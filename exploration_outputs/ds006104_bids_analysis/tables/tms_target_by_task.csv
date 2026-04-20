@@ -1,0 +1,14 @@
+task,tms_target,trial_count
+Words,BA06,1360
+Words,BA44,1101
+Words,control_BA06,680
+Words,control_BA44,552
+phonemes,tongue,2536
+phonemes,lip,2517
+phonemes,control_lip,1266
+phonemes,control_tongue,1263
+single-phoneme,control_BA06,935
+single-phoneme,control_BA44,770
+single-phoneme,control_tongue,715
+single-phoneme,control_lip,660
+single-phoneme,control_,275

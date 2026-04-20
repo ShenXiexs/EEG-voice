@@ -1,0 +1,11 @@
+topic,finding,detail
+pairing,all_event_files_pair_cleanly,56 个 events.tsv 文件都能稳定配对成 TMS -> stimulus trial，pair_errors 总和为 0。
+local_files,edf_entries_are_not_hydrated_locally,当前 ds006104/ 目录下有 56 个 .edf git-annex 链接入口，但真正可读取的本地目标文件数量为 0；当前分析仍主要基于 BIDS sidecars 和事件流。
+field_coverage,words_phoneme3_missing_in_bids,Words 任务里，BIDS trial manifest 的 phoneme3 非空比例为 0.00，本地事件表为 1.00。
+timing,single_phoneme_interval_is_variable,single-phoneme 任务的 TMS 到 stimulus 间隔不是固定 50 ms，而是在 70.0-427.5 ms 间变化；其他任务固定为 50 ms。
+design,single_phoneme_is_control_only,single-phoneme 任务的 3355 个 trial 全部是 control 条件，没有 active TMS。
+cross_year,phoneme_inventory_overlap_is_limited,phonemes 任务在 2019/2021 间共有 20 个 shared units，另有 20 个 2019-only units，2021 没有新增独有 units。
+completeness,subject_task_below_expected_mode,S01 的 Words 只有 120 个 trial，低于该任务常见值 240。
+completeness,subject_task_below_expected_mode,S02 的 Words 只有 213 个 trial，低于该任务常见值 240。
+completeness,subject_task_below_expected_mode,S01 的 single-phoneme 只有 110 个 trial，低于该任务常见值 220。
+completeness,subject_task_below_expected_mode,S13 的 single-phoneme 只有 165 个 trial，低于该任务常见值 220。

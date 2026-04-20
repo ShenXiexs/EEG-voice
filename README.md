@@ -24,6 +24,7 @@
 - [数据探索报告](reports/moreira_dataset_exploration_cn.md)
 - [论文解析与概念说明](reports/moreira_paper_data_concepts_cn.md)
 - [ds006104 本地 BIDS 数据集说明](reports/ds006104_bids_dataset_note_cn.md)
+- [ds006104 事件级数据分析](reports/ds006104_bids_analysis_cn.md)
 
 ## 当前主要结论
 
@@ -42,6 +43,7 @@
 - [reports/moreira_dataset_exploration_cn.md](reports/moreira_dataset_exploration_cn.md)
 - [reports/moreira_paper_data_concepts_cn.md](reports/moreira_paper_data_concepts_cn.md)
 - [reports/ds006104_bids_dataset_note_cn.md](reports/ds006104_bids_dataset_note_cn.md)
+- [reports/ds006104_bids_analysis_cn.md](reports/ds006104_bids_analysis_cn.md)
 
 ### 表格
 
