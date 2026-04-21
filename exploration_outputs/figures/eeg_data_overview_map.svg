@@ -1,0 +1,98 @@
+<svg width="1600" height="980" viewBox="0 0 1600 980" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1600" height="980" fill="#F7F3EA"/>
+  <text x="70" y="70" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="700" fill="#1F2A2E">EEG-Voice 数据说明导图</text>
+  <text x="70" y="105" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#49565B">从公开数据源到当前可训练数据准备阶段的整体视图</text>
+
+  <rect x="70" y="150" width="250" height="110" rx="18" fill="#D7E8D3" stroke="#314B3A" stroke-width="2"/>
+  <text x="95" y="192" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#213227">OpenNeuro ds006104</text>
+  <text x="95" y="225" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#213227">Moreira et al., 2025</text>
+  <text x="95" y="248" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#213227">公开 EEG speech decoding 数据集</text>
+
+  <rect x="390" y="130" width="270" height="155" rx="18" fill="#F9E4C8" stroke="#7C5A28" stroke-width="2"/>
+  <text x="415" y="170" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#5A3D11">Study 1: 2019</text>
+  <text x="415" y="202" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#5A3D11">subjects: P01-P08</text>
+  <text x="415" y="228" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#5A3D11">任务主轴: phoneme pairs</text>
+  <text x="415" y="254" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#5A3D11">特点: 含 CV / VC, 可做跨年 shared CV</text>
+
+  <rect x="710" y="130" width="300" height="180" rx="18" fill="#F7D8D0" stroke="#6B3A2D" stroke-width="2"/>
+  <text x="735" y="170" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#53271F">Study 2: 2021</text>
+  <text x="735" y="202" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#53271F">subjects: S01-S16</text>
+  <text x="735" y="228" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#53271F">任务层级更完整:</text>
+  <text x="755" y="254" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#53271F">1. single-phoneme</text>
+  <text x="755" y="278" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#53271F">2. phonemes</text>
+  <text x="755" y="302" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#53271F">3. Words</text>
+
+  <rect x="1080" y="130" width="420" height="185" rx="18" fill="#DCE7F5" stroke="#35536E" stroke-width="2"/>
+  <text x="1105" y="170" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#233747">每条记录最核心的原始内容</text>
+  <text x="1105" y="206" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#233747">EDF: 连续脑电波形</text>
+  <text x="1105" y="232" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#233747">events.tsv/json: trial 事件、stimulus onset、标签</text>
+  <text x="1105" y="258" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#233747">channels.tsv: 通道名、类型、单位</text>
+  <text x="1105" y="284" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#233747">eeg.json / coordsystem.json: 采样率、参考、坐标系</text>
+
+  <path d="M320 205 L390 205" stroke="#4A5B61" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M660 205 L710 205" stroke="#4A5B61" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M1010 220 L1080 220" stroke="#4A5B61" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <rect x="70" y="380" width="320" height="180" rx="18" fill="#FFFFFF" stroke="#5C6B70" stroke-width="2"/>
+  <text x="95" y="420" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" fill="#223238">任务与含义</text>
+  <text x="95" y="456" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">single-phoneme:</text>
+  <text x="220" y="456" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">单音级 speech unit</text>
+  <text x="95" y="482" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">phonemes:</text>
+  <text x="220" y="482" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">双音组合, 可做序列</text>
+  <text x="95" y="508" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">Words:</text>
+  <text x="220" y="508" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">词 / 假词, 高层 lexical unit</text>
+  <text x="95" y="534" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">TMS:</text>
+  <text x="220" y="534" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">实验条件变量, 不是主标签</text>
+
+  <rect x="440" y="380" width="320" height="180" rx="18" fill="#FFFFFF" stroke="#5C6B70" stroke-width="2"/>
+  <text x="465" y="420" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" fill="#223238">当前最稳的监督</text>
+  <text x="465" y="456" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">已有:</text>
+  <text x="530" y="456" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">stimulus onset, phoneme1-3</text>
+  <text x="465" y="482" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">已有:</text>
+  <text x="530" y="482" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">place / manner / voicing</text>
+  <text x="465" y="508" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">已有:</text>
+  <text x="530" y="508" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">real / nonce, tmstarget</text>
+  <text x="465" y="534" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">缺失:</text>
+  <text x="530" y="534" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">公开音频、边界、mel target</text>
+
+  <rect x="810" y="380" width="320" height="180" rx="18" fill="#FFFFFF" stroke="#5C6B70" stroke-width="2"/>
+  <text x="835" y="420" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" fill="#223238">当前能做什么</text>
+  <text x="835" y="456" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">1. stimulus-locked epoch</text>
+  <text x="835" y="482" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">2. trial-level EEG 数据集</text>
+  <text x="835" y="508" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">3. EEG embedding / EEG token</text>
+  <text x="835" y="534" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#223238">4. speech-unit 弱监督对齐</text>
+
+  <rect x="1180" y="380" width="320" height="180" rx="18" fill="#FFF6D9" stroke="#8A6B19" stroke-width="2"/>
+  <text x="1205" y="420" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" fill="#6C520D">当前不能直接做</text>
+  <text x="1205" y="456" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#6C520D">1. frame-level speech alignment</text>
+  <text x="1205" y="482" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#6C520D">2. EEG -&gt; mel reconstruction</text>
+  <text x="1205" y="508" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#6C520D">3. EEG -&gt; waveform synthesis</text>
+  <text x="1205" y="534" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#6C520D">4. 被试语音配对监督</text>
+
+  <rect x="70" y="650" width="1430" height="230" rx="22" fill="#E9EFEF" stroke="#4F6468" stroke-width="2"/>
+  <text x="95" y="695" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="700" fill="#223238">你现在所在的位置</text>
+  <text x="95" y="735" font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#223238">已经完成: EDF 下载、基础摘要、完整矩阵导出</text>
+  <text x="95" y="765" font-family="Arial, Helvetica, sans-serif" font-size="19" fill="#223238">最该进入: EDF + events -&gt; epoch/trial dataset -&gt; single-phoneme baseline -&gt; EEG token -&gt; CTC 对齐</text>
+
+  <rect x="95" y="790" width="290" height="60" rx="14" fill="#D7E8D3" stroke="#314B3A" stroke-width="2"/>
+  <text x="120" y="828" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#213227">阶段 1: 连续 EDF</text>
+
+  <rect x="430" y="790" width="290" height="60" rx="14" fill="#DCE7F5" stroke="#35536E" stroke-width="2"/>
+  <text x="456" y="828" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#233747">阶段 2: epoch / trial</text>
+
+  <rect x="765" y="790" width="290" height="60" rx="14" fill="#F9E4C8" stroke="#7C5A28" stroke-width="2"/>
+  <text x="785" y="828" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#5A3D11">阶段 3: EEG token</text>
+
+  <rect x="1100" y="790" width="375" height="60" rx="14" fill="#F7D8D0" stroke="#6B3A2D" stroke-width="2"/>
+  <text x="1122" y="828" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#53271F">阶段 4: speech token 对齐 / 训练</text>
+
+  <path d="M385 820 L430 820" stroke="#4A5B61" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M720 820 L765 820" stroke="#4A5B61" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M1055 820 L1100 820" stroke="#4A5B61" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#4A5B61"/>
+    </marker>
+  </defs>
+</svg>

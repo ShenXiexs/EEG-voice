@@ -1,0 +1,13 @@
+.DS_Store
+
+# Full EDF export artifacts under the existing descriptive-analysis folders.
+# Keep lightweight summaries/plots trackable; ignore only the heavy matrix export
+# and copied BIDS sidecars that would otherwise flood `git add .`.
+exploration_outputs/edf_full_analysis/batch_full_export_summary.json
+exploration_outputs/edf_full_analysis/*/*_full_eeg.h5
+exploration_outputs/edf_full_analysis/*/*_full_export_manifest.json
+exploration_outputs/edf_full_analysis/*/*_events.tsv
+exploration_outputs/edf_full_analysis/*/*_events.json
+exploration_outputs/edf_full_analysis/*/*_channels.tsv
+exploration_outputs/edf_full_analysis/*/*_eeg.json
+exploration_outputs/edf_full_analysis/*/*_coordsystem.json

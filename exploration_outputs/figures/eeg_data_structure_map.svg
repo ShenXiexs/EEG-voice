@@ -1,0 +1,89 @@
+<svg width="1600" height="1080" viewBox="0 0 1600 1080" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1600" height="1080" fill="#F6F4EE"/>
+  <text x="70" y="70" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="700" fill="#1F2A2E">EEG 数据结构说明图</text>
+  <text x="70" y="105" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#49565B">以单个记录目录为例，说明每个文件是什么、含义是什么、后面怎么用</text>
+
+  <rect x="70" y="150" width="1460" height="120" rx="20" fill="#DCE7F5" stroke="#35536E" stroke-width="2"/>
+  <text x="95" y="193" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#233747">单个目录示例</text>
+  <text x="95" y="228" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#233747">ref_github/speech_decoding/exploration_outputs/edf_full_analysis/sub-P01_ses-01_task-phonemes_eeg/</text>
+  <text x="95" y="253" font-family="Arial, Helvetica, sans-serif" font-size="18" fill="#233747">这个目录现在同时包含: 原始 sidecar 复制件 + 描述性图表 + 完整 HDF5 导出</text>
+
+  <rect x="70" y="330" width="450" height="640" rx="20" fill="#FFFFFF" stroke="#5C6B70" stroke-width="2"/>
+  <text x="95" y="375" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="700" fill="#223238">A. 原始数据描述文件</text>
+
+  <rect x="95" y="405" width="400" height="95" rx="14" fill="#D7E8D3" stroke="#314B3A" stroke-width="2"/>
+  <text x="118" y="440" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#213227">*_eeg.edf</text>
+  <text x="118" y="468" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#213227">真正的连续脑电主文件</text>
+  <text x="118" y="490" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#213227">含 61 EEG 通道 + 1 Status 通道</text>
+
+  <rect x="95" y="520" width="400" height="95" rx="14" fill="#F9E4C8" stroke="#7C5A28" stroke-width="2"/>
+  <text x="118" y="555" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#5A3D11">*_events.tsv / *_events.json</text>
+  <text x="118" y="583" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#5A3D11">事件表: onset, trial_type, phoneme, category, TMS</text>
+  <text x="118" y="605" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#5A3D11">后面切 epoch、构造 trial label 靠它</text>
+
+  <rect x="95" y="635" width="400" height="95" rx="14" fill="#F7D8D0" stroke="#6B3A2D" stroke-width="2"/>
+  <text x="118" y="670" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#53271F">*_channels.tsv</text>
+  <text x="118" y="698" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#53271F">通道名、类型、单位</text>
+  <text x="118" y="720" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#53271F">告诉你哪些是 EEG, 哪些不是</text>
+
+  <rect x="95" y="750" width="400" height="95" rx="14" fill="#FFF6D9" stroke="#8A6B19" stroke-width="2"/>
+  <text x="118" y="785" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#6C520D">*_eeg.json / *_coordsystem.json</text>
+  <text x="118" y="813" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#6C520D">采样率、参考、电极系统、坐标系</text>
+  <text x="118" y="835" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#6C520D">后面预处理和复现实验说明靠它</text>
+
+  <rect x="575" y="330" width="450" height="640" rx="20" fill="#FFFFFF" stroke="#5C6B70" stroke-width="2"/>
+  <text x="600" y="375" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="700" fill="#223238">B. 目前已有的描述性产物</text>
+
+  <rect x="600" y="405" width="400" height="95" rx="14" fill="#E9EFEF" stroke="#4F6468" stroke-width="2"/>
+  <text x="623" y="440" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#223238">*_summary.json</text>
+  <text x="623" y="468" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#223238">时长、采样率、通道数、矩阵大小、全局均值方差</text>
+  <text x="623" y="490" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#223238">它是体检摘要, 不是训练数据本体</text>
+
+  <rect x="600" y="520" width="400" height="95" rx="14" fill="#E9EFEF" stroke="#4F6468" stroke-width="2"/>
+  <text x="623" y="555" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#223238">*_channel_stats.csv</text>
+  <text x="623" y="583" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#223238">每个通道的 mean / std / min / max / ptp</text>
+  <text x="623" y="605" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#223238">用来快速看坏道或异常波动</text>
+
+  <rect x="600" y="635" width="400" height="95" rx="14" fill="#E9EFEF" stroke="#4F6468" stroke-width="2"/>
+  <text x="623" y="670" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#223238">*_full_overview.png</text>
+  <text x="623" y="698" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#223238">全程波形概览, 只用于宏观目视检查</text>
+  <text x="623" y="720" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#223238">不能替代 trial-level 分析</text>
+
+  <rect x="600" y="750" width="400" height="95" rx="14" fill="#E9EFEF" stroke="#4F6468" stroke-width="2"/>
+  <text x="623" y="785" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#223238">*_psd.png / *_channel_std_top20.png</text>
+  <text x="623" y="813" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#223238">频谱概览和高波动通道图</text>
+  <text x="623" y="835" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#223238">适合筛查, 不等于完整研究分析</text>
+
+  <rect x="1080" y="330" width="450" height="640" rx="20" fill="#FFFFFF" stroke="#5C6B70" stroke-width="2"/>
+  <text x="1105" y="375" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="700" fill="#223238">C. 你刚导出的完整数据</text>
+
+  <rect x="1105" y="405" width="400" height="125" rx="14" fill="#DCE7F5" stroke="#35536E" stroke-width="2"/>
+  <text x="1128" y="440" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#233747">*_full_eeg.h5</text>
+  <text x="1128" y="468" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#233747">完整 EEG 矩阵本体</text>
+  <text x="1128" y="492" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#233747">dataset: eeg_data_uV, shape = [channels, time]</text>
+  <text x="1128" y="516" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#233747">还带 channel_names / all_channel_names / non_eeg_channel_names</text>
+
+  <rect x="1105" y="550" width="400" height="115" rx="14" fill="#D7E8D3" stroke="#314B3A" stroke-width="2"/>
+  <text x="1128" y="585" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#213227">*_full_export_manifest.json</text>
+  <text x="1128" y="613" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#213227">记录 HDF5 对应的采样率、时长、通道、sidecar 路径</text>
+  <text x="1128" y="637" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#213227">方便后面做批处理和核对来源</text>
+
+  <rect x="1105" y="685" width="400" height="160" rx="14" fill="#F9E4C8" stroke="#7C5A28" stroke-width="2"/>
+  <text x="1128" y="720" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#5A3D11">这些完整数据后面怎么用</text>
+  <text x="1128" y="748" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#5A3D11">1. 用 events.tsv 的 onset 切 stimulus-locked epoch</text>
+  <text x="1128" y="772" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#5A3D11">2. 用 phoneme/category/tmstarget 做 label</text>
+  <text x="1128" y="796" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#5A3D11">3. 形成 trial-level 数据集</text>
+  <text x="1128" y="820" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#5A3D11">4. 再进入 EEG token / speech token 对齐</text>
+
+  <path d="M520 470 L575 470" stroke="#4A5B61" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M1025 470 L1080 470" stroke="#4A5B61" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <rect x="70" y="1000" width="1460" height="40" rx="14" fill="#E9EFEF" stroke="#4F6468" stroke-width="1.5"/>
+  <text x="95" y="1026" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#223238">一句话理解: A 是“原始定义”，B 是“体检报告”，C 才是“后面能切 epoch、能训练模型的完整 EEG 数据本体”。</text>
+
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#4A5B61"/>
+    </marker>
+  </defs>
+</svg>

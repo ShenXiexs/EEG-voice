@@ -9,7 +9,7 @@
 
 这意味着你现在不再处于“能不能读数据”的阶段，而是正式进入：
 
-`EDF -> epoch -> EEG 表征 -> EEG token -> speech unit 对齐 -> 训练 -> 论文`
+**`EDF -> epoch -> EEG 表征 -> EEG token -> speech unit 对齐 -> 训练 -> 论文`**
 
 ## 1. 先把研究目标定对
 
