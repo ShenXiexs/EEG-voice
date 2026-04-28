@@ -105,21 +105,21 @@ find outputs/probe_artifacts -maxdepth 2 -type f | sort
 
 ## 2. 推荐测试顺序
 
-| 顺序 | 数据集 | 用途 | 先测内容 | 进入训练前门槛 |
-| --- | --- | --- | --- | --- |
-| 1 | `ds004718` LPPHK | 词级/韵律对齐主数据集 | word timing、trigger、acoustic | 词 onset 能落到 EEG token grid |
-| 2 | `ds005345` LPP Multi-talker | 单说话人/混合说话人自然语音 | word info、f0/intensity、FIF | single female 可完成 EEG-audio 对齐 |
-| 3 | `ds004408` naturalistic speech | 英语 TextGrid/phoneme 监督 | TextGrid、BrainVision | phoneme onset 与 EEG sample 对齐 |
-| 4 | `ds006104` speech decoding | 受控 phoneme/articulation probe | events、EDF header | phoneme/manner/place 标签可分类 |
-| 5 | `ds006434` ABR/attention | 64 秒长 epoch 和 attention timing | events、WAV header | event sample、duration、stimulus 一致 |
-| 6 | `ds007591` speech decoding | overt/covert/minimally overt 辅助验证 | events、EDF | session/task condition 可分层 |
-| 7 | `zenodo-4004271` KUL | 经典 AAD baseline | README、preprocess、S1.mat | 严格 leave-trial/story/subject split |
-| 8 | `zenodo-1199011` DTU | competing speech robustness | preprocessing script、预处理包 | 不先下载 16GB EEG.zip |
-| 9 | `zenodo-7078451` ESAA | Mandarin AAD | readme、baseline、S1.zip | trial marker 与 target stream 可恢复 |
-| 10 | `zenodo-4518754` 255ch | 高密度空间 tokenizer | misc/scripts/stimuli | channel layout 可读后再下 subject |
-| 11 | `openmiir` | 音乐 beat/tempo probe | metadata、beats | beat time 可落到 token grid |
-| 12 | `ds003774` MUSIN-G | 自然音乐 EEG 预训练 | events、audio header、EEGLAB | listening run 可切片 |
-| 13 | `zenodo-4537751` MAD-EEG | polyphonic music attention | behavior、yaml、HDF5 | target instrument 序列可恢复 |
+| 顺序 | 数据集                           | 用途                                  | 先测内容                       | 进入训练前门槛                        |
+| ---- | -------------------------------- | ------------------------------------- | ------------------------------ | ------------------------------------- |
+| 1    | `ds004718` LPPHK               | 词级/韵律对齐主数据集                 | word timing、trigger、acoustic | 词 onset 能落到 EEG token grid        |
+| 2    | `ds005345` LPP Multi-talker    | 单说话人/混合说话人自然语音           | word info、f0/intensity、FIF   | single female 可完成 EEG-audio 对齐   |
+| 3    | `ds004408` naturalistic speech | 英语 TextGrid/phoneme 监督            | TextGrid、BrainVision          | phoneme onset 与 EEG sample 对齐      |
+| 4    | `ds006104` speech decoding     | 受控 phoneme/articulation probe       | events、EDF header             | phoneme/manner/place 标签可分类       |
+| 5    | `ds006434` ABR/attention       | 64 秒长 epoch 和 attention timing     | events、WAV header             | event sample、duration、stimulus 一致 |
+| 6    | `ds007591` speech decoding     | overt/covert/minimally overt 辅助验证 | events、EDF                    | session/task condition 可分层         |
+| 7    | `zenodo-4004271` KUL           | 经典 AAD baseline                     | README、preprocess、S1.mat     | 严格 leave-trial/story/subject split  |
+| 8    | `zenodo-1199011` DTU           | competing speech robustness           | preprocessing script、预处理包 | 不先下载 16GB EEG.zip                 |
+| 9    | `zenodo-7078451` ESAA          | Mandarin AAD                          | readme、baseline、S1.zip       | trial marker 与 target stream 可恢复  |
+| 10   | `zenodo-4518754` 255ch         | 高密度空间 tokenizer                  | misc/scripts/stimuli           | channel layout 可读后再下 subject     |
+| 11   | `openmiir`                     | 音乐 beat/tempo probe                 | metadata、beats                | beat time 可落到 token grid           |
+| 12   | `ds003774` MUSIN-G             | 自然音乐 EEG 预训练                   | events、audio header、EEGLAB   | listening run 可切片                  |
+| 13   | `zenodo-4537751` MAD-EEG       | polyphonic music attention            | behavior、yaml、HDF5           | target instrument 序列可恢复          |
 
 ## 3. 通用依赖检查
 
@@ -176,7 +176,7 @@ PY
 ```bash
 mkdir -p data/raw/openneuro/ds004718/sub-HK001/eeg
 curl -L -o data/raw/openneuro/ds004718/sub-HK001/eeg/sub-HK001_task-lppHK_eeg.set \
-  https://s3.amazonaws.com/openneuro.org/ds004718/sub-HK001/eeg/sub-HK001_task-lppHK_eeg.set
+https://s3.amazonaws.com/openneuro.org/ds004718/sub-HK001/eeg/sub-HK001_task-lppHK_eeg.set
 ```
 
 读取 EEG：
@@ -259,12 +259,13 @@ python3 - <<'PY'
 import mne
 
 path = "data/raw/openneuro/ds005345/sub-01/eeg/sub-01_task-multitalker_run-1_eeg_preprocessed.fif"
-raw = mne.io.read_raw_fif(path, preload=False, verbose=False)
 
-print(raw)
-print("sfreq:", raw.info["sfreq"])
-print("nchan:", raw.info["nchan"])
-print("duration_sec:", raw.n_times / raw.info["sfreq"])
+epochs = mne.read_epochs(path, preload=False, verbose=False)
+
+print(epochs)
+print("sfreq:", epochs.info["sfreq"])
+print("nchan:", epochs.info["nchan"])
+print("shape:", epochs.get_data().shape)
 PY
 ```
 
