@@ -1,5 +1,0 @@
-study_year,task,subject_count,trial_count,min_trials_per_subject,median_trials_per_subject,max_trials_per_subject,unique_units_bids_visible,unique_units_local,unique_tms_targets,tms_targets,tms_to_stim_median_ms,tms_to_stim_min_ms,tms_to_stim_max_ms
-2019,phonemes,8,3742,439,474.5,479,40,40,4,"control_lip, control_tongue, lip, tongue",50.0,50.0,50.0
-2021,Words,16,3693,120,240.0,240,17,20,4,"BA06, BA44, control_BA06, control_BA44",50.0,50.0,50.0
-2021,phonemes,16,3840,240,240.0,240,20,20,4,"control_lip, control_tongue, lip, tongue",50.0,50.0,50.0
-2021,single-phoneme,16,3355,110,220.0,220,11,11,5,"control_, control_BA06, control_BA44, control_lip, control_tongue",89.5,70.0,427.5

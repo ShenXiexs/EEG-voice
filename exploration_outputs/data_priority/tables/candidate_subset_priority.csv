@@ -1,4 +1,0 @@
-priority,subset_name,subset_definition,recommended_unit,subjects,trials,class_count,class_balance,control_only_version,cross_year_alignment,why_useful
-1,2021 single-phoneme,"study_year=2021, task=single-phoneme",phoneme1,16,3355,11,完全均衡,是，且全部 trial 均为 control* 条件,否，2019 无 single-phoneme 任务,最干净的离散 speech-unit 数据，适合先看 EEG token 是否可分
-2,2021 Words,"study_year=2021, task=Words",category (real/nonce)，另有 20 个 lexical bases,16,3693,2,完全均衡,是，存在 control_BA06 / control_BA44 子集,否，2019 无 Words 任务,最接近高层 speech unit，可先做粗粒度 lexical token 准备
-3,control-only phonemes,"task=phonemes, tmstarget startswith control",20 shared phoneme bases（跨年）或 articulation labels,24,2529,20,不均衡,是，当前子集即 control-only,是，但只有 20 个 shared bases,唯一具备跨 2019/2021 对齐基础的离散 phoneme 子集

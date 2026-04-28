@@ -1,7 +1,0 @@
-{
-  "bids_events_files": 56,
-  "bids_trial_rows": 14630,
-  "pair_errors": 0,
-  "local_event_rows": 14630,
-  "output_root": "/Users/samxie/Research/EEG-Voice/ref_github/speech_decoding/exploration_outputs/ds006104_bids_analysis"
-}

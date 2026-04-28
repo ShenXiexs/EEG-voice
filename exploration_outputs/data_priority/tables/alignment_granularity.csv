@@ -1,4 +1,0 @@
-granularity,status,available_supervision,missing_supervision,takeaway
-trial-level,可用,"stimulus onset, phoneme1-3, category, tmstarget",无额外缺口,可以直接做 trial/unit 级数据观察和切窗准备
-unit-level,部分可用,"single phoneme, phoneme pair, CVC base, articulation labels",公开音频、音素时长、speech-side tokenizer 输出,适合离散 speech-unit 级 EEG token 准备
-frame-level,不可用,无,"waveform, mel target, forced alignment, phoneme boundaries",当前不能直接支持 EEG-to-voice 重建监督

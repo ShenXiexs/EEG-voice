@@ -1,4 +1,0 @@
-task,trial_count,unique_interval_values,min_ms,p05_ms,median_ms,p95_ms,max_ms,gt_150ms_count
-Words,3693,1,50.0,50.0,50.0,50.0,50.0,0
-phonemes,7582,1,50.0,50.0,50.0,50.0,50.0,0
-single-phoneme,3355,37,70.0,72.5,89.5,144.5,427.5,122
