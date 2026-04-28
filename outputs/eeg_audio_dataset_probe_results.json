@@ -60,6 +60,12 @@
         "bytes_read": 338,
         "content_length_header": "338",
         "content_range": null,
+        "artifact": {
+          "sha256": "b30eaa089cdc3613f7d369db24291acafef8d01c36fe20b50dfc6f109c5a430d",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004408/01_dataset_description.json",
+          "artifact_bytes": 338
+        },
         "parsed": {
           "Name": "EEG responses to continuous naturalistic speech\n",
           "BIDSVersion": "1.7.0",
@@ -81,6 +87,12 @@
         "bytes_read": 577,
         "content_length_header": "577",
         "content_range": null,
+        "artifact": {
+          "sha256": "e9cbeb89c8aaf3c26974ffc08d580ee48dc0ca159467a6377877f3b15324c448",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004408/02_participants.tsv",
+          "artifact_bytes": 577
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -143,6 +155,12 @@
         "bytes_read": 180689,
         "content_length_header": "180689",
         "content_range": null,
+        "artifact": {
+          "sha256": "52c82adfeac4ef79c66f3993aeea1cc69531d3948d2b22e802e598a56d2bd8b0",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004408/03_audio01_TextGrid.TextGrid",
+          "artifact_bytes": 180689
+        },
         "parsed": {
           "interval_labels": 2536,
           "nonempty_labels": 2465,
@@ -168,6 +186,12 @@
         "bytes_read": 4096,
         "content_length_header": "4096",
         "content_range": "bytes 0-4095/31322156",
+        "artifact": {
+          "sha256": "1f69935146ae465bff3083cf14e5e86d4676a81707decc858a91b8ea89b14c55",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds004408/04_audio01_wav_header.wav.header.bin",
+          "artifact_bytes": 4096
+        },
         "parsed": {
           "valid_wav": true,
           "audio_format": 1,
@@ -186,6 +210,12 @@
         "bytes_read": 487,
         "content_length_header": "487",
         "content_range": null,
+        "artifact": {
+          "sha256": "11c36a4fab899034fc757499821b58d1ce6e484733e60c35426c832109680cb5",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004408/05_run01_EEG_sidecar.json",
+          "artifact_bytes": 487
+        },
         "parsed": {
           "TaskName": "listening",
           "Manufacturer": "Brain Products",
@@ -212,6 +242,12 @@
         "bytes_read": 5920,
         "content_length_header": "5920",
         "content_range": null,
+        "artifact": {
+          "sha256": "8b2d2fbb35291d81c12cf3145e96b5ce3a6bb56575d45721ec6c8c89513f6a22",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004408/06_run01_channels.tsv",
+          "artifact_bytes": 5920
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -280,6 +316,12 @@
         "bytes_read": 2984,
         "content_length_header": "2984",
         "content_range": null,
+        "artifact": {
+          "sha256": "4152fe42d1576fa576b58bd1d4f89df0d50d168fb49aad747780dfbfda6458ce",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004408/07_run01_BrainVision_header.txt",
+          "artifact_bytes": 2984
+        },
         "parsed": {
           "lines": [
             "Brain Vision Data Exchange Header File Version 1.0",
@@ -305,6 +347,12 @@
         "bytes_read": 512,
         "content_length_header": "512",
         "content_range": "bytes 0-511/51380224",
+        "artifact": {
+          "sha256": "cfaa1e3b8b820b666e15bd99bd04290f1eb84469a89fe6a5a5661ae4482d5bf3",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds004408/08_run01_raw_EEG_bytes.bin",
+          "artifact_bytes": 512
+        },
         "parsed": {
           "bytes_read": 512,
           "content_range": "bytes 0-511/51380224",
@@ -367,6 +415,12 @@
         "bytes_read": 578,
         "content_length_header": "578",
         "content_range": null,
+        "artifact": {
+          "sha256": "4fb290bcd4656947476322e18d8f3ce6ed0ba1e403d2514ba69446816353656a",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds005345/01_dataset_description.json",
+          "artifact_bytes": 578
+        },
         "parsed": {
           "Name": "Le Petit Prince (LPP) Multi-talker: Naturalistic 7T fMRI and EEG Dataset",
           "BIDSVersion": "1.8.0",
@@ -389,6 +443,12 @@
         "bytes_read": 64469,
         "content_length_header": "64469",
         "content_range": null,
+        "artifact": {
+          "sha256": "3a32fb7c26570fd6c0c902c495cb4b631e514e58ab08254b9f02213058af3202",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds005345/02_female_word_info.csv",
+          "artifact_bytes": 64469
+        },
         "parsed": {
           "delimiter": ",",
           "columns": [
@@ -469,6 +529,12 @@
         "bytes_read": 262144,
         "content_length_header": "262144",
         "content_range": "bytes 0-262143/17430736",
+        "artifact": {
+          "sha256": "8412296a1b78b9582f2774f1603d16eda87b1e253286868589b178b607212e33",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds005345/03_female_acoustic_sample.csv",
+          "artifact_bytes": 262144
+        },
         "parsed": {
           "delimiter": ",",
           "columns": [
@@ -513,6 +579,12 @@
         "bytes_read": 4096,
         "content_length_header": "4096",
         "content_range": "bytes 0-4095/53184646",
+        "artifact": {
+          "sha256": "5912adf3d291047f34c27535d86016ad1e03d93b5fda013fde5d2aee372438fa",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds005345/04_single_female_wav_header.wav.header.bin",
+          "artifact_bytes": 4096
+        },
         "parsed": {
           "valid_wav": true,
           "audio_format": 1,
@@ -531,6 +603,12 @@
         "bytes_read": 1009,
         "content_length_header": "1009",
         "content_range": null,
+        "artifact": {
+          "sha256": "3c67fd6f977e23a37c7b4ad4a69a45fd51d1c626e15f9a8af5a88c82c7684996",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds005345/05_raw_EEG_sidecar.json",
+          "artifact_bytes": 1009
+        },
         "parsed": {
           "TaskName": "multitalker",
           "TaskDescription": "Listening to multitalker narratives for auditory processing research",
@@ -571,6 +649,12 @@
         "bytes_read": 11426,
         "content_length_header": "11426",
         "content_range": null,
+        "artifact": {
+          "sha256": "02795699a67dab83b57522e438f7898a41c2d829f66c3b529db38525f9f265c2",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds005345/06_raw_EEG_BrainVision_header.txt",
+          "artifact_bytes": 11426
+        },
         "parsed": {
           "lines": [
             "Brain Vision Data Exchange Header File Version 1.0",
@@ -596,6 +680,12 @@
         "bytes_read": 512,
         "content_length_header": "512",
         "content_range": "bytes 0-511/182722560",
+        "artifact": {
+          "sha256": "2a6f992c5b54e258eec28204b1e9c62191e1771823e5b4f6253c24a677904de3",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds005345/07_raw_EEG_bytes.bin",
+          "artifact_bytes": 512
+        },
         "parsed": {
           "bytes_read": 512,
           "content_range": "bytes 0-511/182722560",
@@ -610,6 +700,12 @@
         "bytes_read": 512,
         "content_length_header": "512",
         "content_range": "bytes 0-511/76938881",
+        "artifact": {
+          "sha256": "d24e37ceefc101a7a6ac475e6e34952104e6189f7e9814deb2e766dd57354c22",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds005345/08_preprocessed_fif_bytes.bin",
+          "artifact_bytes": 512
+        },
         "parsed": {
           "bytes_read": 512,
           "content_range": "bytes 0-511/76938881",
@@ -680,6 +776,12 @@
         "bytes_read": 361,
         "content_length_header": "361",
         "content_range": null,
+        "artifact": {
+          "sha256": "3f6ebe332a36160ecfd0aa3824c15c1f65074e8f35227f6499cf51855f992393",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004718/01_dataset_description.json",
+          "artifact_bytes": 361
+        },
         "parsed": {
           "Name": "Le Petit Prince Hong Kong: Naturalistic fMRI and EEG dataset from older Cantonese speakers",
           "BIDSVersion": "1.12.0",
@@ -701,6 +803,12 @@
         "bytes_read": 21228,
         "content_length_header": "21228",
         "content_range": null,
+        "artifact": {
+          "sha256": "eecc9a7a56ae99d4a1dfe2be81f867e754d252fef0bacbc657ebe3eec0efca1e",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004718/02_sentences.txt",
+          "artifact_bytes": 21228
+        },
         "parsed": {
           "lines": [
             "snt_id\tsnt",
@@ -726,6 +834,12 @@
         "bytes_read": 346830,
         "content_length_header": "346830",
         "content_range": null,
+        "artifact": {
+          "sha256": "481ba85db8f4fe98cd002ba973ee57ac9095db17dafc36c676a3eaaacb5a5f6f",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004718/03_word_timing_xlsx.xlsx",
+          "artifact_bytes": 346830
+        },
         "parsed": {
           "sheets": [
             "lppHK_word_information"
@@ -794,6 +908,12 @@
         "bytes_read": 17004,
         "content_length_header": "17004",
         "content_range": null,
+        "artifact": {
+          "sha256": "94690ccef4ac1b51ed247ccf7a5bac0b9daaef496048d6dccb69c431cbceb842",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004718/04_trigger_sentence_xlsx.xlsx",
+          "artifact_bytes": 17004
+        },
         "parsed": {
           "sheets": [
             "Sheet1"
@@ -832,6 +952,12 @@
         "bytes_read": 262144,
         "content_length_header": "262144",
         "content_range": "bytes 0-262143/3296484",
+        "artifact": {
+          "sha256": "1dfdb10238b67157db1d2c3ab5df010c4d99f41e7cbe7e21f64813bc3d06c3e6",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds004718/05_acoustic_csv_sample.csv",
+          "artifact_bytes": 262144
+        },
         "parsed": {
           "delimiter": ",",
           "columns": [
@@ -876,6 +1002,12 @@
         "bytes_read": 4096,
         "content_length_header": "4096",
         "content_range": "bytes 0-4095/691472",
+        "artifact": {
+          "sha256": "b46cdfb9e9f87409fe06985c470d67b32ab1a12808a007a2db899e194f058246",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds004718/06_sentence_wav_header.wav.header.bin",
+          "artifact_bytes": 4096
+        },
         "parsed": {
           "valid_wav": true,
           "audio_format": 1,
@@ -894,6 +1026,12 @@
         "bytes_read": 449,
         "content_length_header": "449",
         "content_range": null,
+        "artifact": {
+          "sha256": "8271ed45c01032c40969df63da907bfb1919796b10a44178ee6a2b2f9d20876e",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds004718/07_raw_EEG_sidecar.json",
+          "artifact_bytes": 449
+        },
         "parsed": {
           "InstitutionName": "Hong Kong Polytechnic University",
           "InstitutionalDepartmentName": "Department of Chinese and Bilingual Studies",
@@ -916,6 +1054,12 @@
         "bytes_read": 512,
         "content_length_header": "512",
         "content_range": "bytes 0-511/11911048",
+        "artifact": {
+          "sha256": "c69706a793885af9d8548be8f72173d31c22e595cd6ec431c91cd1af64dc2209",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds004718/08_raw_EEG_EEGLAB_set_bytes.bin",
+          "artifact_bytes": 512
+        },
         "parsed": {
           "bytes_read": 512,
           "content_range": "bytes 0-511/11911048",
@@ -970,6 +1114,12 @@
         "bytes_read": 2584,
         "content_length_header": "2584",
         "content_range": null,
+        "artifact": {
+          "sha256": "c496465528c6641f56e344e99990af605af3936c4f9c85e4ad38740958abb093",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds006104/01_dataset_description.json",
+          "artifact_bytes": 2584
+        },
         "parsed": {
           "Name": "EEG dataset for speech decoding",
           "BIDSVersion": "1.6.0",
@@ -1005,6 +1155,12 @@
         "bytes_read": 719,
         "content_length_header": "719",
         "content_range": null,
+        "artifact": {
+          "sha256": "b561d843e3c3b7490afd8411c90b1b384113563ff45951a4f83f520ec6159e6a",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds006104/02_channels.tsv",
+          "artifact_bytes": 719
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -1049,6 +1205,12 @@
         "bytes_read": 58838,
         "content_length_header": "58838",
         "content_range": null,
+        "artifact": {
+          "sha256": "dd4a51a6993beeec168f3d9076896b8bd4a55fe3e23c3b9789112ced83b0bf78",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds006104/03_events.tsv",
+          "artifact_bytes": 58838
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -1147,6 +1309,12 @@
         "bytes_read": 783,
         "content_length_header": "783",
         "content_range": null,
+        "artifact": {
+          "sha256": "d4154810bc3385c5ab7bac7ed4e657642790e0661b876a53c3c25eccd255c1f7",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds006104/04_EEG_sidecar.json",
+          "artifact_bytes": 783
+        },
         "parsed": {
           "TaskName": "phonemes",
           "TaskDescription": "Listening to consonant-vowel and vowel-consonant phoneme pairs.",
@@ -1177,6 +1345,12 @@
         "bytes_read": 512,
         "content_length_header": "512",
         "content_range": "bytes 0-511/815192128",
+        "artifact": {
+          "sha256": "0b2bd6b642738a7f1f39b9642321bf23715ee1dd0f8406a85d7dbf085e27056f",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds006104/05_raw_EDF_bytes.bin",
+          "artifact_bytes": 512
+        },
         "parsed": {
           "bytes_read": 512,
           "content_range": "bytes 0-511/815192128",
@@ -1247,6 +1421,12 @@
         "bytes_read": 1319,
         "content_length_header": "1319",
         "content_range": null,
+        "artifact": {
+          "sha256": "d02dffd457ba12ba420b18931d45c188a97bd866ad5611d784f89bffbd20c7af",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds006434/01_dataset_description.json",
+          "artifact_bytes": 1319
+        },
         "parsed": {
           "Name": "The auditory brainstem response to natural speech is not affected by selective attention",
           "BIDSVersion": "1.7.0",
@@ -1283,6 +1463,12 @@
         "bytes_read": 18528,
         "content_length_header": "18528",
         "content_range": null,
+        "artifact": {
+          "sha256": "b5e4dd2f8b4cec2e0d66a13fde1b74ccfefc5362d257977f9233a9d61e7b7d6c",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds006434/02_events.tsv",
+          "artifact_bytes": 18528
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -1363,6 +1549,12 @@
         "bytes_read": 1875,
         "content_length_header": "1875",
         "content_range": null,
+        "artifact": {
+          "sha256": "d77553a457d4dd81365001cc19af7b3026dafc5894c445847a40568d4deca30f",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds006434/03_channels.tsv",
+          "artifact_bytes": 1875
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -1443,6 +1635,12 @@
         "bytes_read": 945,
         "content_length_header": "945",
         "content_range": null,
+        "artifact": {
+          "sha256": "fb2d958d50c2e1651d34d9f10d5bc6b65b0648605ad8c1e99a5e0edc1e22ac7a",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds006434/04_EEG_sidecar.json",
+          "artifact_bytes": 945
+        },
         "parsed": {
           "TaskName": "exp2Dichotic",
           "Manufacturer": "Brain Products",
@@ -1472,6 +1670,12 @@
         "bytes_read": 4096,
         "content_length_header": "4096",
         "content_range": "bytes 0-4095/6250044",
+        "artifact": {
+          "sha256": "f3b2ea70559e3d9aed13f1f979e97d0e3ca5e1766bffab1ffcb9ad80aeab2771",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds006434/05_stim_wav_header.wav.header.bin",
+          "artifact_bytes": 4096
+        },
         "parsed": {
           "valid_wav": true,
           "audio_format": 1,
@@ -1490,6 +1694,12 @@
         "bytes_read": 512,
         "content_length_header": "512",
         "content_range": "bytes 0-511/296412800",
+        "artifact": {
+          "sha256": "caeadd0847eddc849595869ecc4a32b57bfb22bfad3c0a651243bec4cc82f4d9",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds006434/06_raw_EEG_bytes.bin",
+          "artifact_bytes": 512
+        },
         "parsed": {
           "bytes_read": 512,
           "content_range": "bytes 0-511/296412800",
@@ -1560,6 +1770,12 @@
         "bytes_read": 461,
         "content_length_header": "461",
         "content_range": null,
+        "artifact": {
+          "sha256": "9faabe4fa698e81058d89e86f1834d860907d07604a2dbeb6e24d18343858090",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds003774/01_dataset_description.json",
+          "artifact_bytes": 461
+        },
         "parsed": {
           "Authors": [
             "Krishna Prasad Miyapuram",
@@ -1587,6 +1803,12 @@
         "bytes_read": 7680,
         "content_length_header": "7680",
         "content_range": null,
+        "artifact": {
+          "sha256": "5f972b26e9300951483a7bcb7ebd6cccb1c539b60e168de1757f01086c05c3f8",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds003774/02_events.tsv",
+          "artifact_bytes": 7680
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -1655,6 +1877,12 @@
         "bytes_read": 1972,
         "content_length_header": "1972",
         "content_range": null,
+        "artifact": {
+          "sha256": "2bac253f78f8bf37cb8604216ef55bd27e9f5bf4d05f22be42b903d0848652c6",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds003774/03_channels.tsv",
+          "artifact_bytes": 1972
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -1699,6 +1927,12 @@
         "bytes_read": 2100,
         "content_length_header": "2100",
         "content_range": null,
+        "artifact": {
+          "sha256": "3347aa60020338ea721e283d80eeed495d0741de2abcd2e5fdc6f25790febea2",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds003774/04_EEG_sidecar.json",
+          "artifact_bytes": 2100
+        },
         "parsed": {
           "PowerLineFrequency": 50,
           "SoftwareFilters": {
@@ -1741,6 +1975,12 @@
         "bytes_read": 4096,
         "content_length_header": "4096",
         "content_range": "bytes 0-4095/4031804",
+        "artifact": {
+          "sha256": "2529b6772843eed523120943cb72b423219fa359598d4fbef9b316dd9a74c2f0",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds003774/05_song_wav_header.wav.header.bin",
+          "artifact_bytes": 4096
+        },
         "parsed": {
           "valid_wav": true,
           "audio_format": 1,
@@ -1759,6 +1999,12 @@
         "bytes_read": 512,
         "content_length_header": "512",
         "content_range": "bytes 0-511/261068280",
+        "artifact": {
+          "sha256": "40be15f9c4824dfdee7bdeeade65d6a5943935bb96542672e5bafab86e58f4a6",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds003774/06_raw_EEG_set_bytes.bin",
+          "artifact_bytes": 512
+        },
         "parsed": {
           "bytes_read": 512,
           "content_range": "bytes 0-511/261068280",
@@ -1829,6 +2075,12 @@
         "bytes_read": 1122,
         "content_length_header": "1122",
         "content_range": null,
+        "artifact": {
+          "sha256": "0803c399f6144319ceb56426e59a5e056e15aa15a95234c381d839b25695df59",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds007591/01_dataset_description.json",
+          "artifact_bytes": 1122
+        },
         "parsed": {
           "Name": "Delineating neural contributions to EEG-based speech decoding",
           "BIDSVersion": "1.9.0",
@@ -1866,6 +2118,12 @@
         "bytes_read": 65,
         "content_length_header": "65",
         "content_range": null,
+        "artifact": {
+          "sha256": "73edac187b85361eef80958fdabf8c1b4959c45df94a859c3a0675ba67b5e972",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds007591/02_participants.tsv",
+          "artifact_bytes": 65
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -1900,6 +2158,12 @@
         "bytes_read": 5456,
         "content_length_header": "5456",
         "content_range": null,
+        "artifact": {
+          "sha256": "3f2adc3d9ea3dd3c4077cd5702ceaf49c570ac9bc82559d98c2cb5c6488e8f0a",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds007591/03_events.tsv",
+          "artifact_bytes": 5456
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -1962,6 +2226,12 @@
         "bytes_read": 3135,
         "content_length_header": "3135",
         "content_range": null,
+        "artifact": {
+          "sha256": "30c03057912c8a8e35cd85910b0a83b63793aae9904a07cdefff7f46c303e659",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds007591/04_channels.tsv",
+          "artifact_bytes": 3135
+        },
         "parsed": {
           "delimiter": "\\t",
           "columns": [
@@ -2018,6 +2288,12 @@
         "bytes_read": 823,
         "content_length_header": "823",
         "content_range": null,
+        "artifact": {
+          "sha256": "b6c332ca39f3b8cb788873806da8fe6e668f07cf15cef3040d6dfea294ea9507",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/ds007591/05_EEG_sidecar.json",
+          "artifact_bytes": 823
+        },
         "parsed": {
           "TaskName": "minimallyovert",
           "TaskDescription": "Speech decoding task (minimally overt). Participants produced one of 5 color words (green, magenta, orange, violet, yellow) in minimally overt speech condition. Each trial consists of 5 repetitions of the same word (1.25 sec per repetition, 6.25 sec total). Session type: calibration.",
@@ -2044,6 +2320,12 @@
         "bytes_read": 512,
         "content_length_header": "512",
         "content_range": "bytes 0-511/82497276",
+        "artifact": {
+          "sha256": "fc74272648ead5235a297d92701ab6251f77aa7728a562a7a2b659408aa0f5c2",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/ds007591/06_raw_EDF_bytes.bin",
+          "artifact_bytes": 512
+        },
         "parsed": {
           "bytes_read": 512,
           "content_range": "bytes 0-511/82497276",
@@ -2132,6 +2414,12 @@
         "bytes_read": 12732,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "afed3e82c6f36a31eac233faada8bcccf8453ed4553f1b78c964cb027ec5dfc3",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/zenodo-4004271/01_README.txt",
+          "artifact_bytes": 12732
+        },
         "parsed": {
           "lines": [
             "",
@@ -2157,6 +2445,12 @@
         "bytes_read": 7759,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "851440866d576097a600cde867364b35ac21e0d5e8c37fdc97fdcbedd75d4e2a",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/zenodo-4004271/02_preprocess_script.txt",
+          "artifact_bytes": 7759
+        },
         "parsed": {
           "lines": [
             "",
@@ -2216,6 +2510,12 @@
         "bytes_read": 6252,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "b308dbe0d5c0cb7e3e40ba99ebd30bafb3f2a1a8e27973a4458545a0745488e4",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/zenodo-1199011/01_preproc_script.txt",
+          "artifact_bytes": 6252
+        },
         "parsed": {
           "lines": [
             "% This script demonstrates how to import and align EEG and AUDIO data using",
@@ -2315,6 +2615,12 @@
         "bytes_read": 2030221,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "731357e37d464a6a49af016ba852e5dab7e51f7ecd33b5ae8ab16172f84a1cbc",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/zenodo-4518754/01_misc_zip.zip",
+          "artifact_bytes": 2030221
+        },
         "parsed": {
           "entries": 3,
           "first_entries": [
@@ -2340,6 +2646,12 @@
         "bytes_read": 3086,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "eb6494ef0142c4611992ad6cf70376213fc0a8ec6778f77f6938c44ca3a852f5",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/zenodo-4518754/02_scripts_zip.zip",
+          "artifact_bytes": 3086
+        },
         "parsed": {
           "entries": 3,
           "first_entries": [
@@ -2439,6 +2751,12 @@
         "bytes_read": 974,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "3e867b1dc755a146f795fc8ee163f2e56a2b26f1e7f4266d9ecab28fcadfd6b6",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/zenodo-7078451/01_readme.txt",
+          "artifact_bytes": 974
+        },
         "parsed": {
           "lines": [
             "This ESAA database consists of EEG data for 17 normal-hearing subjects. Taking S1/S1.mat as an example, the detailed descriptions of each file can be summarized as follows:",
@@ -2464,6 +2782,12 @@
         "bytes_read": 17877,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "5bcf1cc37e0e2c322a68391a8708a10caf2015e18a06c6abb414f1d86ae5e8b0",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/zenodo-7078451/02_preprocess_zip.zip",
+          "artifact_bytes": 17877
+        },
         "parsed": {
           "entries": 6,
           "first_entries": [
@@ -2501,6 +2825,12 @@
         "bytes_read": 24337,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "22f0f8fcb4c4e106a15a757fd7bd325e1935ca398ef196a6fbb8c3543a2c7726",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/zenodo-7078451/03_baseline_zip.zip",
+          "artifact_bytes": 24337
+        },
         "parsed": {
           "entries": 9,
           "first_entries": [
@@ -2598,6 +2928,12 @@
         "bytes_read": 43929,
         "content_length_header": "43929",
         "content_range": null,
+        "artifact": {
+          "sha256": "d08f39671dec6463847d57b9a82e8afdf2a1e57a122bed16e9f80c7d3ffddfb3",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/openmiir/01_stimuli_metadata.xlsx",
+          "artifact_bytes": 43929
+        },
         "parsed": {
           "sheets": [
             "Sheet1"
@@ -2666,6 +3002,12 @@
         "bytes_read": 46917,
         "content_length_header": "46917",
         "content_range": null,
+        "artifact": {
+          "sha256": "4b2465644d515575424f95e3d27e39122f45863a2b32b57fc11526f774ef641c",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/openmiir/02_electrode_info.xlsx",
+          "artifact_bytes": 46917
+        },
         "parsed": {
           "sheets": [
             "Sheet1"
@@ -2729,6 +3071,12 @@
         "bytes_read": 672,
         "content_length_header": "357",
         "content_range": null,
+        "artifact": {
+          "sha256": "b42c472fb1267525f32ec4405f08ca1cde5fc54bff9bf5887a15d69bcbf7b759",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/openmiir/03_beat_annotations.txt",
+          "artifact_bytes": 672
+        },
         "parsed": {
           "lines": [
             "# offset of cue: 1.632",
@@ -2808,6 +3156,12 @@
         "bytes_read": 13693,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "3a4163c1eb387145e66904f60b7bc0f8a53cf950d1ae044da6bd0603ac1b2336",
+          "is_partial": false,
+          "artifact_path": "outputs/probe_artifacts/zenodo-4537751/01_behavioral_data.xlsx",
+          "artifact_bytes": 13693
+        },
         "parsed": {
           "sheets": [
             "Sheet1"
@@ -2876,6 +3230,12 @@
         "bytes_read": 65536,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "cf003c425941eb2b70b4b7e7beed22551fbfa2e5f11296d9e4b5c4651c48d01f",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/zenodo-4537751/02_raw_yaml.txt",
+          "artifact_bytes": 65536
+        },
         "parsed": {
           "lines": [
             "'0001':",
@@ -2901,6 +3261,12 @@
         "bytes_read": 65536,
         "content_length_header": null,
         "content_range": null,
+        "artifact": {
+          "sha256": "0a9766ce4c31910eb1fd208fe9b6cd43167ca16683789b8b7ebe013668ec6edc",
+          "is_partial": true,
+          "artifact_path": "outputs/probe_artifacts/zenodo-4537751/03_sequences_yaml.txt",
+          "artifact_bytes": 65536
+        },
         "parsed": {
           "lines": [
             "'0001':",

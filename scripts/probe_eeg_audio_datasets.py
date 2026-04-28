@@ -11,11 +11,12 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import hashlib
 import json
 import re
 import struct
 import sys
-import textwrap
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,13 +60,28 @@ def s3_url(key: str) -> str:
     return f"{S3_BASE}/{key}"
 
 
-def get_bytes(url: str, max_bytes: int | None = None, timeout: int = 30) -> tuple[bytes, dict[str, str]]:
+def get_bytes(
+    url: str,
+    max_bytes: int | None = None,
+    timeout: int = 30,
+    attempts: int = 4,
+) -> tuple[bytes, dict[str, str]]:
     headers = {}
     if max_bytes is not None:
         headers["Range"] = f"bytes=0-{max_bytes - 1}"
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp.content, dict(resp.headers)
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp.content, dict(resp.headers)
+        except (requests.RequestException, requests.Timeout) as exc:
+            last_exc = exc
+            if attempt == attempts:
+                break
+            time.sleep(0.75 * attempt)
+    assert last_exc is not None
+    raise last_exc
 
 
 def list_s3(prefix: str, max_keys: int = 1000) -> dict[str, Any]:
@@ -194,8 +210,58 @@ def preview_binary(blob: bytes, headers: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def summarize_target(target: Target) -> dict[str, Any]:
+def artifact_extension(kind: str) -> str:
+    return {
+        "json": ".json",
+        "tsv": ".tsv",
+        "csv": ".csv",
+        "text": ".txt",
+        "textgrid": ".TextGrid",
+        "wav": ".wav.header.bin",
+        "xlsx": ".xlsx",
+        "zip": ".zip",
+        "binary": ".bin",
+    }.get(kind, ".bin")
+
+
+def safe_filename(text: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", text.strip()).strip("._")
+    return name or "artifact"
+
+
+def save_artifact(
+    artifact_dir: Path | None,
+    dataset_id: str,
+    target_index: int,
+    target: Target,
+    blob: bytes,
+    headers: dict[str, str],
+) -> dict[str, Any]:
+    sha = hashlib.sha256(blob).hexdigest()
+    info = {
+        "sha256": sha,
+        "is_partial": target.max_bytes is not None or headers.get("Content-Range") is not None,
+    }
+    if artifact_dir is None:
+        return info
+
+    dataset_dir = artifact_dir / safe_filename(dataset_id)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    path = dataset_dir / f"{target_index:02d}_{safe_filename(target.label)}{artifact_extension(target.kind)}"
+    path.write_bytes(blob)
+    info["artifact_path"] = str(path)
+    info["artifact_bytes"] = len(blob)
+    return info
+
+
+def summarize_target(
+    target: Target,
+    dataset_id: str,
+    target_index: int,
+    artifact_dir: Path | None = None,
+) -> dict[str, Any]:
     blob, headers = get_bytes(target.url, target.max_bytes)
+    artifact = save_artifact(artifact_dir, dataset_id, target_index, target, blob, headers)
     out: dict[str, Any] = {
         "label": target.label,
         "kind": target.kind,
@@ -203,6 +269,7 @@ def summarize_target(target: Target) -> dict[str, Any]:
         "bytes_read": len(blob),
         "content_length_header": headers.get("Content-Length"),
         "content_range": headers.get("Content-Range"),
+        "artifact": artifact,
     }
     try:
         if target.kind == "json":
@@ -229,9 +296,14 @@ def summarize_target(target: Target) -> dict[str, Any]:
     return out
 
 
-def safe_summarize_target(target: Target) -> dict[str, Any]:
+def safe_summarize_target(
+    target: Target,
+    dataset_id: str,
+    target_index: int,
+    artifact_dir: Path | None = None,
+) -> dict[str, Any]:
     try:
-        return summarize_target(target)
+        return summarize_target(target, dataset_id, target_index, artifact_dir)
     except Exception as exc:
         return {
             "label": target.label,
@@ -241,7 +313,14 @@ def safe_summarize_target(target: Target) -> dict[str, Any]:
         }
 
 
-def probe_openneuro(probe: Probe) -> dict[str, Any]:
+def summarize_targets(probe: Probe, artifact_dir: Path | None = None) -> list[dict[str, Any]]:
+    return [
+        safe_summarize_target(target, probe.dataset_id, index, artifact_dir)
+        for index, target in enumerate(probe.targets, start=1)
+    ]
+
+
+def probe_openneuro(probe: Probe, artifact_dir: Path | None = None) -> dict[str, Any]:
     ds = probe.dataset_id
     summary = {
         "dataset_id": ds,
@@ -259,11 +338,11 @@ def probe_openneuro(probe: Probe) -> dict[str, Any]:
             f for f in page["files"][:25] if f["size"] < 1_000_000
         ][:10],
     }
-    summary["targets"] = [safe_summarize_target(t) for t in probe.targets]
+    summary["targets"] = summarize_targets(probe, artifact_dir)
     return summary
 
 
-def probe_zenodo(probe: Probe) -> dict[str, Any]:
+def probe_zenodo(probe: Probe, artifact_dir: Path | None = None) -> dict[str, Any]:
     assert probe.zenodo_id is not None
     resp = requests.get(f"https://zenodo.org/api/records/{probe.zenodo_id}", timeout=30)
     resp.raise_for_status()
@@ -287,11 +366,11 @@ def probe_zenodo(probe: Probe) -> dict[str, Any]:
             for f in files[:12]
         ],
     }
-    summary["targets"] = [safe_summarize_target(t) for t in probe.targets]
+    summary["targets"] = summarize_targets(probe, artifact_dir)
     return summary
 
 
-def probe_github(probe: Probe) -> dict[str, Any]:
+def probe_github(probe: Probe, artifact_dir: Path | None = None) -> dict[str, Any]:
     assert probe.github_api is not None
     resp = requests.get(probe.github_api, timeout=30)
     resp.raise_for_status()
@@ -313,7 +392,7 @@ def probe_github(probe: Probe) -> dict[str, Any]:
             for item in listing
         ],
     }
-    summary["targets"] = [safe_summarize_target(t) for t in probe.targets]
+    summary["targets"] = summarize_targets(probe, artifact_dir)
     return summary
 
 
@@ -519,17 +598,17 @@ def build_probes() -> list[Probe]:
     ]
 
 
-def run(probes: list[Probe]) -> list[dict[str, Any]]:
+def run(probes: list[Probe], artifact_dir: Path | None = None) -> list[dict[str, Any]]:
     results = []
     for probe in probes:
         print(f"Probing {probe.dataset_id}...", file=sys.stderr)
         try:
             if probe.source == "OpenNeuro":
-                results.append(probe_openneuro(probe))
+                results.append(probe_openneuro(probe, artifact_dir))
             elif probe.source == "Zenodo":
-                results.append(probe_zenodo(probe))
+                results.append(probe_zenodo(probe, artifact_dir))
             else:
-                results.append(probe_github(probe))
+                results.append(probe_github(probe, artifact_dir))
         except Exception as exc:
             results.append(
                 {
@@ -586,7 +665,7 @@ def compact_markdown(results: list[dict[str, Any]]) -> str:
                         )
                     elif target["kind"] == "json":
                         value = parsed.get("Name") or parsed.get("SamplingFrequency") or "json"
-                        bits.append(f"{target['label']}: {str(value).strip()}")
+                        bits.append(f"{target['label']}: {markdown_cell(str(value))}")
                     else:
                         bits.append(f"{target['label']}: {target.get('bytes_read')} bytes")
             evidence = "; ".join(bits)
@@ -597,10 +676,102 @@ def compact_markdown(results: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def markdown_cell(value: Any) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", text).strip().replace("|", "\\|")
+
+
+def summarize_parsed_value(target: dict[str, Any]) -> str:
+    parsed = target.get("parsed", {})
+    if "error" in target:
+        return target["error"]
+    if not isinstance(parsed, dict):
+        return "unparsed"
+    kind = target.get("kind")
+    if kind == "json":
+        keys = ["Name", "DatasetDOI", "License", "SamplingFrequency", "EEGReference", "Manufacturer"]
+        values = [f"{key}={markdown_cell(parsed[key])}" for key in keys if key in parsed]
+        return "; ".join(values) or "json parsed"
+    if kind in {"csv", "tsv"}:
+        return f"columns={parsed.get('columns', [])}; preview_rows={parsed.get('preview_rows', [])[:2]}"
+    if kind == "xlsx":
+        return (
+            f"sheets={parsed.get('sheets', [])}; "
+            f"shape=({parsed.get('max_row')}, {parsed.get('max_column')}); "
+            f"preview_rows={parsed.get('preview_rows', [])[:2]}"
+        )
+    if kind == "textgrid":
+        return (
+            f"nonempty_labels={parsed.get('nonempty_labels')}; "
+            f"duration_sec_hint={parsed.get('duration_sec_hint')}; "
+            f"first_nonempty={parsed.get('first_nonempty', [])[:10]}"
+        )
+    if kind == "wav":
+        return (
+            f"sample_rate={parsed.get('sample_rate')}; channels={parsed.get('channels')}; "
+            f"bits={parsed.get('bits_per_sample')}; duration_sec_est={parsed.get('duration_sec_est')}"
+        )
+    if kind == "zip":
+        return f"entries={parsed.get('entries')}; first_entries={parsed.get('first_entries', [])[:5]}"
+    return f"bytes={target.get('bytes_read')}; magic={parsed.get('magic_hex')}; range={parsed.get('content_range')}"
+
+
+def detailed_markdown(results: list[dict[str, Any]]) -> str:
+    lines = [
+        "# EEG-audio dataset probe detailed report",
+        "",
+        "This report is generated from real remote metadata probes. Full EEG archives are not downloaded by default; partial byte-range artifacts are explicitly marked.",
+        "",
+        "## Dataset Summary",
+        "",
+        "| Dataset | Source | Priority | Fit | URL |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for res in results:
+        lines.append(
+            f"| {markdown_cell(res.get('dataset_id'))} | {markdown_cell(res.get('source'))} | {markdown_cell(res.get('priority'))} | {markdown_cell(res.get('fit'))} | {markdown_cell(res.get('url'))} |"
+        )
+
+    lines.extend(["", "## Target-Level Evidence", ""])
+    for res in results:
+        lines.extend([f"### {res.get('dataset_id')} - {res.get('title')}", ""])
+        if "error" in res:
+            lines.extend([f"Probe error: `{res['error']}`", ""])
+            continue
+        if res.get("doi"):
+            lines.append(f"DOI: `{res['doi']}`")
+        if res.get("file_count") is not None:
+            lines.append(f"Zenodo file count: `{res['file_count']}`")
+        if res.get("s3_first_page"):
+            page = res["s3_first_page"]
+            lines.append(
+                f"OpenNeuro S3 first page: `{page.get('key_count_page')}` keys; truncated=`{page.get('is_truncated')}`"
+            )
+        lines.append("")
+        lines.append("| Target | Kind | Bytes | Partial | Artifact | Parsed evidence |")
+        lines.append("| --- | --- | ---: | --- | --- | --- |")
+        for target in res.get("targets", []):
+            artifact = target.get("artifact", {})
+            artifact_path = artifact.get("artifact_path", "")
+            partial = artifact.get("is_partial", "")
+            evidence = markdown_cell(summarize_parsed_value(target))
+            lines.append(
+                f"| {markdown_cell(target.get('label'))} | {markdown_cell(target.get('kind'))} | {markdown_cell(target.get('bytes_read', ''))} | {markdown_cell(partial)} | {markdown_cell(artifact_path)} | {evidence} |"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--md-out", type=Path)
+    parser.add_argument("--detail-md-out", type=Path)
+    parser.add_argument(
+        "--artifact-dir",
+        type=Path,
+        help="Directory for saved raw probe artifacts: small metadata files, headers, and byte-range samples.",
+    )
     parser.add_argument(
         "--only",
         nargs="*",
@@ -613,12 +784,14 @@ def main() -> None:
         wanted = set(args.only)
         probes = [p for p in probes if p.dataset_id in wanted]
 
-    results = run(probes)
+    results = run(probes, args.artifact_dir)
     if args.json_out:
         args.json_out.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
     markdown = compact_markdown(results)
     if args.md_out:
         args.md_out.write_text(markdown, encoding="utf-8")
+    if args.detail_md_out:
+        args.detail_md_out.write_text(detailed_markdown(results), encoding="utf-8")
     print(markdown)
 
 

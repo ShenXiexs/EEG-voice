@@ -1,0 +1,105 @@
+# macOS and editor noise
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+._*
+*.swp
+*.swo
+*~
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# Local data downloads: keep raw data outside git
+data/
+datasets/
+downloads/
+openneuro/
+zenodo/
+raw/
+derived/
+cache/
+tmp/
+temp/
+
+# Probe artifacts: reports are OK, saved remote snippets/binaries stay local
+outputs/probe_artifacts/
+
+# EEG / MEG / biosignal raw and derivative files
+*.eeg
+*.edf
+*.bdf
+*.gdf
+*.cnt
+*.vhdr
+*.vmrk
+*.set
+*.fdt
+*.fif
+*.fif.gz
+*.xdf
+
+# Audio and video stimuli
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Large scientific arrays and model artifacts
+*.mat
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+# Archives and downloaded bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.gz
+*.bz2
+*.xz
+
+# Reference PDFs can be large; force-add explicitly if a PDF must be versioned
+*.pdf
+
+# Logs and generated reports that can grow large
+*.log
+logs/
+runs/
+wandb/
+mlruns/
+tensorboard/
+checkpoints/
+models/
+
+# Keep current lightweight reports trackable
+!outputs/
+!outputs/*.md
+!outputs/*.json
