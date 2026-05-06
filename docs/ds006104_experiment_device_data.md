@@ -1,40 +1,45 @@
 # ds006104 实验-设备-数据说明
 
-## 定位
+## 1. 数据定位
 
-`ds006104` 是 speech decoding 的受控 phoneme discrimination + TMS-EEG 数据集。当前项目中，它用于验证：
+`ds006104` 是 controlled speech decoding + TMS-EEG 数据集。它在当前项目中的角色不是训练自然声音重构模型，而是作为 `Voice Image EEG Dataset` 之前的受控验证集，用来回答一个更基础的问题：
 
 ```text
-EEG token 是否保留 phoneme / CV / VC / CVC、articulatory feature、F0/timbre/style 的可解码线索
+EEG token 是否保留声音内容、音素结构、发音结构、音调/音色线索和情绪风格线索
 ```
 
-它不是自然幻听数据，也不是自然连续语音数据。它适合做 AVH Voice Image Dataset 之前的受控 probe。
+该数据集的价值在于控制程度高。它把语音材料拆成 single phoneme、CV、VC、CVC real word / pseudoword，并在 `events.tsv` 中给出 phoneme、manner、place、voicing、category、TMS target 等标签。项目本地同时保存了对应的真实音频刺激，可直接提取 F0、duration、spectral centroid、brightness、energy envelope 等声音形象特征。
 
-## 实验设计
+## 2. 数据已经做到什么
+
+### 2.1 实验任务
 
 数据集包含两个相关研究：
 
-| Study | Session | Subjects | 任务 |
+| Study | Session | Subjects | 任务结构 |
 | --- | --- | --- | --- |
 | Study 1 | `ses-01` | `sub-P01` 到 `sub-P08` | CV / VC phoneme pairs |
 | Study 2 | `ses-02` | `sub-S01` 到 `sub-S16` | single phonemes、CV pairs、real words、pseudowords |
 
-被试听 speech sounds，并通过 button press 识别刺激。刺激包括：
+被试听 speech sounds，并通过 button press 识别刺激。刺激覆盖：
 
-- consonants: `/b/`, `/p/`, `/d/`, `/t/`, `/s/`, `/z/`
-- vowels: `/i/`, `/E/`, `/A/`, `/u/`, `/oU/`
-- CV / VC combinations
-- CVC real words / pseudowords
+| 类型 | 内容 |
+| --- | --- |
+| consonants | `/b/`, `/p/`, `/d/`, `/t/`, `/s/`, `/z/` |
+| vowels | `/i/`, `/E/`, `/A/`, `/u/`, `/oU/` |
+| phoneme pairs | CV、VC |
+| phoneme triplets | CVC real words、CVC pseudowords |
 
 实验同时包含 TMS：
 
-- Study 1: LipM1、TongueM1
-- Study 2: Broca's area BA44、verbal memory region BA6 等
-- TMS 为 paired pulses，50 ms interpulse interval
+| Study | TMS target |
+| --- | --- |
+| Study 1 | LipM1、TongueM1 |
+| Study 2 | Broca's area BA44、verbal memory region BA6、motor cortex targets |
 
-建模时必须把 `tms_target`、`tms_intensity` 和 TMS/stimulus onset timing 作为 nuisance 或 control condition。
+TMS 采用 paired pulses，50 ms interpulse interval。建模时 `tms_target`、`tms_intensity`、TMS onset 与 stimulus onset 的相对时间必须作为 control / nuisance 信息进入数据表。
 
-## 设备
+### 2.2 EEG 设备
 
 本地 `sub-P01_ses-01_task-phonemes_eeg.json` 显示：
 
@@ -50,24 +55,9 @@ EEG token 是否保留 phoneme / CV / VC / CVC、articulatory feature、F0/timbr
 | Hardware high-pass | 0.1 Hz |
 | Hardware low-pass | 350 Hz |
 
-## 数据结构
+当前完整派生数据已经重采样到 250 Hz，保存为 `data/derived/openneuro_full/ds006104/.../*_full_eeg.npz`。
 
-本地路径：
-
-```text
-data/raw/openneuro/ds006104_datalad/
-```
-
-关键文件：
-
-```text
-sub-P01/ses-01/eeg/sub-P01_ses-01_task-phonemes_eeg.edf
-sub-P01/ses-01/eeg/sub-P01_ses-01_task-phonemes_events.tsv
-sub-P01/ses-01/eeg/sub-P01_ses-01_task-phonemes_channels.tsv
-sub-S01/ses-02/eeg/sub-S01_ses-02_task-singlephoneme_eeg.edf
-sub-S01/ses-02/eeg/sub-S01_ses-02_task-phonemes_eeg.edf
-sub-S01/ses-02/eeg/sub-S01_ses-02_task-Words_eeg.edf
-```
+### 2.3 EEG 事件标签
 
 `events.tsv` 核心列：
 
@@ -87,63 +77,239 @@ trial
 voicing
 ```
 
-其中：
+标签含义：
 
-- `trial_type=TMS` 表示 TMS pulse。
-- `trial_type=stimulus` 表示语音刺激 onset。
-- `category/manner/place/voicing` 可作为 articulatory probe 标签。
-- `phoneme1/phoneme2/phoneme3` 可构造 single phoneme、CV、VC、CVC 标签。
+| 字段 | 用途 |
+| --- | --- |
+| `trial_type=TMS` | TMS pulse event |
+| `trial_type=stimulus` | speech stimulus onset |
+| `phoneme1/2/3` | single phoneme、CV、VC、CVC content unit |
+| `category` | real / nonce 或 articulatory category |
+| `manner` | stop 等发音方式 |
+| `place` | bilabial、alveolar 等发音部位 |
+| `voicing` | voiced / unvoiced |
+| `tms_target` | control / nuisance condition |
 
-## 当前处理输出
+## 3. 本地音频刺激
 
-处理脚本：
-
-```text
-scripts/prepare_downloaded_openneuro_artifacts.py
-```
-
-运行：
-
-```bash
-python3 scripts/prepare_downloaded_openneuro_artifacts.py \
-  --ds006104-root data/raw/openneuro/ds006104_datalad \
-  --out-dir outputs/downloaded_openneuro_artifacts
-```
-
-输出：
+当前项目中，`ds006104` 的音频刺激位于：
 
 ```text
-outputs/downloaded_openneuro_artifacts/ds006104/inventory.json
-outputs/downloaded_openneuro_artifacts/ds006104/*events.tsv.summary.md
-outputs/downloaded_openneuro_artifacts/ds006104/*.edf.preview.svg
+data/raw/openneuro/ds006104/stimuli/
 ```
 
-EDF preview 图只展示前几秒的多个 EEG 通道，用于快速检查：
+该目录是本项目做声音形象建模时最重要的补充材料。它不是只给事件标签，而是给出了可直接分析的 wav 文件。
 
-- 文件是否真实下载，不只是 annex 指针。
-- 信号是否非空。
-- 通道尺度是否异常。
-- 是否存在明显饱和或大伪迹。
+本地统计：
 
-## 当前项目使用方式
+| 项目 | 数值 |
+| --- | ---: |
+| wav 总数 | 1273 |
+| sample rate | 44100 Hz |
+| sample width | 16 bit |
+| mono 文件 | 1271 |
+| stereo 文件 | 2 |
+| median duration | 0.573 s |
+| min duration | 0.163 s |
+| max duration | 10.000 s |
 
-建议第一步做：
+目录结构：
+
+| 目录 | wav 数 | 含义 |
+| --- | ---: | --- |
+| root | 482 | 扁平化复制的 CV/VC/CVC 音频 |
+| `CV/` | 160 | consonant-vowel stimuli |
+| `VC/` | 160 | vowel-consonant stimuli |
+| `Words/` | 311 | real / nonce CVC words |
+| `Controls/` | 160 | vowel/control/noise-like controls |
+
+文件名直接携带 emotion/style 标签：
+
+| 标签 | wav 数 |
+| --- | ---: |
+| angry | 639 |
+| happy | 632 |
+| other / noise | 2 |
+
+示例：
 
 ```text
-EDF + events.tsv
--> epoch around stimulus onset
--> EEG tokenizer / shallow encoder
--> probe labels:
-   phoneme
-   CV / VC / CVC
-   category / manner / place / voicing
-   TMS target as control variable
+CV/CV i/Bi_angry1.wav
+CV/CV i/Bi_happy1.wav
+VC/VC i/cleaned/iB_angry1.wav
+Words/Nonce i/Dit_happy1.wav
+Controls/a_angry1_control.wav
 ```
 
-如果要连接声音形象目标，应结合本地 `data/meeting_examples/ds006104/stimuli/` 的音频特征表，把 phoneme/content probe 扩展到 F0、brightness、style。
+这些音频允许构造以下声音形象标签：
 
-## 注意事项
+| 标签 | 构造方式 |
+| --- | --- |
+| content unit | filename + `phoneme1/2/3` |
+| CV / VC / CVC | directory + filename + event columns |
+| real vs nonce | `category` 或 `Words/` 子目录 |
+| emotion style | filename 中的 `happy` / `angry` |
+| F0 | wav 提取 |
+| duration | wav header |
+| intensity / RMS | wav 提取 |
+| timbre brightness | spectral centroid / bandwidth |
+| voicing | `events.tsv` + pitch voiced ratio |
+| articulatory features | `manner`、`place`、`voicing` |
 
-- `derivatives/eeglab/*.set/.fdt` 体积较大，第一版不需要。
-- 数据包含 TMS，不能把所有刺激响应都解释为纯听觉响应。
-- 不是 AVH 患者数据，不能直接证明幻听声音重构。
+## 4. 能支持什么实验
+
+### 4.1 EEG token 内容保真度
+
+任务：
+
+```text
+EEG window around speech onset
+-> EEG tokenizer
+-> probe phoneme / CV / VC / CVC / real-vs-nonce
+```
+
+可检验问题：
+
+- token 是否区分 `/b/`、`/p/`、`/d/`、`/t/` 等 consonant。
+- token 是否保留 vowel 信息。
+- token 是否区分 CV 与 VC。
+- token 是否区分 real word 与 pseudoword。
+
+### 4.2 发音结构 probe
+
+任务：
+
+```text
+EEG token -> manner / place / voicing
+```
+
+用途：
+
+- 检验 tokenizer 是否学到 articulatory structure。
+- 检查模型是否只利用低层声音能量，而没有捕捉 phonemic organization。
+- 与 `Voice Image EEG Dataset` 中的 phoneme / syllable / word 维度对应。
+
+### 4.3 音调、音色、情绪风格 probe
+
+任务：
+
+```text
+EEG token -> F0 bin / brightness bin / happy-vs-angry / duration / energy
+```
+
+来源：
+
+```text
+data/raw/openneuro/ds006104/stimuli/*.wav
+```
+
+用途：
+
+- 验证 EEG token 是否携带 pitch 线索。
+- 验证 EEG token 是否携带 timbre brightness 线索。
+- 验证 happy / angry 风格是否能从 EEG 中被线性或浅层模型读出。
+- 为后续 voice image reconstruction 的 attribute heads 提供受控评估。
+
+### 4.4 TMS confound / robustness
+
+任务：
+
+```text
+EEG token -> speech label
+conditioned on tms_target / tms_intensity
+```
+
+用途：
+
+- 分离 speech-evoked response 与 TMS-evoked response。
+- 检查模型是否错误利用 TMS target 预测语音类别。
+- 在报告中给出 control-condition 结果。
+
+## 5. 对当前模型的帮助
+
+| 模型组件 | ds006104 的作用 |
+| --- | --- |
+| EEG tokenizer | 训练或验证短窗 speech-evoked EEG token |
+| `ProbeHead` | phoneme、CV/VC/CVC、manner、place、voicing、happy/angry |
+| `VoiceAttributeHead` | F0 high/low、brightness high/low、duration、RMS |
+| nuisance/control branch | tms_target、tms_intensity、button response timing |
+| evaluation | 检查 token 是否保留 content + voice attribute，而不是只重构 EEG |
+
+最小模型闭环：
+
+```text
+EDF EEG + events.tsv + stimuli wav
+-> speech-onset epochs
+-> EEG tokenizer
+-> discrete EEG tokens
+-> content/articulation/style/acoustic attribute probes
+```
+
+这一步通过后，才具备进入 `ds005345` 自然语音 stream retrieval 和自建 `Voice Image EEG Dataset` 的基础。
+
+## 6. 当前本地数据
+
+原始 EEG / events：
+
+```text
+data/raw/openneuro/ds006104_datalad/
+```
+
+本地音频：
+
+```text
+data/raw/openneuro/ds006104/stimuli/
+```
+
+完整派生 EEG：
+
+```text
+data/derived/openneuro_full/ds006104/
+```
+
+当前完整派生文件：
+
+```text
+data/derived/openneuro_full/ds006104/sub-P01/ses-01/sub-P01_ses-01_task-phonemes_full_eeg.npz
+data/derived/openneuro_full/ds006104/sub-S01/ses-02/sub-S01_ses-02_task-Words_full_eeg.npz
+data/derived/openneuro_full/ds006104/sub-S01/ses-02/sub-S01_ses-02_task-phonemes_full_eeg.npz
+data/derived/openneuro_full/ds006104/sub-S01/ses-02/sub-S01_ses-02_task-singlephoneme_full_eeg.npz
+```
+
+派生 manifest：
+
+```text
+data/derived/openneuro_full/recordings_manifest.csv
+```
+
+NPZ schema：
+
+```text
+eeg: float32 [channels, time]
+sfreq: 250.0
+ch_names: channel names
+eeg_kind: raw
+source: original EDF path
+```
+
+## 7. 不能支持什么
+
+| 限制 | 影响 |
+| --- | --- |
+| 不是自然连续语音 | 不适合作为自然 voice reconstruction 主训练集 |
+| 包含 TMS | speech label probe 必须控制 TMS 条件 |
+| 音频多为短刺激 | 适合 phoneme / attribute probe，不适合长语义检索 |
+| 没有同一完整句子的多说话人版本 | 不能单独解决 speaker identity 与 content 解耦 |
+| 不是目标声音形象任务 | 不能直接证明无外部声波时的 voice image reconstruction |
+
+## 8. 在项目路线中的位置
+
+```text
+ds006104
+-> controlled speech unit + acoustic attribute probe
+-> 验证 EEG token 是否有 content / pitch / timbre / style 信息
+-> ds005345 single/mix stream retrieval
+-> 自建 Voice Image EEG Dataset 的声音形象检索与重构
+```
+
+`ds006104` 的结论用于回答“模型是否具备读出声音基本属性的能力”。它不提供最终重构任务，但为最终任务提供最干净的低层验证。
