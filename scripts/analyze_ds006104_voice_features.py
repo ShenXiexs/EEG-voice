@@ -291,7 +291,7 @@ def summarize(features: list[VoiceFeature], fig_path: Path) -> str:
     lines = [
         "# ds006104 Voice Timbre/Pitch Local Summary",
         "",
-        "这个目录用于当前项目的声音形象重构方向：EEG token 优先预测音调、音色和声音风格，而不是文本。",
+        "这个目录用于当前项目的说话形象重构方向：EEG -> token -> 与声音内容/音色/音调表征对齐 -> 说话形象重构。",
         "",
         f"- stimuli root: `{STIMULI}`",
         f"- wav files: {len(features)}",
@@ -315,9 +315,9 @@ def summarize(features: list[VoiceFeature], fig_path: Path) -> str:
             "",
             "## Recommended use",
             "",
-            "- 先把音频侧特征作为重构目标：log-F0、voicing、mel 或谱包络、brightness/centroid/bandwidth。",
-            "- 再把 happy/angry/control 作为 probe，检查 EEG token 是否保留音调和音色线索。",
-            "- 训练 waveform vocoder 之前，先报告 F0 correlation、声学特征误差、timbre embedding cosine 和条件分类准确率。",
+            "- 先把音频侧特征作为对齐目标：content unit、log-F0、voicing、mel 或谱包络、brightness/centroid/bandwidth。",
+            "- 再把 happy/angry/control 作为 probe，检查 EEG token 是否保留声音内容、音调和音色线索。",
+            "- 训练 waveform vocoder 之前，先报告 content retrieval、F0 correlation、声学特征误差、timbre embedding cosine 和条件分类准确率。",
         ]
     )
     return "\n".join(lines)

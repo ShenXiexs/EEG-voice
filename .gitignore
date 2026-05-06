@@ -31,6 +31,17 @@ cache/
 tmp/
 temp/
 
+# Project-local dataset working dirs
+data/raw/openneuro/
+data/raw/zenodo/
+data/derived/
+data/cache/
+data/meeting_examples/
+data/token_probe/
+data/retrieval/
+artifacts/
+results/
+
 # Probe artifacts: reports are OK, saved remote snippets/binaries stay local
 outputs/probe_artifacts/
 
@@ -62,6 +73,8 @@ outputs/probe_artifacts/
 
 # Large scientific arrays and model artifacts
 *.mat
+*.nii
+*.nii.gz
 *.h5
 *.hdf5
 *.npy

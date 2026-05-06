@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760">
+  <rect width="1280" height="760" fill="#fbfaf7"/>
+  <text x="48" y="58" font-family="Arial" font-size="30" font-weight="700" fill="#1f2d36">Model v0 Code Modules</text>
+  <text x="48" y="88" font-family="Arial" font-size="15" fill="#53636d">Reference-code style: reusable blocks first, thin tokenizer assembly, small task heads.</text>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#53636d"/>
+    </marker>
+    <style>
+      .file { fill:#ffffff; stroke:#23343d; stroke-width:1.5; rx:8; }
+      .block { fill:#eef5f4; stroke:#3d6f68; stroke-width:1.2; rx:7; }
+      .head { fill:#f7efe7; stroke:#9b6848; stroke-width:1.2; rx:7; }
+      .txt { font-family:Arial; font-size:15px; fill:#1f2d36; }
+      .small { font-family:Arial; font-size:12px; fill:#53636d; }
+      .arrow { stroke:#53636d; stroke-width:2; fill:none; marker-end:url(#arrow); }
+    </style>
+  </defs>
+
+  <rect class="file" x="60" y="140" width="250" height="92"/>
+  <text class="txt" x="88" y="174">builders.py</text>
+  <text class="small" x="88" y="198">build_tokenizer_v0()</text>
+  <text class="small" x="88" y="216">build_model_v0_bundle()</text>
+
+  <rect class="file" x="380" y="140" width="250" height="92"/>
+  <text class="txt" x="408" y="174">tokenizer.py</text>
+  <text class="small" x="408" y="198">BrainStyleEEGTokenizerV0</text>
+  <text class="small" x="408" y="216">encode -> quantize -> decode</text>
+
+  <rect class="file" x="700" y="120" width="470" height="230"/>
+  <text class="txt" x="728" y="154">modules.py</text>
+  <rect class="block" x="728" y="176" width="184" height="44"/>
+  <text class="small" x="746" y="204">SensorEmbedding</text>
+  <rect class="block" x="940" y="176" width="184" height="44"/>
+  <text class="small" x="958" y="204">TemporalEncoder</text>
+  <rect class="block" x="728" y="236" width="184" height="44"/>
+  <text class="small" x="746" y="264">LatentQueryAggregator</text>
+  <rect class="block" x="940" y="236" width="184" height="44"/>
+  <text class="small" x="958" y="264">ResidualVectorQuantizer</text>
+  <rect class="block" x="834" y="296" width="184" height="44"/>
+  <text class="small" x="852" y="324">TemporalDecoder</text>
+
+  <rect class="file" x="380" y="420" width="250" height="126"/>
+  <text class="txt" x="408" y="454">heads.py</text>
+  <text class="small" x="408" y="478">ProbeHead</text>
+  <text class="small" x="408" y="498">AudioContrastiveHead</text>
+  <text class="small" x="408" y="518">VoiceAttributeHead</text>
+
+  <rect class="file" x="700" y="420" width="250" height="126"/>
+  <text class="txt" x="728" y="454">losses.py</text>
+  <text class="small" x="728" y="478">time/frequency/PCC</text>
+  <text class="small" x="728" y="498">commitment loss</text>
+  <text class="small" x="728" y="518">InfoNCE</text>
+
+  <rect class="file" x="60" y="420" width="250" height="126"/>
+  <text class="txt" x="88" y="454">datasets.py</text>
+  <text class="small" x="88" y="478">DS006104EpochDataset</text>
+  <text class="small" x="88" y="498">DS005345StreamDataset</text>
+  <text class="small" x="88" y="518">batch schema only</text>
+
+  <rect class="file" x="60" y="610" width="250" height="82"/>
+  <text class="txt" x="88" y="644">audio_features.py</text>
+  <text class="small" x="88" y="668">F0/intensity/timbre stats</text>
+
+  <rect class="file" x="380" y="610" width="250" height="82"/>
+  <text class="txt" x="408" y="644">configs/*.yaml</text>
+  <text class="small" x="408" y="668">model + run mapping</text>
+
+  <path class="arrow" d="M310 186 L380 186"/>
+  <path class="arrow" d="M630 186 L700 205"/>
+  <path class="arrow" d="M505 232 L505 420"/>
+  <path class="arrow" d="M630 483 L700 483"/>
+  <path class="arrow" d="M310 483 L380 483"/>
+  <path class="arrow" d="M185 610 L185 546"/>
+  <path class="arrow" d="M505 610 L505 546"/>
+
+  <text class="small" x="48" y="730">讲解顺序: builders.py 组装 -> tokenizer.py 串联 -> modules.py 解释核心结构 -> heads/losses 解释任务目标。</text>
+</svg>

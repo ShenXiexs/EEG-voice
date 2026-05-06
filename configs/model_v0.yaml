@@ -1,0 +1,26 @@
+runtime:
+  device: cuda
+  precision: bf16
+  requires: [torch, mne, numpy, pandas, scipy, torchaudio]
+
+tokenizer:
+  sample_rate: 250
+  window_sec: 2.0
+  dim: 256
+  latent_queries: 16
+  codebook_size: 512
+  num_quantizers: 4
+  encoder_channels: 64
+  downsample_rates: [2, 2, 2, 2]
+  n_heads: 4
+  dropout: 0.1
+
+heads:
+  audio_embedding_dim: 11
+  projection_dim: 256
+  contrastive_temperature: 0.07
+
+data:
+  ds006104_root: data/raw/openneuro/ds006104_datalad
+  ds005345_root: data/raw/openneuro/ds005345_datalad
+  ds005345_run_config: configs/ds005345_runs.yaml
