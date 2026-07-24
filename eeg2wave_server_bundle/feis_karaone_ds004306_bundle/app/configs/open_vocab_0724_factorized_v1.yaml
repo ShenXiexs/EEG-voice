@@ -104,7 +104,7 @@ experiment:
 training:
   audio_batch_size: 8
   eeg_batch_size: 6
-  audio_epochs: 30
+  audio_epochs: 15
   eeg_pretrain_epochs: 20
   eeg_epochs: 40
   audio_lr: 0.0003
