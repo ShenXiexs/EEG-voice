@@ -1,5 +1,55 @@
 # FEIS + KARA ONE + ds004306 preprocessing bundle
 
+## OpenVoice-EEG v0724（内容—发声实现解耦）
+
+v0724 位于 `app/src/open_vocab_0724/`，与 0721/0722 checkpoint、cache 和
+artifact 完全隔离。模型从 EEG 分别预测 content tokens 与 realization/timbre
+tokens，显式输出 80-bin log-mel 能量结构和可变长度 EnCodec codes。正式
+`encode`/`generate` 接口只接收 EEG、通道坐标、通道 mask 和时间 mask；label、
+subject、dataset 与真实音频均不能进入推理路径。
+
+默认配置和严格运行顺序如下。`audit-audio --strict` 未通过时，EEG 配对训练会
+被 audio freeze gate 阻止；validation gate 未通过时，locked test 仍不可访问。
+
+```bash
+cd /Users/samxie/Research/EEG-Voice/ref_github/speech_decoding/eeg2wave_server_bundle/feis_karaone_ds004306_bundle
+bash app/run_open_vocab_0724_v1.sh cache
+bash app/run_open_vocab_0724_v1.sh train-audio
+bash app/run_open_vocab_0724_v1.sh audit-audio --strict
+bash app/run_open_vocab_0724_v1.sh pretrain-eeg
+bash app/run_open_vocab_0724_v1.sh train-eeg
+bash app/run_open_vocab_0724_v1.sh validate
+bash app/run_open_vocab_0724_v1.sh synthesize karaone validation
+bash app/run_open_vocab_0724_v1.sh gate --strict
+```
+
+完整架构、监督边界、输出格式、指标和反事实条件见
+[`reports/open_vocab_eeg_to_speech_factorized_0724.md`](reports/open_vocab_eeg_to_speech_factorized_0724.md)。
+KaraOne 是唯一进入 trial-specific realization gate 的数据集；FEIS 只提供
+subject-label content/弱 timbre prototype，ds004306 不参与音频重建 gate。
+`synthesize` 因此只接受 `karaone|feis`，不会为 ds004306 生成伪音频。
+
+主 seed 通过后，可用隔离 artifact 路径运行另外两个 seed、训练集内
+subject-LOSO 和 held-label 开发实验，不会覆盖主 checkpoint：
+
+```bash
+bash app/run_open_vocab_0724_v1.sh seeds
+bash app/run_open_vocab_0724_v1.sh loso karaone:S01
+bash app/run_open_vocab_0724_v1.sh held-label /IY/
+```
+
+正式消融配置由同参数量开关生成；除 ContentVec 外均复用已经通过 gate 的冻结
+audio prior，只重新训练 EEG。ContentVec 需要显式提供本地模型或模型 ID，并建立
+独立 cache/audio oracle：
+
+```bash
+bash app/run_open_vocab_0724_v1.sh ablation-config content_only \
+  app/configs/open_vocab_0724_ablation_content_only.yaml
+bash app/run_open_vocab_0724_v1.sh ablation-config full_contentvec \
+  app/configs/open_vocab_0724_ablation_contentvec.yaml \
+  --contentvec-model /absolute/path/to/contentvec
+```
+
 ## OpenVoice-EEG 0722 V1（新版本）
 
 开放词汇、label-free EEG→语音版本已隔离实现于

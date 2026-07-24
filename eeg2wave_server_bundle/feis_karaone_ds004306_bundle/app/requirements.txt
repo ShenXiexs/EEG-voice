@@ -9,3 +9,4 @@ transformers
 huggingface_hub
 mne
 soundfile
+matplotlib
