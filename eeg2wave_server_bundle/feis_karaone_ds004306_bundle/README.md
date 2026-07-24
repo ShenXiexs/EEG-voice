@@ -8,19 +8,33 @@ tokens，显式输出 80-bin log-mel 能量结构和可变长度 EnCodec codes�
 `encode`/`generate` 接口只接收 EEG、通道坐标、通道 mask 和时间 mask；label、
 subject、dataset 与真实音频均不能进入推理路径。
 
-默认配置和严格运行顺序如下。`audit-audio --strict` 未通过时，EEG 配对训练会
-被 audio freeze gate 阻止；validation gate 未通过时，locked test 仍不可访问。
+默认配置采用固定三 seed（15/31/47）和所有 locked-train KaraOne subject 的
+LOSO。`audit-audio --strict` 未通过时，EEG 预训练和配对训练都会被 audio
+freeze gate 阻止；validation gate 未通过时，locked test 不可访问。
 
 ```bash
 cd /Users/samxie/Research/EEG-Voice/ref_github/speech_decoding/eeg2wave_server_bundle/feis_karaone_ds004306_bundle
 bash app/run_open_vocab_0724_v1.sh cache
 bash app/run_open_vocab_0724_v1.sh train-audio
 bash app/run_open_vocab_0724_v1.sh audit-audio --strict
-bash app/run_open_vocab_0724_v1.sh pretrain-eeg
-bash app/run_open_vocab_0724_v1.sh train-eeg
-bash app/run_open_vocab_0724_v1.sh validate
+bash app/run_open_vocab_0724_v1.sh seeds
+bash app/run_open_vocab_0724_v1.sh loso-all
 bash app/run_open_vocab_0724_v1.sh synthesize karaone validation
 bash app/run_open_vocab_0724_v1.sh gate --strict
+```
+
+`synthesize` 默认只处理 reconstruction-eligible 的 trial；超过 4 秒主动发声的
+KaraOne trial 保留在 content 学习/latent evaluation 中，不会进入 exact
+energy/code gate。正式 gate 会拒绝 `--limit`、缺失反事实、跳过 decoded-content
+metric、非主 g1 run，或不完整的三-seed/全-subject LOSO artifact。它不会接受
+latent cosine 替代解码波形的 HuBERT frame matching/SpeechBERTScore。
+
+通过严格 validation gate 后，使用下面唯一入口运行最终 test；该入口原子地占用
+一次 final-test session，依次执行 combined latent evaluation、KaraOne 与 FEIS
+reconstruction。不要分别直接调用脚本的 `--split test`：一次 session 不能重放。
+
+```bash
+bash app/run_open_vocab_0724_v1.sh test
 ```
 
 完整架构、监督边界、输出格式、指标和反事实条件见
@@ -34,8 +48,16 @@ subject-LOSO 和 held-label 开发实验，不会覆盖主 checkpoint：
 
 ```bash
 bash app/run_open_vocab_0724_v1.sh seeds
-bash app/run_open_vocab_0724_v1.sh loso karaone:S01
+bash app/run_open_vocab_0724_v1.sh loso karaone:MM05
+bash app/run_open_vocab_0724_v1.sh loso-all
 bash app/run_open_vocab_0724_v1.sh held-label /IY/
+```
+
+`all` 是上述完整正式顺序的便捷入口（包含三 seed 与 `loso-all`，但绝不触发
+locked test）：
+
+```bash
+bash app/run_open_vocab_0724_v1.sh all
 ```
 
 正式消融配置由同参数量开关生成；除 ContentVec 外均复用已经通过 gate 的冻结

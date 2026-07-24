@@ -87,20 +87,32 @@ Every KaraOne validation trial synthesizes:
 
 The audio prior must first satisfy the inherited absolute oracle thresholds,
 including median log-mel MAE at or below 12 dB, and the new factor-swap gains.
+Only validation audio is scored; a train utterance can serve solely as a
+non-scored same-label control for a validation singleton (the FEIS case).
 The EEG gate then requires the preregistered morphology, soft-DTW, content,
 subject-bootstrap and trial-win criteria in
 `app/configs/open_vocab_0724_factorized_v1.yaml`. A passed validation gate is
 cryptographically bound to the config, cache lineage, audio checkpoint, EEG
-checkpoint and synthesis manifest before locked-test access is authorized.
+checkpoint, primary synthesis manifest and every LOSO synthesis manifest before
+locked-test access is authorized. The primary validation manifest must cover
+every reconstruction-eligible KaraOne validation trial exactly once, contain
+all eight counterfactuals, and contain finite decoded-content scores; diagnostic
+limits and latent-only content scores cannot unlock the test.
 It also checks factor selectivity: same-label realization swaps must preserve
 content better than wrong-content swaps, while realization swaps must affect
 duration more than content swaps.
 
 ## Reproducibility and ablations
 
-The primary seed is 15; seeds 31 and 47, development subject-LOSO folds, and
-g2/g3 held-label runs are written to distinct checkpoint namespaces. Only the
-primary g1 validation gate can authorize the locked test. The ablation config
+The primary seed is 15; seeds 31 and 47, and every development subject-LOSO
+fold are written to distinct checkpoint/evaluation namespaces. Formal gating
+requires all three seeds plus every KaraOne locked-train LOSO fold; the
+subject-bootstrap intervals are computed from those LOSO subjects, never from
+the single official KaraOne validation subject. Only the primary g1 validation
+gate can authorize the locked test. Authorization additionally creates an
+atomic, single-session access ledger before any test row is opened; the
+official runner consumes its three components (latent evaluation, KaraOne
+reconstruction, FEIS reconstruction) exactly once. The ablation config
 generator supports dual-token/no-energy-map, dual-token/no-disentanglement,
 content-only, realization-only, full HuBERT v0724 and full ContentVec. Branches
 are disabled by masks/zero loss weights rather than deleting modules, so the
