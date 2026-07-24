@@ -34,7 +34,11 @@ case "${1:-}" in
     run_train evaluate --split validation "${@:2}"
     ;;
   synthesize)
-    dataset="${2:?usage: $0 synthesize {karaone|feis} [validation|test] [options]}"
+    if [[ -z "${2:-}" ]]; then
+      echo "usage: $0 synthesize {karaone|feis} [validation|test] [options]" >&2
+      exit 2
+    fi
+    dataset="$2"
     shift 2
     split="validation"
     if [[ "${1:-}" == "validation" || "${1:-}" == "test" ]]; then
@@ -44,6 +48,21 @@ case "${1:-}" in
     args=(--config "${CONFIG}" --dataset "${dataset}" --split "${split}" "${DEVICE_ARGS[@]}")
     [[ "${split}" == "test" ]] && args+=(--allow-final-test)
     exec "${PYTHON_BIN}" "${BUNDLE_DIR}/app/scripts/synthesize_open_vocab_0724.py" "${args[@]}" "$@"
+    ;;
+  plot)
+    if [[ -z "${2:-}" ]]; then
+      echo "usage: $0 plot {karaone|feis} [validation|test] [options]" >&2
+      exit 2
+    fi
+    dataset="$2"
+    shift 2
+    split="test"
+    if [[ "${1:-}" == "validation" || "${1:-}" == "test" ]]; then
+      split="$1"
+      shift
+    fi
+    exec "${PYTHON_BIN}" "${BUNDLE_DIR}/app/scripts/plot_open_vocab_0724_pairs.py" \
+      --config "${CONFIG}" --dataset "${dataset}" --split "${split}" "$@"
     ;;
   gate)
     manifest="${SYNTHESIS_MANIFEST:-${BUNDLE_DIR}/artifacts/open_vocab_0724_factorized_v1/synthesis/karaone/validation/synthesis_manifest.json}"
@@ -108,8 +127,11 @@ case "${1:-}" in
     "${BASH_SOURCE[0]}" synthesize karaone validation
     "${BASH_SOURCE[0]}" gate --strict
     ;;
+  full)
+    exec bash "${BUNDLE_DIR}/app/run_open_vocab_0724_full.sh" "${@:2}"
+    ;;
   *)
-    echo "usage: $0 {cache|train-audio|audit-audio|pretrain-eeg|train-eeg|validate|synthesize|gate|seeds|loso|loso-all|held-label|ablation-config|test|all} [options]" >&2
+    echo "usage: $0 {cache|train-audio|audit-audio|pretrain-eeg|train-eeg|validate|synthesize|plot|gate|seeds|loso|loso-all|held-label|ablation-config|test|all|full} [options]" >&2
     exit 2
     ;;
 esac

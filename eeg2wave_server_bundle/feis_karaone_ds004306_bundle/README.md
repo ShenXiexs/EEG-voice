@@ -37,6 +37,31 @@ reconstruction。不要分别直接调用脚本的 `--split test`：一次 sessi
 bash app/run_open_vocab_0724_v1.sh test
 ```
 
+若需要从 cache v2 开始一口运行正式训练、全部 validation/LOSO gate、唯一的
+locked test，以及最终 KaraOne/FEIS 重建语音对比图，使用总控脚本：
+
+```bash
+DEVICE=mps bash app/run_open_vocab_0724_full.sh
+```
+
+它固定使用 `15/31/47` 三个 seed，先完成严格 validation gate，才在最后一步原子地
+执行 latent test、KaraOne test synthesis 和 FEIS test synthesis。随后输出每个 test
+trial 的波形、包络、显式预测能量图、以及从最终解码 WAV 重新计算的 log-mel 对比图到：
+
+```text
+artifacts/open_vocab_0724_factorized_v1/synthesis/karaone/test/comparison_pairs/
+artifacts/open_vocab_0724_factorized_v1/synthesis/feis/test/comparison_pairs/
+```
+
+对比图只用于展示；所有数值指标仍读取 float `.mel.npy` 或 WAV 张量，且频率轴从不
+缩放。总控脚本会在长训练开始前、以及 locked test 前做只读 preflight；若 test 已被
+占用或绘图中断，不要重新运行总控脚本。完成 test 后可安全地单独重画图：
+
+```bash
+bash app/run_open_vocab_0724_v1.sh plot karaone test
+bash app/run_open_vocab_0724_v1.sh plot feis test
+```
+
 完整架构、监督边界、输出格式、指标和反事实条件见
 [`reports/open_vocab_eeg_to_speech_factorized_0724.md`](reports/open_vocab_eeg_to_speech_factorized_0724.md)。
 KaraOne 是唯一进入 trial-specific realization gate 的数据集；FEIS 只提供
