@@ -144,6 +144,28 @@ def test_soft_dtw_divergence_is_nonnegative_self_corrected_and_differentiable() 
     assert soft_dtw_divergence(numpy_x, 1.0 - numpy_x) > 0.0
 
 
+def test_soft_dtw_banded_long_sequence_has_finite_gradients() -> None:
+    """Regression test for MPS NaNs from +inf blocked-path sentinels."""
+
+    generator = torch.Generator().manual_seed(72)
+    prediction = torch.rand(1, 128, 80, generator=generator, requires_grad=True)
+    target = torch.rand(1, 128, 80, generator=generator)
+    loss = soft_dtw_divergence_torch(
+        prediction, target, gamma=0.1, band_ratio=0.25
+    )
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert prediction.grad is not None
+    assert torch.isfinite(prediction.grad).all()
+
+
+def test_soft_dtw_reports_non_finite_input_without_mislabeling_the_band() -> None:
+    invalid = torch.tensor([[[0.0], [float("nan")]]])
+    target = torch.zeros_like(invalid)
+    with pytest.raises(FloatingPointError, match="non-finite values"):
+        soft_dtw_divergence_torch(invalid, target, band_ratio=0.25)
+
+
 def test_cross_covariance_penalty_and_factorized_structure_helpers_backpropagate() -> (
     None
 ):

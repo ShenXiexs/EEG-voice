@@ -421,13 +421,31 @@ def _as_batched_sequence(value: torch.Tensor) -> tuple[torch.Tensor, bool]:
 def _soft_dtw_cost(
     cost: torch.Tensor, gamma: float, band_ratio: float | None
 ) -> torch.Tensor:
+    if not torch.isfinite(cost).all():
+        raise FloatingPointError(
+            "soft-DTW cost contains non-finite values; check the prediction and "
+            "target sequences"
+        )
     rows, columns = cost.shape
     # Dynamic programming by anti-diagonal reduces Python work from O(T^2)
     # scalar operations to O(T) vector operations and avoids in-place mutation
     # of values retained by autograd.
-    diagonal_minus_two = cost.new_full((rows + 1,), float("inf"))
+    # Do not use ``+inf`` as the blocked-path sentinel.  On MPS the backward
+    # pass through logsumexp([-inf, -inf, -inf]) can produce NaN gradients for
+    # cells outside a Sakoe--Chiba band.  Those cells are not part of the valid
+    # alignment, but their NaNs can still corrupt the optimizer several epochs
+    # later.  A detached finite barrier has the same forward semantics for the
+    # bounded, normalized mel costs while keeping the recurrence differentiable.
+    # It is at least twice the largest possible observed path cost and remains
+    # comfortably below the dtype limit.
+    dtype_limit = torch.finfo(cost.dtype).max / 32.0
+    barrier_floor = min(10_000.0, dtype_limit / 2.0)
+    barrier = (
+        cost.detach().abs().amax() * float(rows + columns + 1) + 1.0
+    ).clamp(min=barrier_floor, max=dtype_limit)
+    diagonal_minus_two = cost.new_ones((rows + 1,)) * barrier
     diagonal_minus_two[0] = 0.0  # d = 0 contains only R[0,0]
-    diagonal_minus_one = cost.new_full((rows + 1,), float("inf"))  # d = 1 boundaries
+    diagonal_minus_one = cost.new_ones((rows + 1,)) * barrier  # d = 1 boundaries
     tolerance = 0.0 if band_ratio is None else float(band_ratio)
     resolution = max(1.0 / max(rows, 1), 1.0 / max(columns, 1))
     for diagonal in range(2, rows + columns + 1):
@@ -441,7 +459,7 @@ def _soft_dtw_cost(
             inside = (row_positions - column_positions).abs() <= tolerance + resolution
             row_indices = row_indices[inside]
             column_indices = column_indices[inside]
-        current = cost.new_full((rows + 1,), float("inf"))
+        current = cost.new_ones((rows + 1,)) * barrier
         if len(row_indices):
             previous = torch.stack(
                 (
@@ -462,8 +480,14 @@ def _soft_dtw_cost(
         diagonal_minus_two, diagonal_minus_one = diagonal_minus_one, current
     result = diagonal_minus_one[rows]
     if not torch.isfinite(result):
+        raise FloatingPointError(
+            "soft-DTW dynamic program produced a non-finite result despite "
+            "finite inputs"
+        )
+    if result >= barrier * 0.5:
         raise ValueError(
-            "Sakoe-Chiba band is too narrow for the supplied sequence lengths"
+            "Sakoe-Chiba band admits no finite alignment path for the supplied "
+            "sequence lengths"
         )
     return result
 

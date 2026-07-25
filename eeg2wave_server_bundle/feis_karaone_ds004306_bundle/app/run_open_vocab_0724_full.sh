@@ -21,6 +21,7 @@ ALLOW_NETWORK="${ALLOW_NETWORK:-0}"
 PLOT_LIMIT="${PLOT_LIMIT:--1}"
 PLOT_MODES="${PLOT_MODES:-}"
 PLOT_DPI="${PLOT_DPI:-140}"
+AUDIO_RESUME="${AUDIO_RESUME:-}"
 
 usage() {
   cat <<'EOF'
@@ -34,6 +35,7 @@ Environment controls:
   PLOT_LIMIT=-1             -1 renders every final-test reconstruction pair
   PLOT_MODES=a,b,...        optional subset of counterfactual columns for presentation
   PLOT_DPI=140              PNG rasterization DPI
+  AUDIO_RESUME=/path/best.pt resume an interrupted audio-factorizer run
   TEST_ACCESS_ID=...        optional safe ID for the one final-test session
 
 The registered seeds are fixed to 15, 31, and 47.  This command cannot resume
@@ -152,6 +154,12 @@ build_cache() {
   bash "${RUNNER}" "${args[@]}"
 }
 
+train_audio() {
+  local args=(train-audio)
+  [[ -n "${AUDIO_RESUME}" ]] && args+=(--resume "${AUDIO_RESUME}")
+  bash "${RUNNER}" "${args[@]}"
+}
+
 plot_final_pairs() {
   local dataset="$1"
   local args=(plot "${dataset}" test --limit "${PLOT_LIMIT}" --dpi "${PLOT_DPI}")
@@ -171,8 +179,7 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-${OUTPUT_ROOT}/matplotlib}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${OUTPUT_ROOT}/xdg_cache}"
 mkdir -p "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
 run_step "Build or verify waveform-consistent teacher cache v2" build_cache
-run_step "Train audio-only content/realization factorizer" \
-  bash "${RUNNER}" train-audio
+run_step "Train audio-only content/realization factorizer" train_audio
 run_step "Strict audio oracle audit and freeze" \
   bash "${RUNNER}" audit-audio --strict
 run_step "Train/evaluate all registered EEG seeds (15/31/47)" \

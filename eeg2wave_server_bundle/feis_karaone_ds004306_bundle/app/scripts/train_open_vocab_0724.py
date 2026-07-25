@@ -1079,6 +1079,14 @@ def train_audio(
         adversaries.load_state_dict(payload["audio_adversaries_state"])
         optimizer.load_state_dict(payload["optimizer_state"])
         start = int(payload["epoch"]) + 1
+        resumed_score = (
+            payload.get("metrics", {}).get("validation", {}).get("loss")
+        )
+        if isinstance(resumed_score, (int, float)) and math.isfinite(resumed_score):
+            # The checkpoint itself is the best checkpoint from the preceding
+            # run.  Preserve its validation score so a resumed run cannot
+            # overwrite it with the first (possibly worse) later epoch.
+            best = float(resumed_score)
     checkpoint = resolve_config_path(
         context.config_path, cfg["paths"]["audio_checkpoint"]
     )
@@ -1112,11 +1120,27 @@ def train_audio(
                 label_lookup=context.label_to_index,
                 adversary_strength=strength,
             )
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "audio objective is non-finite before backward at "
+                    f"epoch={epoch + 1}, batch={step}; checkpoint parameters "
+                    "were left unchanged"
+                )
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(adversaries.parameters()),
-                float(train_cfg["grad_clip"]),
-            )
+            parameters = list(model.parameters()) + list(adversaries.parameters())
+            try:
+                torch.nn.utils.clip_grad_norm_(
+                    parameters,
+                    float(train_cfg["grad_clip"]),
+                    error_if_nonfinite=True,
+                )
+            except RuntimeError as error:
+                optimizer.zero_grad(set_to_none=True)
+                raise FloatingPointError(
+                    "audio objective produced non-finite gradients before the "
+                    f"optimizer step at epoch={epoch + 1}, batch={step}; "
+                    "checkpoint parameters were left unchanged"
+                ) from error
             optimizer.step()
             aggregate_update(running, metrics, len(batch["codes"]))
             count += len(batch["codes"])
