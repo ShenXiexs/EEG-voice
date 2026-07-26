@@ -91,6 +91,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        help=(
+            "Override EEG early-stopping patience for an exploratory run; "
+            "the preregistered config value remains the default"
+        ),
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--allow-final-test", action="store_true")
@@ -1326,6 +1335,13 @@ def train_eeg(
         args.epochs
         or (train_cfg["eeg_pretrain_epochs"] if pretrain else train_cfg["eeg_epochs"])
     )
+    patience_limit = int(
+        args.early_stopping_patience
+        if args.early_stopping_patience is not None
+        else train_cfg["early_stopping_patience"]
+    )
+    if patience_limit < 1:
+        raise ValueError("--early-stopping-patience must be positive")
     metrics_path = checkpoint.parent.parent / "metrics" / "training.jsonl"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     for epoch in range(start, epochs):
@@ -1408,7 +1424,7 @@ def train_eeg(
         if improved:
             torch.save(payload, checkpoint)
         torch.save(payload, latest_checkpoint)
-        if patience >= int(train_cfg["early_stopping_patience"]):
+        if patience >= patience_limit:
             break
 
 
