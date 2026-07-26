@@ -100,6 +100,18 @@ def parse_args() -> argparse.Namespace:
             "the preregistered config value remains the default"
         ),
     )
+    parser.add_argument(
+        "--soft-dtw-train-frames",
+        type=int,
+        default=None,
+        help="Exploratory EEG-training override for soft-DTW temporal resolution",
+    )
+    parser.add_argument(
+        "--soft-dtw-every-batches",
+        type=int,
+        default=1,
+        help="Compute EEG-training soft-DTW once per N batches (default: every batch)",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--allow-final-test", action="store_true")
@@ -615,8 +627,20 @@ def encode_audio_targets(
             batch["realization_frame_mask"][index],
             batch["timbre_global"][index],
         )
+        # ``Tensor.index_copy_`` dispatches to ``aten::index_copy.out``, which
+        # is not implemented by PyTorch's MPS backend.  Expand the compact
+        # teacher state to the original batch with index_select + where; both
+        # preserve the exact routing semantics and run natively on MPS.
+        source_positions = (
+            eligible.to(dtype=torch.int32).cumsum(dim=0).sub(1).clamp_min(0).long()
+        )
         for name in output:
-            output[name].index_copy_(0, index, getattr(state, name))
+            selected = getattr(state, name)
+            expanded = selected.index_select(0, source_positions)
+            selected_mask = eligible.reshape(
+                batch_size, *([1] * (selected.ndim - 1))
+            )
+            output[name] = torch.where(selected_mask, expanded, output[name])
     output["eligible"] = eligible
     return output
 
@@ -632,6 +656,8 @@ def eeg_objective(
     pretrain: bool,
     augment: bool,
     stochastic_mask: bool = True,
+    soft_dtw_weight_scale: float = 1.0,
+    soft_dtw_max_frames: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, float], Any, dict[str, torch.Tensor] | None]:
     weights = cfg["loss"]
     switches = ablation_switches(cfg)
@@ -773,10 +799,16 @@ def eeg_objective(
             batch["energy_supervision"].bool(),
             target_activity=batch["activity_mask"],
             l1_weight=float(weights["mel_l1"]),
-            soft_dtw_weight=float(weights["mel_soft_dtw"]),
+            soft_dtw_weight=(
+                float(weights["mel_soft_dtw"]) * float(soft_dtw_weight_scale)
+            ),
             gamma=float(weights["soft_dtw_gamma"]),
             band_ratio=float(weights["soft_dtw_band_fraction"]),
-            soft_dtw_max_frames=int(weights["soft_dtw_train_frames"]),
+            soft_dtw_max_frames=int(
+                soft_dtw_max_frames
+                if soft_dtw_max_frames is not None
+                else weights["soft_dtw_train_frames"]
+            ),
         )
     else:
         zero_energy = state.log_mel_energy.sum() * 0.0
@@ -1342,6 +1374,16 @@ def train_eeg(
     )
     if patience_limit < 1:
         raise ValueError("--early-stopping-patience must be positive")
+    soft_dtw_train_frames = int(
+        args.soft_dtw_train_frames
+        if args.soft_dtw_train_frames is not None
+        else cfg["loss"]["soft_dtw_train_frames"]
+    )
+    if soft_dtw_train_frames < 2:
+        raise ValueError("--soft-dtw-train-frames must be at least two")
+    soft_dtw_every_batches = int(args.soft_dtw_every_batches)
+    if soft_dtw_every_batches < 1:
+        raise ValueError("--soft-dtw-every-batches must be positive")
     metrics_path = checkpoint.parent.parent / "metrics" / "training.jsonl"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     for epoch in range(start, epochs):
@@ -1363,6 +1405,11 @@ def train_eeg(
                 break
             batch = move_batch(raw, device)
             optimizer.zero_grad(set_to_none=True)
+            soft_dtw_scale = (
+                float(soft_dtw_every_batches)
+                if step % soft_dtw_every_batches == 0
+                else 0.0
+            )
             loss, metrics, _, _ = eeg_objective(
                 eeg,
                 audio,
@@ -1372,6 +1419,8 @@ def train_eeg(
                 adversary_strength=strength,
                 pretrain=pretrain,
                 augment=True,
+                soft_dtw_weight_scale=soft_dtw_scale,
+                soft_dtw_max_frames=soft_dtw_train_frames,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -1397,6 +1446,8 @@ def train_eeg(
             "train": {k: v / max(count, 1) for k, v in running.items()},
             "validation": validation,
             "smoke_steps": args.smoke_steps,
+            "soft_dtw_train_frames": soft_dtw_train_frames,
+            "soft_dtw_every_batches": soft_dtw_every_batches,
         }
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(summary, sort_keys=True) + "\n")

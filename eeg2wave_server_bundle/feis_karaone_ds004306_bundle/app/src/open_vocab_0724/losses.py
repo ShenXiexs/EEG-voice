@@ -654,62 +654,76 @@ def energy_structure_loss(
     prediction_normalized = ((prediction_log_mel + 80.0) / 80.0).clamp(0.0, 1.0)
     target_normalized = ((target_log_mel + 80.0) / 80.0).clamp(0.0, 1.0)
     selected = sample_mask.bool()
-    dtw_values: list[torch.Tensor] = []
-    for index in torch.nonzero(selected, as_tuple=False).flatten().tolist():
-        valid = frame_mask[index].bool()
-        prediction_sequence = prediction_normalized[index, :, valid].transpose(0, 1)
-        target_sequence = target_normalized[index, :, valid].transpose(0, 1)
-        if soft_dtw_max_frames is not None:
-            if soft_dtw_max_frames < 2:
-                raise ValueError("soft_dtw_max_frames must be at least two")
-            if len(prediction_sequence) > soft_dtw_max_frames:
-                prediction_sequence = (
-                    F.interpolate(
-                        prediction_sequence.transpose(0, 1).unsqueeze(0),
-                        size=soft_dtw_max_frames,
-                        mode="linear",
-                        align_corners=False,
-                    )
-                    .squeeze(0)
-                    .transpose(0, 1)
-                )
-                target_sequence = (
-                    F.interpolate(
-                        target_sequence.transpose(0, 1).unsqueeze(0),
-                        size=soft_dtw_max_frames,
-                        mode="linear",
-                        align_corners=False,
-                    )
-                    .squeeze(0)
-                    .transpose(0, 1)
-                )
-        dtw_values.append(
-            soft_dtw_divergence_torch(
-                prediction_sequence,
-                target_sequence,
-                gamma=gamma,
-                band_ratio=band_ratio,
-            )
-        )
-    soft_dtw = torch.stack(dtw_values).mean()
-
-    if target_activity is not None:
-        if target_activity.shape != (batch, frames):
-            raise ValueError("target_activity must be [B,T]")
-        foreground = target_activity[:, None, :].to(prediction_normalized)
+    if float(soft_dtw_weight) == 0.0:
+        # Sparse exploratory scheduling must avoid entering the MPS-heavy
+        # dynamic program at all on skipped batches.
+        soft_dtw = _zero(prediction_log_mel)
     else:
-        foreground = target_normalized.detach().clamp_min(0.0)
-    foreground = foreground * active_frame_mask[:, None, :].to(prediction_normalized)
-    ssim_values = [
-        _weighted_global_ssim_torch(
-            prediction_normalized[index],
-            target_normalized[index],
-            foreground[index].expand_as(target_normalized[index]),
+        dtw_values: list[torch.Tensor] = []
+        for index in torch.nonzero(selected, as_tuple=False).flatten().tolist():
+            valid = frame_mask[index].bool()
+            prediction_sequence = prediction_normalized[index, :, valid].transpose(0, 1)
+            target_sequence = target_normalized[index, :, valid].transpose(0, 1)
+            if soft_dtw_max_frames is not None:
+                if soft_dtw_max_frames < 2:
+                    raise ValueError("soft_dtw_max_frames must be at least two")
+                if len(prediction_sequence) > soft_dtw_max_frames:
+                    prediction_sequence = (
+                        F.interpolate(
+                            prediction_sequence.transpose(0, 1).unsqueeze(0),
+                            size=soft_dtw_max_frames,
+                            mode="linear",
+                            align_corners=False,
+                        )
+                        .squeeze(0)
+                        .transpose(0, 1)
+                    )
+                    target_sequence = (
+                        F.interpolate(
+                            target_sequence.transpose(0, 1).unsqueeze(0),
+                            size=soft_dtw_max_frames,
+                            mode="linear",
+                            align_corners=False,
+                        )
+                        .squeeze(0)
+                        .transpose(0, 1)
+                    )
+            dtw_values.append(
+                soft_dtw_divergence_torch(
+                    prediction_sequence,
+                    target_sequence,
+                    gamma=gamma,
+                    band_ratio=band_ratio,
+                )
+            )
+        soft_dtw = torch.stack(dtw_values).mean()
+
+    if float(ssim_weight) == 0.0:
+        ssim = _zero(prediction_log_mel)
+    else:
+        if target_activity is not None:
+            if target_activity.shape != (batch, frames):
+                raise ValueError("target_activity must be [B,T]")
+            foreground = target_activity[:, None, :].to(prediction_normalized)
+        else:
+            foreground = target_normalized.detach().clamp_min(0.0)
+        foreground = foreground * active_frame_mask[:, None, :].to(
+            prediction_normalized
         )
-        for index in torch.nonzero(selected, as_tuple=False).flatten().tolist()
-        if foreground[index].sum() > 0
-    ]
-    ssim = torch.stack(ssim_values).mean() if ssim_values else _zero(prediction_log_mel)
+        ssim_values = [
+            _weighted_global_ssim_torch(
+                prediction_normalized[index],
+                target_normalized[index],
+                foreground[index].expand_as(target_normalized[index]),
+            )
+            for index in torch.nonzero(selected, as_tuple=False).flatten().tolist()
+            if foreground[index].sum() > 0
+        ]
+        ssim = (
+            torch.stack(ssim_values).mean()
+            if ssim_values
+            else _zero(prediction_log_mel)
+        )
     total = (
         float(l1_weight) * log_mel_l1
         + float(soft_dtw_weight) * soft_dtw

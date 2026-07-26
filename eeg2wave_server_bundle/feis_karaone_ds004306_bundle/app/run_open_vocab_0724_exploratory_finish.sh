@@ -16,8 +16,10 @@ EEG_LATEST="${OUTPUT_ROOT}/eeg/checkpoints/latest.pt"
 
 DEVICE="${DEVICE:-mps}"
 SEED="${SEED:-15}"
-EEG_EPOCHS="${EEG_EPOCHS:-40}"
-EEG_PATIENCE="${EEG_PATIENCE:-40}"
+EEG_EPOCHS="${EEG_EPOCHS:-30}"
+EEG_PATIENCE="${EEG_PATIENCE:-30}"
+SOFT_DTW_FRAMES="${SOFT_DTW_FRAMES:-32}"
+SOFT_DTW_EVERY="${SOFT_DTW_EVERY:-4}"
 PLOT_DPI="${PLOT_DPI:-140}"
 RUN_EXPLORATORY_TEST="${RUN_EXPLORATORY_TEST:-1}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -28,8 +30,10 @@ Usage:
   DEVICE=mps bash app/run_open_vocab_0724_exploratory_finish.sh
 
 Optional environment controls:
-  EEG_EPOCHS=40             paired EEG epoch ceiling
-  EEG_PATIENCE=40           exploratory early-stopping patience
+  EEG_EPOCHS=30             paired EEG epoch ceiling
+  EEG_PATIENCE=30           exploratory early-stopping patience
+  SOFT_DTW_FRAMES=32        training-only soft-DTW temporal resolution
+  SOFT_DTW_EVERY=4          compute training soft-DTW once per N batches
   PLOT_DPI=140              pair-figure resolution
   RUN_EXPLORATORY_TEST=1    set to 0 to stop after validation WAVs/figures
   DRY_RUN=1                 print commands without running them
@@ -57,6 +61,14 @@ if ! [[ "${EEG_EPOCHS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if ! [[ "${EEG_PATIENCE}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: EEG_PATIENCE must be a positive integer." >&2
+  exit 2
+fi
+if ! [[ "${SOFT_DTW_FRAMES}" =~ ^[0-9]+$ ]] || (( SOFT_DTW_FRAMES < 2 )); then
+  echo "ERROR: SOFT_DTW_FRAMES must be an integer of at least two." >&2
+  exit 2
+fi
+if ! [[ "${SOFT_DTW_EVERY}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: SOFT_DTW_EVERY must be a positive integer." >&2
   exit 2
 fi
 if ! [[ "${PLOT_DPI}" =~ ^[1-9][0-9]*$ ]]; then
@@ -100,6 +112,8 @@ train_paired_eeg() {
     --seed "${SEED}"
     --epochs "${EEG_EPOCHS}"
     --early-stopping-patience "${EEG_PATIENCE}"
+    --soft-dtw-train-frames "${SOFT_DTW_FRAMES}"
+    --soft-dtw-every-batches "${SOFT_DTW_EVERY}"
   )
   if [[ -f "${EEG_LATEST}" ]]; then
     args+=(--resume "${EEG_LATEST}")
@@ -117,6 +131,8 @@ printf '[0724 exploratory] config=%s\n' "${CONFIG}"
 printf '[0724 exploratory] output=%s\n' "${OUTPUT_ROOT}"
 printf '[0724 exploratory] device=%s seed=%s epochs=%s patience=%s\n' \
   "${DEVICE}" "${SEED}" "${EEG_EPOCHS}" "${EEG_PATIENCE}"
+printf '[0724 exploratory] fast soft-DTW: frames=%s every=%s batches\n' \
+  "${SOFT_DTW_FRAMES}" "${SOFT_DTW_EVERY}"
 printf '[0724 exploratory] formal locked-test claim: disabled\n'
 
 printf '\n===== Train or resume paired EEG =====\n'
