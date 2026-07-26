@@ -94,6 +94,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--allow-final-test", action="store_true")
+    parser.add_argument(
+        "--exploratory-test",
+        action="store_true",
+        help=(
+            "Diagnostic only: permit test evaluation without a passing "
+            "validation gate. Results are not a formal locked-test result."
+        ),
+    )
     parser.add_argument("--test-access-id", default=None)
     parser.add_argument(
         "--smoke-steps",
@@ -1440,7 +1448,7 @@ def evaluate(
         holdout_label=args.holdout_label,
     )
     require_frozen_audio_checkpoint(context.config_path, cfg, lineage, audio_path)
-    if args.split == "test":
+    if args.split == "test" and not args.exploratory_test:
         authorize_locked_test(
             resolve_config_path(context.config_path, cfg["paths"]["validation_gate"]),
             lineage=lineage,
@@ -1568,23 +1576,24 @@ def main() -> None:
                 "Locked test is only available to the preregistered primary seed; "
                 "LOSO, held-label, and secondary-seed runs are development-only"
             )
-        if not args.allow_final_test:
-            raise PermissionError("Locked test requires --allow-final-test")
-        authorize_locked_test_metadata(
-            resolve_config_path(config_path, raw_cfg["paths"]["validation_gate"]),
-            config_path=config_path,
-            audio_checkpoint=resolve_config_path(
-                config_path, raw_cfg["paths"]["audio_checkpoint"]
-            ),
-            eeg_checkpoint=resolve_config_path(
-                config_path, raw_cfg["paths"]["eeg_checkpoint"]
-            ),
-        )
-        claim_locked_test_access(
-            resolve_config_path(config_path, raw_cfg["paths"]["validation_gate"]),
-            purpose="latent_evaluation",
-            access_id=args.test_access_id,
-        )
+        if not args.exploratory_test:
+            if not args.allow_final_test:
+                raise PermissionError("Locked test requires --allow-final-test")
+            authorize_locked_test_metadata(
+                resolve_config_path(config_path, raw_cfg["paths"]["validation_gate"]),
+                config_path=config_path,
+                audio_checkpoint=resolve_config_path(
+                    config_path, raw_cfg["paths"]["audio_checkpoint"]
+                ),
+                eeg_checkpoint=resolve_config_path(
+                    config_path, raw_cfg["paths"]["eeg_checkpoint"]
+                ),
+            )
+            claim_locked_test_access(
+                resolve_config_path(config_path, raw_cfg["paths"]["validation_gate"]),
+                purpose="latent_evaluation",
+                access_id=args.test_access_id,
+            )
     context = load_context(config_path)
     seed = int(
         args.seed if args.seed is not None else context.config["training"]["seed"]

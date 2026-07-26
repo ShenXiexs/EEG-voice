@@ -106,6 +106,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--allow-final-test", action="store_true")
+    parser.add_argument(
+        "--exploratory-test",
+        action="store_true",
+        help=(
+            "Diagnostic only: permit test synthesis without a passing "
+            "validation gate. Results are not a formal locked-test result."
+        ),
+    )
     parser.add_argument("--test-access-id", default=None)
     parser.add_argument("--skip-decoded-content-metric", action="store_true")
     parser.add_argument("--skip-decoded-timbre-metric", action="store_true")
@@ -556,25 +564,26 @@ def main() -> None:
                 "Locked-test synthesis is primary-g1 only; LOSO, held-label, "
                 "and secondary-seed runs are development-only"
             )
-        if not args.allow_final_test:
-            raise PermissionError("Locked test synthesis requires --allow-final-test")
-        authorize_locked_test_metadata(
-            gate_path,
-            config_path=config_path,
-            audio_checkpoint=audio_path,
-            eeg_checkpoint=eeg_path,
-        )
-        claim_locked_test_access(
-            gate_path,
-            purpose=f"reconstruction_{args.dataset}",
-            access_id=args.test_access_id,
-        )
+        if not args.exploratory_test:
+            if not args.allow_final_test:
+                raise PermissionError("Locked test synthesis requires --allow-final-test")
+            authorize_locked_test_metadata(
+                gate_path,
+                config_path=config_path,
+                audio_checkpoint=audio_path,
+                eeg_checkpoint=eeg_path,
+            )
+            claim_locked_test_access(
+                gate_path,
+                purpose=f"reconstruction_{args.dataset}",
+                access_id=args.test_access_id,
+            )
     context = load_context(config_path)
     teachers = TeacherCacheV2(
         resolve_config_path(config_path, raw_cfg["paths"]["teacher_cache"])
     )
     lineage = build_lineage(context)
-    if args.split == "test":
+    if args.split == "test" and not args.exploratory_test:
         authorize_locked_test(
             gate_path,
             lineage=lineage,
