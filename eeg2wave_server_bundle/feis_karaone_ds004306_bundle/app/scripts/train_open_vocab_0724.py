@@ -1266,6 +1266,7 @@ def train_eeg(
             holdout_label=args.holdout_label,
         )
     )
+    latest_checkpoint = checkpoint.with_name("latest.pt")
     start = 0
     best = float("inf")
     patience = 0
@@ -1282,6 +1283,16 @@ def train_eeg(
         eeg.load_state_dict(payload["model_state"])
         optimizer.load_state_dict(payload["optimizer_state"])
         start = int(payload["epoch"]) + 1
+        resumed_best = payload.get("best_validation_loss")
+        if not isinstance(resumed_best, (int, float)):
+            resumed_best = (
+                payload.get("metrics", {}).get("validation", {}).get("loss")
+            )
+        if isinstance(resumed_best, (int, float)) and math.isfinite(resumed_best):
+            best = float(resumed_best)
+        resumed_patience = payload.get("early_stopping_patience", 0)
+        if isinstance(resumed_patience, int) and resumed_patience >= 0:
+            patience = resumed_patience
     train_set = FactorizedEEGDataset(
         context,
         teachers,
@@ -1374,26 +1385,31 @@ def train_eeg(
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(summary, sort_keys=True) + "\n")
         score = validation.get("loss", float("inf"))
-        if score < best:
+        improved = score < best
+        if improved:
             best = score
             patience = 0
-            payload = checkpoint_payload(
-                phase=phase,
-                lineage=lineage,
-                model_state=eeg.state_dict(),
-                optimizer_state=optimizer.state_dict(),
-                epoch=epoch,
-                metrics=summary,
-                dependencies=dependencies,
-            )
-            payload["diagnostic_smoke"] = bool(args.smoke_steps)
-            payload["run"] = run_metadata(args)
-            checkpoint.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(payload, checkpoint)
         else:
             patience += 1
-            if patience >= int(train_cfg["early_stopping_patience"]):
-                break
+        payload = checkpoint_payload(
+            phase=phase,
+            lineage=lineage,
+            model_state=eeg.state_dict(),
+            optimizer_state=optimizer.state_dict(),
+            epoch=epoch,
+            metrics=summary,
+            dependencies=dependencies,
+        )
+        payload["diagnostic_smoke"] = bool(args.smoke_steps)
+        payload["run"] = run_metadata(args)
+        payload["best_validation_loss"] = best
+        payload["early_stopping_patience"] = patience
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        if improved:
+            torch.save(payload, checkpoint)
+        torch.save(payload, latest_checkpoint)
+        if patience >= int(train_cfg["early_stopping_patience"]):
+            break
 
 
 def expected_eeg_dependencies(
