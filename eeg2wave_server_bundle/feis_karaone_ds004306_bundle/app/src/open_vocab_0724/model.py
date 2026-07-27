@@ -21,6 +21,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _all_finite(value: torch.Tensor) -> bool:
+    """Return a reliable finite check, including after rare MPS false alarms.
+
+    The normal device-side reduction remains the fast path.  Only when MPS
+    reports a failure do we synchronize and repeat the check on CPU, so real
+    NaN/Inf values are still rejected without slowing normal training.
+    """
+
+    device_result = torch.isfinite(value).all()
+    if bool(device_result.detach().cpu().item()):
+        return True
+    if value.device.type == "mps":
+        return bool(torch.isfinite(value.detach().cpu()).all().item())
+    return False
+
+
 class _GradientReverse(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, value: torch.Tensor, strength: float) -> torch.Tensor:  # type: ignore[override]
@@ -420,7 +436,7 @@ class AudioContentProjector(nn.Module):
                 f"hubert_features must be [B,T,{self.cfg.hubert_dimension}], "
                 f"got {tuple(hubert_features.shape)}"
             )
-        if not torch.isfinite(hubert_features).all():
+        if not _all_finite(hubert_features):
             raise ValueError("hubert_features must be finite")
         valid = _normalize_sequence_mask(
             valid_mask,
@@ -471,7 +487,7 @@ class AudioRealizationEncoder(nn.Module):
                 f"[B,T,{self.cfg.realization_input_dimension}]"
             )
         batch, steps, _ = realization_features.shape
-        if not torch.isfinite(realization_features).all():
+        if not _all_finite(realization_features):
             raise ValueError("realization features must be finite")
         valid = _normalize_sequence_mask(
             valid_mask,
@@ -529,7 +545,7 @@ class TimbreProjector(nn.Module):
             or timbre_embedding.shape[-1] != self.input_dimension
         ):
             raise ValueError(f"timbre_embedding must be [B,{self.input_dimension}]")
-        if not torch.isfinite(timbre_embedding).all():
+        if not _all_finite(timbre_embedding):
             raise ValueError("timbre_embedding must be finite")
         return F.normalize(self.net(timbre_embedding), dim=-1)
 
@@ -902,7 +918,7 @@ class VariableLengthMaskedCodeDecoder(nn.Module):
     def duration_mask(self, duration_seconds: torch.Tensor) -> torch.Tensor:
         if duration_seconds.ndim != 1:
             raise ValueError("duration_seconds must be [B]")
-        if not torch.isfinite(duration_seconds).all():
+        if not _all_finite(duration_seconds):
             raise ValueError("duration_seconds must be finite")
         lengths = torch.ceil(
             duration_seconds.clamp(
@@ -1373,7 +1389,7 @@ class FactorizedEEGEncoder(nn.Module):
     ) -> FactorizedEEGState:
         if channel_xyz.shape != (*eeg.shape[:2], 3):
             raise ValueError("channel_xyz must be [B,C,3]")
-        if not torch.isfinite(eeg).all() or not torch.isfinite(channel_xyz).all():
+        if not _all_finite(eeg) or not _all_finite(channel_xyz):
             raise ValueError("EEG and channel coordinates must be finite")
         patches, patch_valid = self._patches(eeg, channel_mask, time_mask)
         patch_content = self.patch_embedding(patches)

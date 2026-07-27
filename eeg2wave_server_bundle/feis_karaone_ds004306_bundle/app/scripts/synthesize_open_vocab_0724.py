@@ -117,6 +117,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-access-id", default=None)
     parser.add_argument("--skip-decoded-content-metric", action="store_true")
     parser.add_argument("--skip-decoded-timbre-metric", action="store_true")
+    parser.add_argument(
+        "--resume-existing",
+        action="store_true",
+        help="Reuse completed per-trial records and continue an interrupted synthesis.",
+    )
     return parser.parse_args()
 
 
@@ -718,19 +723,40 @@ def main() -> None:
                 batch["time_mask"],
                 epoch=int(eeg_payload["epoch"]),
             )
-            zero = eeg(
-                torch.zeros_like(batch["eeg"][:1]),
-                batch["channel_xyz"][:1],
-                batch["channel_mask"][:1],
-                batch["time_mask"][:1],
-                epoch=int(eeg_payload["epoch"]),
-            )
             audio_state = audio.encode(
                 batch["content_tokens"][:1],
                 batch["content_token_mask"][:1],
                 batch["realization_features"][:1],
                 batch["realization_frame_mask"][:1],
                 batch["timbre_global"][:1],
+            )
+
+        stem = f"{output_index:04d}_{safe(str(batch['sample_key'][0]))}"
+        record_path = output_root / "records" / f"{stem}.json"
+        if args.resume_existing and record_path.exists():
+            existing = json.loads(record_path.read_text(encoding="utf-8"))
+            if (
+                str(existing.get("sample_key")) != str(batch["sample_key"][0])
+                or str(existing.get("audio_key")) != str(batch["audio_key"][0])
+            ):
+                raise ValueError(
+                    f"Resume record does not match current dataset ordering: {record_path}"
+                )
+            records.append(existing)
+            for name, result in dict(existing.get("metrics") or {}).items():
+                aggregate[str(name)].append(dict(result))
+            retrieval_eeg.append(state.content_global[0].detach().cpu())
+            retrieval_audio.append(audio_state.content_global[0].detach().cpu())
+            retrieval_labels.append(int(batch["label_idx"][0]))
+            continue
+
+        with torch.no_grad():
+            zero = eeg(
+                torch.zeros_like(batch["eeg"][:1]),
+                batch["channel_xyz"][:1],
+                batch["channel_mask"][:1],
+                batch["time_mask"][:1],
+                epoch=int(eeg_payload["epoch"]),
             )
         modes, content_sources, timbre_sources = counterfactuals(eeg, state, zero)
         modes["audio_condition_oracle"] = FactorizedConditionState(
@@ -774,7 +800,6 @@ def main() -> None:
         metadata = teachers.metadata(str(batch["audio_key"][0]))
         reference = reference_audio(metadata, raw_cfg, codec.codec_sample_rate)
         reference_map = batch["log_mel_energy"][0].cpu().numpy()
-        stem = f"{output_index:04d}_{safe(str(batch['sample_key'][0]))}"
         reference_dir = output_root / "reference"
         reference_dir.mkdir(parents=True, exist_ok=True)
         write_wav(reference_dir / f"{stem}.wav", reference, codec.codec_sample_rate)
@@ -887,7 +912,7 @@ def main() -> None:
                 },
             }
         )
-        write_json(output_root / "records" / f"{stem}.json", records[-1])
+        write_json(record_path, records[-1])
 
     retrieval: dict[str, float] = {}
     if retrieval_eeg:

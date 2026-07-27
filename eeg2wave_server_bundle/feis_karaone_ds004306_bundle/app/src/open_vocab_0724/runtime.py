@@ -147,8 +147,14 @@ def seed_everything(seed: int) -> None:
 
 
 def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    # ``non_blocking=True`` is useful with pinned CPU memory on CUDA, but MPS
+    # does not provide the same ordering guarantees.  In long synthesis runs
+    # it can make a just-copied finite tensor transiently fail an MPS reduction.
+    non_blocking = device.type == "cuda"
     return {
-        key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+        key: value.to(device, non_blocking=non_blocking)
+        if torch.is_tensor(value)
+        else value
         for key, value in batch.items()
     }
 

@@ -143,7 +143,8 @@ run_step "Evaluate validation latent metrics" \
 
 for dataset in karaone feis; do
   run_step "Synthesize ${dataset} validation WAV and mel tensors" \
-    bash "${RUNNER}" synthesize "${dataset}" validation --seed "${SEED}"
+    bash "${RUNNER}" synthesize "${dataset}" validation \
+      --seed "${SEED}" --resume-existing
   run_step "Render ${dataset} validation comparison pairs" \
     bash "${RUNNER}" plot "${dataset}" validation \
       --seed "${SEED}" --dpi "${PLOT_DPI}"
@@ -153,7 +154,7 @@ if [[ "${RUN_EXPLORATORY_TEST}" == "1" ]]; then
   for dataset in karaone feis; do
     run_step "Synthesize ${dataset} exploratory-test WAV and mel tensors" \
       bash "${RUNNER}" synthesize "${dataset}" test \
-        --seed "${SEED}" --exploratory-test
+        --seed "${SEED}" --exploratory-test --resume-existing
     run_step "Render ${dataset} exploratory-test comparison pairs" \
       bash "${RUNNER}" plot "${dataset}" test \
         --seed "${SEED}" --dpi "${PLOT_DPI}"
