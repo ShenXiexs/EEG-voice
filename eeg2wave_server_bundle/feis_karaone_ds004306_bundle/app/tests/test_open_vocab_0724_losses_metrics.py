@@ -28,6 +28,7 @@ from src.open_vocab_0724.metrics import (
     reconstruction_metrics,
     soft_dtw_divergence,
     soft_iou,
+    summarize,
     time_normalize_energy,
 )
 
@@ -164,6 +165,18 @@ def test_soft_dtw_reports_non_finite_input_without_mislabeling_the_band() -> Non
     target = torch.zeros_like(invalid)
     with pytest.raises(FloatingPointError, match="non-finite values"):
         soft_dtw_divergence_torch(invalid, target, band_ratio=0.25)
+
+
+def test_metric_summary_ignores_null_and_non_finite_observations() -> None:
+    result = summarize(
+        [
+            {"f0_log_mae": None, "score": 1.0},
+            {"f0_log_mae": 0.25, "score": float("nan")},
+            {"f0_log_mae": 0.75, "score": 3.0},
+        ]
+    )
+    assert result["f0_log_mae"]["mean"] == pytest.approx(0.5)
+    assert result["score"]["mean"] == pytest.approx(2.0)
 
 
 def test_cross_covariance_penalty_and_factorized_structure_helpers_backpropagate() -> (

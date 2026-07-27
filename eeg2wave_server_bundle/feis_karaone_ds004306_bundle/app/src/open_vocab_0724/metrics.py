@@ -8,6 +8,7 @@ Frequency bins are kept fixed; only the time axis may be normalized.
 from __future__ import annotations
 
 import math
+from numbers import Real
 from typing import Iterable
 
 import numpy as np
@@ -765,13 +766,25 @@ def reconstruction_metrics(
     return output
 
 
-def summarize(records: Iterable[dict[str, float]]) -> dict[str, dict[str, float]]:
+def summarize(
+    records: Iterable[dict[str, float | None]],
+) -> dict[str, dict[str, float]]:
     rows = list(records)
     keys = sorted({key for row in rows for key in row})
     output: dict[str, dict[str, float]] = {}
     for key in keys:
+        # Undefined per-trial metrics (for example F0 error when neither signal
+        # has a voiced frame) are serialized as JSON null.  They are missing
+        # observations, not zeros, and must be excluded from the aggregate.
         values = np.asarray(
-            [row[key] for row in rows if key in row and np.isfinite(row[key])]
+            [
+                float(value)
+                for row in rows
+                if key in row
+                for value in (row[key],)
+                if isinstance(value, Real) and np.isfinite(float(value))
+            ],
+            dtype=np.float64,
         )
         output[key] = {
             "mean": float(np.mean(values)) if len(values) else float("nan"),
