@@ -71,4 +71,6 @@ def evidence_loss(probability: torch.Tensor) -> torch.Tensor:
 
 
 def channel_consistency(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
-    return F.smooth_l1_loss(first, second)
+    # Multi-head attention and query slicing can return non-contiguous views;
+    # materialize both operands before the MPS smooth-L1 kernel flattens them.
+    return F.smooth_l1_loss(first.contiguous(), second.contiguous())

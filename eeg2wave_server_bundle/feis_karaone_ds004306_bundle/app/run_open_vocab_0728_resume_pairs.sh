@@ -10,9 +10,12 @@ ROOT="${BUNDLE_DIR}/artifacts/open_vocab_0728_duallatent_v1"
 
 export RUN_ID="${RUN_ID:-v0728_resume_pairs_$(date -u +%Y%m%dT%H%M%SZ)}"
 export DEVICE="${DEVICE:-mps}"
-# A lower MPS watermark asks PyTorch to reclaim memory earlier, making the
-# post-training audio audit less likely to be terminated by macOS.
-export PYTORCH_MPS_HIGH_WATERMARK_RATIO="${PYTORCH_MPS_HIGH_WATERMARK_RATIO:-0.8}"
+# PyTorch requires LOW <= HIGH.  Some shells retain the macOS default low
+# watermark (1.4), so set both values together rather than overriding high
+# alone.  The defaults retain headroom for the OS while avoiding the invalid
+# 1.4 > 0.8 combination that would prevent all MPS work from starting.
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO="${MPS_HIGH_WATERMARK:-1.2}"
+export PYTORCH_MPS_LOW_WATERMARK_RATIO="${MPS_LOW_WATERMARK:-1.0}"
 
 AUDIO_RESUME="${AUDIO_RESUME:-${ROOT}/audio/checkpoints/latest.pt}"
 if [[ ! -f "${AUDIO_RESUME}" ]]; then
@@ -37,8 +40,14 @@ printf '[0728 exploratory] scope=audio resume -> semantic4 -> dual4 -> full11 va
 
 # The audio loop is already complete at epoch 20. Resume only so the model can
 # write its gate/freeze outputs; a failed gate is intentionally non-blocking.
-soft_stage 'audio-resume-or-gate' train-audio --resume "${AUDIO_RESUME}"
-soft_stage 'audio-disentanglement-audit' audit-disentanglement
+# Set SKIP_AUDIO_AUDIT=1 after this stage has already completed to continue
+# directly from semantic4 without repeating the ~30-minute audit.
+if [[ "${SKIP_AUDIO_AUDIT:-0}" == "1" ]]; then
+  printf '[0728 exploratory] skipping audio resume/audit by request\n'
+else
+  soft_stage 'audio-resume-or-gate' train-audio --resume "${AUDIO_RESUME}"
+  soft_stage 'audio-disentanglement-audit' audit-disentanglement
+fi
 
 bash "${RUNNER}" train-semantic4
 bash "${RUNNER}" synthesize semantic4 validation

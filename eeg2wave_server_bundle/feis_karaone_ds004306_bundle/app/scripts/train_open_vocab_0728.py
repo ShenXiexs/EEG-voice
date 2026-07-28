@@ -77,12 +77,12 @@ def audio_gate(model:DualLatentAudioModel,data:DataLoader,stss:STSS,cfg:dict[str
     for source in train.indices:
         label=normalize_label(str(train.cache.raw["labels"][source])); grouped.setdefault(label,[]).append(np.asarray(train.cache.raw["mel"][source]))
     medians={label:np.median(values,axis=0) for label,values in grouped.items()}
-    for batch in data:
+    for batch in tqdm(data,desc="[0728 audio gate]",unit="batch",mininterval=1.0,disable=False):
         batch=move_batch(batch,device); state=model(batch["hubert"],batch["hubert_mask"],batch["mel"],batch["activity"])
         for index,label in enumerate(batch["label"]):
             pred=state.log_mel[index].cpu().numpy(); ref=batch["mel"][index].cpu().numpy(); maes.append(float(np.abs(pred-ref).mean())); ssim.append(ms_ssim(pred,ref)); scores.append(stss.score(pred,ref)); generations.append(pred)
             baseline=stss.score(medians[normalize_label(label)],ref); baseline_scores.append(baseline); gains.append(scores[-1]-baseline); wins.append(scores[-1]>baseline)
-    variance=float(np.var(generations)); reference=float(np.var([value for values in labels.values() for value in values])); ratio=variance/max(reference,1e-8)
+    variance=float(np.var(generations)); reference=float(np.var([value for values in grouped.values() for value in values])); ratio=variance/max(reference,1e-8)
     report={"median_log_mel_mae":float(np.median(maes)),"median_msssim":float(np.median(ssim)),"median_stss":float(np.median(scores)),"median_label_median_stss":float(np.median(baseline_scores)),"median_stss_gain_over_label_median":float(np.median(gains)),"trial_win_rate_over_label_median":float(np.mean(wins)),"generated_reference_variance_ratio":ratio,"passed":bool(np.median(maes)<=float(cfg["evaluation"]["audio_mel_mae_max_db"]) and np.median(ssim)>=float(cfg["evaluation"]["audio_msssim_minimum"]) and np.median(gains)>=float(cfg["evaluation"]["audio_stss_gain_over_label_median"]) and np.mean(wins)>=float(cfg["evaluation"]["audio_trial_win_rate"]) and float(cfg["evaluation"]["audio_variance_ratio_min"])<=ratio<=float(cfg["evaluation"]["audio_variance_ratio_max"]))}
     return report
 
@@ -118,7 +118,7 @@ def eeg_loss(generator:DualLatentEEGToSpeech,batch:dict[str,Any],cfg:dict[str,An
 @torch.no_grad()
 def evaluate_eeg(generator:DualLatentEEGToSpeech,data:DataLoader,device:torch.device) -> dict[str,float]:
     losses=[]; correct=[]; evidence=[]; predictions=[]
-    for batch in data:
+    for batch in tqdm(data,desc="[0728 eeg validation]",unit="batch",mininterval=1.0,disable=False):
         batch=move_batch(batch,device); state=generator.encode(batch["eeg"],batch["channel_xyz"],batch["channel_mask"],batch["time_mask"])
         target=generator.audio_model(batch["hubert"],batch["hubert_mask"],batch["mel"],batch["activity"])
         logits=F.normalize(masked_pool(state.linguistic_latent,state.linguistic_mask),dim=-1)@F.normalize(masked_pool(target.linguistic_latent,target.linguistic_mask),dim=-1).T
@@ -131,8 +131,17 @@ def evaluate_eeg(generator:DualLatentEEGToSpeech,data:DataLoader,device:torch.de
 def run_audio(config_path:Path,cfg:dict[str,Any],device:torch.device,seed:int,epochs:int|None,resume:Path|None,smoke:int,*,loso_subject:str|None=None) -> None:
     context=load_context(config_path,cfg); lineage=build_lineage(config_path,cfg,manifest=context.manifest_path,split=context.split_path,montage=context.montage_path); root=resolve_config_path(config_path,cfg["paths"]["cache_root"])
     train=DualLatentDataset(CacheV3(root,"train"),exclude_subject=loso_subject); valid=DualLatentDataset(CacheV3(root,"validation"),exclude_subject=loso_subject); dl=loader(train,batch_size=int(cfg["training"]["audio_batch_size"]),seed=seed,train=True); vl=loader(valid,batch_size=int(cfg["training"]["audio_batch_size"]),seed=seed,train=False)
-    run_id=None if loso_subject is None else f"strict_end_to_end_loso_{loso_subject.replace(':','_')}_seed_{seed}"; model=DualLatentAudioModel().to(device); opt=torch.optim.AdamW(model.parameters(),lr=float(cfg["training"]["audio_lr"]),weight_decay=float(cfg["training"]["weight_decay"])); latest,best_path,history=paths(config_path,cfg,"audio",run_id); start,best=(0,math.inf) if not resume else restore(resume,model,opt,lineage)
-    total=int(epochs or cfg["training"]["audio_epochs"]); warm=int(cfg["training"]["audio_content_warmup_epochs"]); stale=0; patience=int(cfg["training"]["audio_patience"])
+    run_id=None if loso_subject is None else f"strict_end_to_end_loso_{loso_subject.replace(':','_')}_seed_{seed}"; model=DualLatentAudioModel().to(device); latest,best_path,history=paths(config_path,cfg,"audio",run_id); warm=int(cfg["training"]["audio_content_warmup_epochs"])
+    if resume:
+        raw=torch.load(resume,map_location="cpu",weights_only=False); validate_checkpoint(raw,lineage); model.load_state_dict(raw["state_dict"]); start=int(raw["epoch"])+1; best=float(raw.get("extra",{}).get("best",math.inf)); warmup_complete=bool(raw.get("extra",{}).get("warmup_complete",start>=warm))
+        if warmup_complete:
+            for module in (model.content,model.content_decoder):
+                for parameter in module.parameters(): parameter.requires_grad=False
+        opt=torch.optim.AdamW([parameter for parameter in model.parameters() if parameter.requires_grad],lr=float(cfg["training"]["audio_lr"]),weight_decay=float(cfg["training"]["weight_decay"]))
+        if raw.get("extra",{}).get("optimizer"): opt.load_state_dict(raw["extra"]["optimizer"])
+    else:
+        start,best=0,math.inf; opt=torch.optim.AdamW(model.parameters(),lr=float(cfg["training"]["audio_lr"]),weight_decay=float(cfg["training"]["weight_decay"]))
+    total=int(epochs or cfg["training"]["audio_epochs"]); stale=0; patience=int(cfg["training"]["audio_patience"])
     for epoch in range(start,total):
         if epoch>=warm and any(parameter.requires_grad for parameter in model.content.parameters()):
             for module in (model.content,model.content_decoder):
@@ -143,7 +152,7 @@ def run_audio(config_path:Path,cfg:dict[str,Any],device:torch.device,seed:int,ep
             batch=move_batch(batch,device); loss,metric=audio_loss(model,batch,cfg,warmup=epoch<warm); opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),float(cfg["training"]["grad_clip"])); opt.step(); values.append(metric)
             if smoke and step+1>=smoke: break
         model.eval(); validation=[]
-        for step,batch in enumerate(vl):
+        for step,batch in enumerate(tqdm(vl,desc=f"[0728 audio validation] {epoch+1}/{total}",unit="batch",mininterval=1.0,disable=False)):
             batch=move_batch(batch,device); loss,metric=audio_loss(model,batch,cfg,warmup=epoch<warm); validation.append(metric["loss"])
             if smoke and step+1>=smoke: break
         score=float(np.mean(validation)); record={"epoch":epoch+1,"train_loss":float(np.mean([v["loss"] for v in values])),"validation_loss":score}; history.parent.mkdir(parents=True,exist_ok=True); history.open("a").write(json.dumps(record)+"\n"); save_checkpoint(latest,model,opt,epoch,lineage,{"best":best,"warmup_complete":epoch>=warm})
