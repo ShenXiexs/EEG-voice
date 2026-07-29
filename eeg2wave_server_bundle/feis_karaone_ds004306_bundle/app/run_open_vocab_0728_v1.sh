@@ -82,13 +82,15 @@ case "${1:-}" in
   train-dual4) train dual4 "${@:2}" ;;
   train-full11) train full11 "${@:2}" ;;
   synthesize)
-    phase="${2:?usage: $0 synthesize {semantic4|dual4|full11} {validation|locked_test|diagnostic}}"; split="${3:?missing split}"
+    # Keep the parameter-expansion error text free of a second literal `}`;
+    # otherwise bash treats that brace as part of the phase value.
+    phase="${2:?missing phase (semantic4|dual4|full11)}"; split="${3:?missing split}"
     shift 3; synth "${phase}" "${split}" "$@" ;;
   plot)
     phase="${2:?missing phase}"; split="${3:?missing split}"
     "${PYTHON_BIN}" "${BUNDLE_DIR}/app/scripts/plot_open_vocab_0728_pairs.py" --manifest "${root}/synthesis/${phase}/${split}/synthesis_manifest.json" "${@:4}" ;;
   gate)
-    phase="${2:?usage: $0 gate {semantic4|dual4|full11} [validation|locked_test]}"; split="${3:-validation}"
+    phase="${2:?missing phase (semantic4|dual4|full11)}"; split="${3:-validation}"
     "${PYTHON_BIN}" "${BUNDLE_DIR}/app/scripts/gate_open_vocab_0728.py" --config "${CONFIG}" --phase "${phase}" --manifest "${root}/synthesis/${phase}/${split}/synthesis_manifest.json" ;;
   freeze-test)
     phase="${2:-full11}"

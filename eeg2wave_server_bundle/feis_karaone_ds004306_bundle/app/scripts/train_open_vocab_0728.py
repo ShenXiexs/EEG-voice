@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -94,12 +95,17 @@ def eeg_loss(generator:DualLatentEEGToSpeech,batch:dict[str,Any],cfg:dict[str,An
     state=generator.encode(batch["eeg"],batch["channel_xyz"],batch["channel_mask"],batch["time_mask"])
     pos=positive_matrix(batch)
     semantic=multi_positive_clip(masked_pool(state.linguistic_latent,state.linguistic_mask),masked_pool(target.linguistic_latent,target.linguistic_mask),pos,temperature=float(cfg["loss"]["contrastive_temperature"]))
-    seq=sequence_soft_dtw(state.linguistic_latent,target.linguistic_latent,gamma=float(cfg["loss"]["soft_dtw_gamma"]),band_fraction=float(cfg["loss"]["soft_dtw_band_fraction"]))
+    sequence_weight=float(cfg["loss"]["semantic_sequence_soft_dtw"])
+    seq=sequence_soft_dtw(state.linguistic_latent,target.linguistic_latent,gamma=float(cfg["loss"]["soft_dtw_gamma"]),band_fraction=float(cfg["loss"]["soft_dtw_band_fraction"])) if sequence_weight>0 else torch.zeros((),device=state.linguistic_latent.device)
     coarse,coarse_activity=audio.decode_content(state.linguistic_latent)
     total=float(cfg["loss"]["semantic_contrastive"])*semantic+float(cfg["loss"]["semantic_sequence_soft_dtw"])*seq+float(cfg["loss"]["semantic_coarse_mel"])*F.smooth_l1_loss(coarse,batch["mel"])+float(cfg["loss"]["eeg_activity"])*F.binary_cross_entropy_with_logits(coarse_activity,batch["activity"].float())
-    zero=generator.encode(torch.zeros_like(batch["eeg"]),batch["channel_xyz"],batch["channel_mask"],batch["time_mask"]).evidence_probability
-    noise=generator.encode(torch.randn_like(batch["eeg"])*float(cfg["training"]["signal_noise_std"]),batch["channel_xyz"],batch["channel_mask"],batch["time_mask"]).evidence_probability
-    evidence=F.binary_cross_entropy(state.evidence_probability,torch.ones_like(state.evidence_probability))+0.5*(F.binary_cross_entropy(zero,torch.zeros_like(zero))+F.binary_cross_entropy(noise,torch.zeros_like(noise)))
+    evidence_weight=float(cfg["loss"]["evidence"])
+    if evidence_weight>0:
+        zero=generator.encode(torch.zeros_like(batch["eeg"]),batch["channel_xyz"],batch["channel_mask"],batch["time_mask"]).evidence_probability
+        noise=generator.encode(torch.randn_like(batch["eeg"])*float(cfg["training"]["signal_noise_std"]),batch["channel_xyz"],batch["channel_mask"],batch["time_mask"]).evidence_probability
+        evidence=F.binary_cross_entropy(state.evidence_probability,torch.ones_like(state.evidence_probability))+0.5*(F.binary_cross_entropy(zero,torch.zeros_like(zero))+F.binary_cross_entropy(noise,torch.zeros_like(noise)))
+    else:
+        evidence=torch.zeros((),device=state.linguistic_latent.device)
     total=total+float(cfg["loss"]["evidence"])*evidence
     if phase!="semantic4":
         realization=multi_positive_clip(masked_pool(state.realization_latent,state.realization_mask),masked_pool(target.realization_latent,target.realization_mask),torch.eye(len(batch["label"]),device=batch["eeg"].device,dtype=torch.bool),temperature=float(cfg["loss"]["contrastive_temperature"]))
@@ -108,9 +114,13 @@ def eeg_loss(generator:DualLatentEEGToSpeech,batch:dict[str,Any],cfg:dict[str,An
         structure=(1-foreground_msssim(pred,batch["mel"]).mean())+(1-soft_iou(pred,batch["mel"]).mean())
         total=total+float(cfg["loss"]["weak_paired_realization"])*realization+float(cfg["loss"]["same_subject_label_realization"])*same+float(cfg["loss"]["paired_mel"])*F.smooth_l1_loss(pred,batch["mel"])+float(cfg["loss"]["foreground_structure"])*structure+float(cfg["loss"]["eeg_activity"])*F.binary_cross_entropy_with_logits(act,batch["activity"].float())
     # Light channel consistency after one stochastic channel view.
-    mask=batch["channel_mask"] & (torch.rand_like(batch["channel_mask"].float())>float(cfg["training"]["channel_dropout_max"]))
-    alternate=generator.encode(batch["eeg"],batch["channel_xyz"],mask,batch["time_mask"])
-    consistency=channel_consistency(state.linguistic_latent,alternate.linguistic_latent)
+    consistency_weight=float(cfg["loss"]["channel_consistency"])
+    if consistency_weight>0:
+        mask=batch["channel_mask"] & (torch.rand_like(batch["channel_mask"].float())>float(cfg["training"]["channel_dropout_max"]))
+        alternate=generator.encode(batch["eeg"],batch["channel_xyz"],mask,batch["time_mask"])
+        consistency=channel_consistency(state.linguistic_latent,alternate.linguistic_latent)
+    else:
+        consistency=torch.zeros((),device=state.linguistic_latent.device)
     total=total+float(cfg["loss"]["channel_consistency"])*consistency
     return total,{"loss":float(total.detach()),"semantic":float(semantic.detach()),"sequence":float(seq.detach()),"evidence":float(evidence.detach()),"consistency":float(consistency.detach())}
 
@@ -123,7 +133,7 @@ def evaluate_eeg(generator:DualLatentEEGToSpeech,data:DataLoader,device:torch.de
         target=generator.audio_model(batch["hubert"],batch["hubert_mask"],batch["mel"],batch["activity"])
         logits=F.normalize(masked_pool(state.linguistic_latent,state.linguistic_mask),dim=-1)@F.normalize(masked_pool(target.linguistic_latent,target.linguistic_mask),dim=-1).T
         predicted=logits.argmax(-1); correct.extend((batch["label_index"]==batch["label_index"][predicted]).float().cpu().tolist()); predictions.extend(batch["label_index"][predicted].cpu().tolist()); evidence.extend(state.evidence_probability.cpu().tolist())
-        losses.append(float(F.smooth_l1_loss(state.linguistic_latent,target.linguistic_latent).cpu()))
+        losses.append(float(F.smooth_l1_loss(state.linguistic_latent.contiguous(),target.linguistic_latent.contiguous()).cpu()))
     maximum=max(np.mean(np.asarray(predictions)==value) for value in set(predictions)) if predictions else 1.0
     return {"loss":float(np.mean(losses)),"content_retrieval_macro_top1":float(np.mean(correct)),"evidence_median":float(np.median(evidence)),"maximum_prediction_fraction":float(maximum)}
 
@@ -199,7 +209,14 @@ def run_eeg(config_path:Path,cfg:dict[str,Any],device:torch.device,seed:int,phas
 
 
 def main() -> None:
-    value=args(); config_path,cfg=load_config(value.config); seed=int(value.seed or cfg["training"]["seed"]); seed_everything(seed); device=default_device(value.device)
+    value=args(); config_path,cfg=load_config(value.config)
+    if os.environ.get("V0728_FAST_EEG","") == "1":
+        cfg["training"]["eeg_batch_size"]=int(os.environ.get("V0728_FAST_EEG_BATCH_SIZE","12"))
+        cfg["loss"]["semantic_sequence_soft_dtw"]=0.0
+        cfg["loss"]["evidence"]=0.0
+        cfg["loss"]["channel_consistency"]=0.0
+        print(f"[0728 fast-eeg] batch_size={cfg['training']['eeg_batch_size']} soft_dtw=off evidence=off channel_consistency=off",flush=True)
+    seed=int(value.seed or cfg["training"]["seed"]); seed_everything(seed); device=default_device(value.device)
     if value.phase=="audio": run_audio(config_path,cfg,device,seed,value.epochs,value.resume,value.smoke_steps,loso_subject=value.loso_subject if value.strict_audio_loso else None)
     elif value.phase in {"semantic4","dual4","full11"}: run_eeg(config_path,cfg,device,seed,value.phase,value.epochs,value.resume,value.smoke_steps,loso_subject=value.loso_subject,strict_audio_loso=value.strict_audio_loso)
     else:
