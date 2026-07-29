@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
 APP = Path(__file__).resolve().parents[1]
 if str(APP) not in sys.path:
@@ -48,10 +49,10 @@ def content_retrieval(logits: np.ndarray, targets: np.ndarray, labels: list[str]
 
 
 @torch.no_grad()
-def evaluate_role(model: ContentProsodyEEG, renderer: CPMelRenderer, dataset: CPDataset, device: torch.device, cfg: dict[str, Any]) -> dict[str, Any]:
-    batches = DataLoader(dataset, batch_size=int(cfg["training"]["batch_size"]), shuffle=False, collate_fn=collate, num_workers=0)
+def evaluate_role(model: ContentProsodyEEG, renderer: CPMelRenderer, dataset: CPDataset, device: torch.device, cfg: dict[str, Any], role: str) -> dict[str, Any]:
+    batches = DataLoader(dataset, batch_size=int(cfg["evaluation"]["batch_size"]), shuffle=False, collate_fn=collate, num_workers=0)
     output: dict[str, list[Any]] = defaultdict(list)
-    for batch in batches:
+    for batch in tqdm(batches, total=len(batches), desc=f"[0730 eval] {role}", unit="batch", dynamic_ncols=True, mininterval=0.5):
         batch = move_batch(batch, device)
         variants = {
             "correct": batch["eeg"],
@@ -93,8 +94,8 @@ def evaluate_role(model: ContentProsodyEEG, renderer: CPMelRenderer, dataset: CP
 @torch.no_grad()
 def renderer_gate(renderer: CPMelRenderer, dataset: CPDataset, device: torch.device, cfg: dict[str, Any]) -> dict[str, Any]:
     values = []
-    loader = DataLoader(dataset, batch_size=int(cfg["training"]["batch_size"]), shuffle=False, collate_fn=collate, num_workers=0)
-    for batch in loader:
+    loader = DataLoader(dataset, batch_size=int(cfg["evaluation"]["batch_size"]), shuffle=False, collate_fn=collate, num_workers=0)
+    for batch in tqdm(loader, total=len(loader), desc="[0730 eval] renderer gate", unit="batch", dynamic_ncols=True, mininterval=0.5):
         batch = move_batch(batch, device)
         oracle = renderer(batch["content_tokens"], batch["prosody"])
         c_swap = renderer(torch.roll(batch["content_tokens"], shifts=1, dims=0), batch["prosody"])
@@ -108,17 +109,28 @@ def renderer_gate(renderer: CPMelRenderer, dataset: CPDataset, device: torch.dev
 
 def main() -> None:
     args = parse(); config_path, cfg = load_config(args.config); device = default_device(args.device)
+    report_path = resolve_config_path(config_path, cfg["paths"]["evaluation_report"])
+    status_path = report_path.parent / "evaluation_status.json"
+    if not args.limit:
+        write_json(status_path, {"schema_version": "openvoice-0730-evaluation-status-v1", "state": "running", "device": str(device), "note": "Ignore an older evaluation.json unless this state becomes complete."})
+    print(f"[0730 eval] device={device}", flush=True)
     records = load_prepared(resolve_config_path(config_path, cfg["paths"]["prepared_cache"])); model, _ = load_eeg(config_path, cfg, device); renderer = load_renderer(config_path, cfg, device)
     datasets = {role: CPDataset(records, (role,)) for role in ("subject_holdout_seen", "label_holdout_seen_subject", "subject_and_label_holdout")}
     if args.limit:
         datasets = {role: Subset(dataset, range(min(args.limit, len(dataset)))) for role, dataset in datasets.items()}
-    reports = {role: evaluate_role(model, renderer, dataset, device, cfg) for role, dataset in datasets.items()}
+    reports = {}
+    for role, dataset in datasets.items():
+        print(f"[0730 eval] role={role} n={len(dataset)}", flush=True)
+        reports[role] = evaluate_role(model, renderer, dataset, device, cfg, role)
+        print(f"[0730 eval] role={role} complete", flush=True)
     gate = renderer_gate(renderer, datasets["subject_holdout_seen"], device, cfg)
     if args.limit:
         print({role: value["n"] for role, value in reports.items()}, flush=True)
         return
     write_json(resolve_config_path(config_path, cfg["paths"]["renderer_gate"]), gate)
-    write_json(resolve_config_path(config_path, cfg["paths"]["evaluation_report"]), {"schema_version": "openvoice-0730-evaluation-v1", "role_counts": role_counts(records.roles), "renderer_gate": gate, "results": reports, "waveform_interpretation": "Conditional generative approximation only; imagined EEG and later overt audio are weakly paired."})
+    write_json(report_path, {"schema_version": "openvoice-0730-evaluation-v1", "device": str(device), "role_counts": role_counts(records.roles), "renderer_gate": gate, "results": reports, "waveform_interpretation": "Conditional generative approximation only; imagined EEG and later overt audio are weakly paired."})
+    write_json(status_path, {"schema_version": "openvoice-0730-evaluation-status-v1", "state": "complete", "device": str(device), "report": str(report_path)})
+    print(f"[0730 eval] complete report={report_path}", flush=True)
 
 
 if __name__ == "__main__":

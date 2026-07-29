@@ -14,6 +14,7 @@ import torch
 from scipy.io import wavfile
 from scipy.signal import resample_poly
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 APP = Path(__file__).resolve().parents[1]
 if str(APP) not in sys.path:
@@ -101,7 +102,9 @@ def main() -> None:
     gate = json.loads(gate_path.read_text(encoding="utf-8")) if gate_path.is_file() else {"passed": False, "reason": "renderer gate has not been evaluated"}
     rows: list[dict[str, Any]] = []
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate, num_workers=0)
-    for index, batch in enumerate(loader):
+    total = min(len(dataset), args.limit) if args.limit else len(dataset)
+    progress = tqdm(loader, total=total, desc="[0730 pairs] WAV export", unit="pair", dynamic_ncols=True, mininterval=0.5)
+    for index, batch in enumerate(progress):
         batch = move_batch(batch, device); key = batch["sample_key"][0]; stem = destination / key
         reconstruction_path = stem.with_name(stem.name + "__reconstruction.wav")
         reference_path = stem.with_name(stem.name + "__reference.wav")

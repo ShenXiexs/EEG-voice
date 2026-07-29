@@ -154,7 +154,7 @@ def train_renderer(config_path: Path, cfg: dict[str, Any], records: Any, device:
     total = int(args.epochs or cfg["training"]["renderer_epochs"])
     for epoch in range(total):
         model.train(); values = []
-        for step, batch in enumerate(loader(train, batch_size=int(cfg["training"]["batch_size"]), train=True)):
+        for step, batch in enumerate(loader(train, batch_size=int(cfg["training"]["renderer_batch_size"]), train=True)):
             batch = move_batch(batch, device)
             loss = F.smooth_l1_loss(model(batch["content_tokens"], batch["prosody"]), batch["mel"])
             optimizer.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["training"]["grad_clip"])); optimizer.step()
@@ -163,7 +163,7 @@ def train_renderer(config_path: Path, cfg: dict[str, Any], records: Any, device:
                 break
         model.eval(); validation = []
         with torch.no_grad():
-            for step, batch in enumerate(loader(valid, batch_size=int(cfg["training"]["batch_size"]), train=False)):
+            for step, batch in enumerate(loader(valid, batch_size=int(cfg["training"]["renderer_batch_size"]), train=False)):
                 batch = move_batch(batch, device)
                 validation.append(float(F.smooth_l1_loss(model(batch["content_tokens"], batch["prosody"]), batch["mel"]).detach()))
                 if args.smoke_steps and step + 1 >= args.smoke_steps:
@@ -191,7 +191,7 @@ def train_eeg(config_path: Path, cfg: dict[str, Any], records: Any, device: torc
     history = checkpoint_path(config_path, cfg, "eeg").parent.parent / "metrics" / "training.jsonl"
     for epoch in range(total):
         model.train(); values = []
-        for step, batch in enumerate(loader(train, batch_size=int(cfg["training"]["batch_size"]), train=True)):
+        for step, batch in enumerate(loader(train, batch_size=int(cfg["training"]["eeg_batch_size"]), train=True)):
             batch = move_batch(batch, device)
             state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"])
             c, c_metrics = content_loss(state, batch, codebook, references, model.clip_logit_scale)
@@ -203,7 +203,7 @@ def train_eeg(config_path: Path, cfg: dict[str, Any], records: Any, device: torc
                 break
         model.eval(); validation = []
         with torch.no_grad():
-            for step, batch in enumerate(loader(valid, batch_size=int(cfg["training"]["batch_size"]), train=False)):
+            for step, batch in enumerate(loader(valid, batch_size=int(cfg["training"]["eeg_batch_size"]), train=False)):
                 batch = move_batch(batch, device)
                 state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"])
                 c, _ = content_loss(state, batch, codebook, references, model.clip_logit_scale)

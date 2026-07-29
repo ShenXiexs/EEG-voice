@@ -67,7 +67,9 @@ model:
 
 training:
   seed: 31
-  batch_size: 32
+  # MPS-safe: the EEG attention score tensor fails at B=32 on Apple Metal.
+  renderer_batch_size: 32
+  eeg_batch_size: 8
   renderer_epochs: 8
   renderer_patience: 2
   eeg_epochs: 12
@@ -81,6 +83,7 @@ training:
   wall_hours: 9.5
 
 evaluation:
+  batch_size: 8
   bootstrap_samples: 2000
   bootstrap_seed: 731
   renderer_mel_l1_max_db: 15.0
