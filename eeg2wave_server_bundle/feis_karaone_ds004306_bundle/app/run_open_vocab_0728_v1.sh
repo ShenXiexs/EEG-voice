@@ -88,7 +88,7 @@ case "${1:-}" in
     shift 3; synth "${phase}" "${split}" "$@" ;;
   plot)
     phase="${2:?missing phase}"; split="${3:?missing split}"
-    "${PYTHON_BIN}" "${BUNDLE_DIR}/app/scripts/plot_open_vocab_0728_pairs.py" --manifest "${root}/synthesis/${phase}/${split}/synthesis_manifest.json" "${@:4}" ;;
+    "${PYTHON_BIN}" "${BUNDLE_DIR}/app/scripts/plot_open_vocab_0728_pairs.py" --manifest "${root}/synthesis/${phase}/${split}/synthesis_manifest.json" --reference-cache "${root}/cache/v3/records_${split}.npz" "${@:4}" ;;
   gate)
     phase="${2:?missing phase (semantic4|dual4|full11)}"; split="${3:-validation}"
     "${PYTHON_BIN}" "${BUNDLE_DIR}/app/scripts/gate_open_vocab_0728.py" --config "${CONFIG}" --phase "${phase}" --manifest "${root}/synthesis/${phase}/${split}/synthesis_manifest.json" ;;

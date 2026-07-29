@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--dataset", choices=("karaone", "feis"), required=True)
-    parser.add_argument("--split", choices=("validation", "test"), default="test")
+    parser.add_argument("--split", choices=("train", "validation", "test"), default="test")
     parser.add_argument("--synthesis-root", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -75,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated generated modes to include in every comparison panel",
     )
     parser.add_argument("--dpi", type=int, default=140)
+    parser.add_argument(
+        "--resume-existing",
+        action="store_true",
+        help="Reuse complete comparison PNGs and continue an interrupted render.",
+    )
     return parser.parse_args()
 
 
@@ -121,6 +126,9 @@ def time_axis(samples: int, sample_rate: int) -> np.ndarray:
 
 
 def metric_text(metrics: dict[str, Any]) -> str:
+    if float(metrics.get("visual_preview_only", 0.0)) > 0.5:
+        return "qualitative preview — numerical metrics skipped"
+
     def value(name: str) -> float:
         raw = metrics.get(name, float("nan"))
         return float(raw) if raw is not None else float("nan")
@@ -152,6 +160,7 @@ def plot_record(
     destination: Path,
     *,
     dpi: int,
+    evaluation_scope: str,
 ) -> list[str]:
     stem = str(record["stem"])
     reference_wav, sample_rate = read_wav(root / "reference" / f"{stem}.wav")
@@ -295,7 +304,8 @@ def plot_record(
     axes[0, 1].legend(loc="upper right", fontsize=7)
     figure.suptitle(
         "v0724 reconstruction comparison | "
-        f"sample={record.get('sample_key')} | label={record.get('label')}\n"
+        f"scope={evaluation_scope} | sample={record.get('sample_key')} | "
+        f"label={record.get('label')}\n"
         "waveforms RMS-normalized for display; metrics come from numerical tensors",
         fontsize=12,
     )
@@ -312,11 +322,13 @@ def render_comparisons(
     modes: tuple[str, ...],
     limit: int,
     dpi: int,
+    resume_existing: bool,
 ) -> dict[str, Any]:
     manifest_path = root / "synthesis_manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Missing v0724 synthesis manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    evaluation_scope = str(manifest.get("evaluation_scope") or manifest.get("split"))
     records = list(manifest.get("records") or [])
     if not records:
         raise ValueError("v0724 synthesis manifest has no records to plot")
@@ -326,10 +338,23 @@ def render_comparisons(
         records = records[:limit]
     output.mkdir(parents=True, exist_ok=True)
     plots: list[dict[str, Any]] = []
-    for record in tqdm(records, desc="[0724 comparison plots]", unit="figure"):
+    for record in tqdm(
+        records,
+        desc="[0724 energy pairs]",
+        unit="figure",
+        mininterval=1.0,
+        dynamic_ncols=True,
+        disable=False,
+    ):
         stem = str(record.get("stem") or safe_name(str(record.get("sample_key"))))
         figure = output / f"{safe_name(stem)}.png"
-        modes_written = plot_record(root, record, modes, figure, dpi=dpi)
+        modes_written = (
+            list(modes)
+            if resume_existing and figure.is_file()
+            else plot_record(
+                root, record, modes, figure, dpi=dpi, evaluation_scope=evaluation_scope
+            )
+        )
         if modes_written:
             plots.append(
                 {
@@ -350,6 +375,11 @@ def render_comparisons(
         "source_manifest_schema": manifest.get("schema_version"),
         "dataset": manifest.get("dataset"),
         "split": manifest.get("split"),
+        "output_split": manifest.get("output_split", manifest.get("split")),
+        "evaluation_scope": evaluation_scope,
+        "input_dataset_record_count": manifest.get("input_dataset_record_count"),
+        "full_dataset_record_count": manifest.get("full_dataset_record_count"),
+        "skipped_record_count": manifest.get("skipped_record_count", 0),
         "plots_written": len(plots),
         "requested_modes": list(modes),
         "metrics_use_png_pixels": False,
@@ -374,6 +404,7 @@ def main() -> None:
         modes=parse_modes(args.modes),
         limit=int(args.limit),
         dpi=int(args.dpi),
+        resume_existing=bool(args.resume_existing),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

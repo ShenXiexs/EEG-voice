@@ -25,7 +25,7 @@ from src.open_vocab_0728.vocoder import griffin_lim_from_log_mel
 
 def parse() -> argparse.Namespace:
     p=argparse.ArgumentParser(description="Synthesize v0728 mel/WAV and factor counterfactuals")
-    p.add_argument("--config",type=Path,required=True); p.add_argument("--phase",choices=("semantic4","dual4","full11"),default="full11"); p.add_argument("--split",choices=("validation","locked_test","diagnostic"),default="validation"); p.add_argument("--device",default=None); p.add_argument("--access-id"); p.add_argument("--resume-existing",action="store_true"); p.add_argument("--limit",type=int,default=0); return p.parse_args()
+    p.add_argument("--config",type=Path,required=True); p.add_argument("--phase",choices=("semantic4","dual4","full11"),default="full11"); p.add_argument("--split",choices=("train","validation","locked_test","diagnostic"),default="validation"); p.add_argument("--device",default=None); p.add_argument("--access-id"); p.add_argument("--resume-existing",action="store_true"); p.add_argument("--limit",type=int,default=0); return p.parse_args()
 
 
 def checkpoint_path(config:Path,cfg:dict,phase:str)->Path:
@@ -55,18 +55,26 @@ def decode(audio:DualLatentAudioModel,linguistic:torch.Tensor,realization:torch.
 @torch.no_grad()
 def main()->None:
     arg=parse(); config,cfg=load_config(arg.config); device=default_device(arg.device); root=resolve_config_path(config,cfg["paths"]["cache_root"])
+    print(f"[0728 synth] preparing {arg.phase}/{arg.split}: device={device.type}; loading split cache", flush=True)
     ledger=None
     if arg.split=="locked_test":
         if not arg.access_id: raise PermissionError("locked-test synthesis requires --access-id")
         freeze_path=resolve_config_path(config,cfg["paths"]["locked_test_freeze"])
         if not freeze_path.exists(): raise PermissionError("locked test requires frozen validation configuration")
         ledger=claim_locked_test_access(resolve_config_path(config,cfg["paths"]["locked_test_ledger"]),freeze=json.loads(freeze_path.read_text()),access_id=arg.access_id)
-    cache=CacheV3(root,arg.split,allow_locked=arg.split=="locked_test"); train_cache=CacheV3(root,"train"); model=load_model(config,cfg,arg.phase,device); stss=load_stss(resolve_config_path(config,cfg["paths"]["metric_manifest"]))
+    cache=CacheV3(root,arg.split,allow_locked=arg.split=="locked_test")
+    train_cache=CacheV3(root,"train")
+    print(f"[0728 synth] cache ready: target={len(cache)} records; loading frozen {arg.phase} checkpoint", flush=True)
+    model=load_model(config,cfg,arg.phase,device)
+    stss=load_stss(resolve_config_path(config,cfg["paths"]["metric_manifest"]))
+    print("[0728 synth] checkpoint ready; building train-only label-median baselines", flush=True)
     label_medians:dict[str,np.ndarray]={}
-    for label in sorted({normalize_label(str(value)) for value in train_cache.raw["labels"]}):
+    labels=sorted({normalize_label(str(value)) for value in train_cache.raw["labels"]})
+    for label in tqdm(labels,desc="[0728 synth] label medians",unit="label",mininterval=1.0,disable=False):
         members=[np.asarray(train_cache.raw["mel"][i]) for i,value in enumerate(train_cache.raw["labels"]) if normalize_label(str(value))==label]
         label_medians[label]=np.median(members,axis=0)
     output=resolve_config_path(config,cfg["paths"]["output_root"])/"synthesis"/arg.phase/arg.split; output.mkdir(parents=True,exist_ok=True); records=[]
+    print(f"[0728 synth] preparation complete; starting {len(cache) if not arg.limit else min(len(cache),arg.limit)} trial synthesis", flush=True)
     for index in tqdm(range(len(cache)),desc=f"[0728 synth] {arg.phase}/{arg.split}",unit="trial"):
         item=cache.item(index); base=output/item["sample_key"]
         if arg.resume_existing and (base.with_suffix(".json")).exists():

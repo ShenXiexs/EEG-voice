@@ -97,13 +97,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--dataset", choices=("karaone", "feis"), required=True)
-    parser.add_argument("--split", choices=("validation", "test"), default="validation")
+    parser.add_argument(
+        "--split", choices=("train", "validation", "test"), default="validation"
+    )
     parser.add_argument("--generalization", choices=("g1", "g2", "g3"), default="g1")
     parser.add_argument("--holdout-label", default=None)
     parser.add_argument("--loso-subject", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--limit", type=int, default=-1)
+    parser.add_argument(
+        "--stratified-limit",
+        type=int,
+        default=0,
+        help=(
+            "Select this many primary trials without replacement, stratified by "
+            "(subject_group_id, label). Use for descriptive previews only; it is "
+            "mutually exclusive with --limit and unavailable on the locked test."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--allow-final-test", action="store_true")
     parser.add_argument(
@@ -118,6 +130,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-decoded-content-metric", action="store_true")
     parser.add_argument("--skip-decoded-timbre-metric", action="store_true")
     parser.add_argument(
+        "--visual-preview",
+        action="store_true",
+        help=(
+            "Write reconstructed WAV/mel artifacts but skip expensive numerical "
+            "waveform/content/timbre metrics and per-mode standalone PNGs. "
+            "Preview outputs must not be used for aggregate performance claims."
+        ),
+    )
+    parser.add_argument(
         "--resume-existing",
         action="store_true",
         help="Reuse completed per-trial records and continue an interrupted synthesis.",
@@ -127,6 +148,76 @@ def parse_args() -> argparse.Namespace:
 
 def safe(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
+
+
+def subject_label_stratified_indices(
+    eligible_indices: Sequence[int],
+    rows: Sequence[dict[str, Any]],
+    *,
+    limit: int,
+    seed: int,
+) -> tuple[list[int], dict[str, Any]]:
+    """Sample primary trials evenly across subject-label strata.
+
+    The EEG encoder never receives subject or label metadata.  These fields are
+    used only to make a small, human-inspection preview cover the available
+    population more fairly.  Counterfactual controls are still selected from the
+    full eligible pool later in ``main``.
+    """
+
+    if limit <= 0:
+        raise ValueError("--stratified-limit must be a positive integer")
+    groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index in eligible_indices:
+        row = rows[index]
+        groups[(str(row["subject_group_id"]), str(row["label"]))].append(index)
+    if not groups:
+        raise ValueError("Cannot stratify an empty eligible-index set")
+
+    requested = int(limit)
+    target = min(requested, len(eligible_indices))
+    generator = np.random.default_rng(seed)
+    strata = sorted(groups)
+    generator.shuffle(strata)
+    queues: dict[tuple[str, str], list[int]] = {}
+    for stratum in strata:
+        members = list(groups[stratum])
+        generator.shuffle(members)
+        queues[stratum] = members
+
+    selected: list[int] = []
+    # One observation per stratum whenever the requested budget permits it.
+    for stratum in strata[:target]:
+        selected.append(queues[stratum].pop())
+
+    # Fill the remaining budget round-robin so high-frequency labels or subjects
+    # do not monopolize a descriptive preview.
+    while len(selected) < target:
+        progressed = False
+        for stratum in strata:
+            if len(selected) >= target:
+                break
+            if queues[stratum]:
+                selected.append(queues[stratum].pop())
+                progressed = True
+        if not progressed:
+            break
+
+    selected = sorted(selected)
+    selected_strata = {
+        (str(rows[index]["subject_group_id"]), str(rows[index]["label"]))
+        for index in selected
+    }
+    return selected, {
+        "method": "subject_label_stratified_without_replacement",
+        "seed": int(seed),
+        "requested_primary_trials": requested,
+        "selected_primary_trials": len(selected),
+        "available_primary_trials": len(eligible_indices),
+        "available_subject_label_strata": len(strata),
+        "selected_subject_label_strata": len(selected_strata),
+        "uncovered_subject_label_strata": max(0, len(strata) - len(selected_strata)),
+    }
 
 
 def expected_dependencies(
@@ -539,10 +630,19 @@ def main() -> None:
     args = parse_args()
     if args.limit == 0 or args.limit < -1:
         raise ValueError("--limit must be -1 or a positive number of trials")
-    if args.split == "test" and (args.limit >= 0 or args.skip_decoded_content_metric):
+    if args.stratified_limit < 0:
+        raise ValueError("--stratified-limit must be zero or a positive number of trials")
+    if args.limit >= 0 and args.stratified_limit > 0:
+        raise ValueError("--limit and --stratified-limit cannot be used together")
+    if args.split == "test" and (
+        args.limit >= 0
+        or args.stratified_limit > 0
+        or args.skip_decoded_content_metric
+        or args.skip_decoded_timbre_metric
+        or args.visual_preview
+    ):
         raise PermissionError(
-            "The one-shot locked test cannot use --limit or skip the decoded "
-            "content metric"
+            "The one-shot locked test cannot use sampling or preview-only options"
         )
     config_path, raw_cfg = load_config(args.config)
     seed = int(raw_cfg["training"]["seed"] if args.seed is None else args.seed)
@@ -640,6 +740,17 @@ def main() -> None:
         raise ValueError(
             f"No reconstruction-eligible {args.dataset}/{args.split} trials"
         )
+    eligible_index_set = set(eligible_indices)
+    skipped_records = [
+        {
+            "sample_key": str(row["sample_key"]),
+            "audio_key": str(row["audio_key"]),
+            "label": str(row["label"]),
+            "reason": "audio_not_reconstruction_eligible",
+        }
+        for index, row in enumerate(dataset.rows)
+        if index not in eligible_index_set
+    ]
     eligible_rows = [dataset.rows[index] for index in eligible_indices]
     same_local, wrong_local, shuffled_local = control_indices(eligible_rows, seed)
     same_indices = {
@@ -655,8 +766,24 @@ def main() -> None:
         for position, original in enumerate(eligible_indices)
     }
     full_dataset_record_count = len(eligible_indices)
-    indices = list(eligible_indices)
-    indices = indices if args.limit < 0 else indices[: args.limit]
+    sampling: dict[str, Any]
+    if args.stratified_limit > 0:
+        indices, sampling = subject_label_stratified_indices(
+            eligible_indices,
+            dataset.rows,
+            limit=args.stratified_limit,
+            seed=seed,
+        )
+    else:
+        indices = list(eligible_indices)
+        indices = indices if args.limit < 0 else indices[: args.limit]
+        sampling = {
+            "method": "sequential_prefix" if args.limit >= 0 else "full_eligible_pool",
+            "seed": int(seed),
+            "requested_primary_trials": int(args.limit),
+            "selected_primary_trials": len(indices),
+            "available_primary_trials": len(eligible_indices),
+        }
     run_id = run_identifier(
         raw_cfg,
         seed=seed,
@@ -664,18 +791,27 @@ def main() -> None:
         generalization=args.generalization,
         holdout_label=args.holdout_label,
     )
+    output_split = (
+        "exploratory_test"
+        if args.split == "test" and args.exploratory_test
+        else args.split
+    )
     default_output = (
         resolve_config_path(config_path, raw_cfg["paths"]["output_root"])
         / "synthesis"
         / args.dataset
-        / args.split
+        / output_split
     )
     if run_id is not None:
         default_output = default_output / "runs" / run_id
     if args.limit >= 0:
         default_output = default_output / f"diagnostic_limit_{args.limit}"
+    elif args.stratified_limit > 0:
+        default_output = default_output / f"preview_subject_label_{args.stratified_limit}"
     if args.skip_decoded_content_metric:
         default_output = default_output / "diagnostic_no_decoded_content_metric"
+    if args.visual_preview:
+        default_output = default_output / "visual_preview"
     output_root = args.output.resolve() if args.output else default_output
     output_root.mkdir(parents=True, exist_ok=True)
     codec = DiscreteEncodec(
@@ -693,12 +829,12 @@ def main() -> None:
         str(resolve_config_path(config_path, raw_cfg["teachers"]["hubert_model"])),
         int(raw_cfg["teachers"]["hubert_layer"]),
         device,
-        args.skip_decoded_content_metric,
+        args.skip_decoded_content_metric or args.visual_preview,
     )
     timbre_metric = TimbreMetric(
         str(raw_cfg["teachers"]["wavlm_model"]),
         device,
-        args.skip_decoded_timbre_metric,
+        args.skip_decoded_timbre_metric or args.visual_preview,
     )
     records: list[dict[str, Any]] = []
     aggregate: dict[str, list[dict[str, float]]] = defaultdict(list)
@@ -804,75 +940,83 @@ def main() -> None:
         reference_dir.mkdir(parents=True, exist_ok=True)
         write_wav(reference_dir / f"{stem}.wav", reference, codec.codec_sample_rate)
         np.save(reference_dir / f"{stem}.mel.npy", reference_map)
-        plot_energy(
-            reference_dir / f"{stem}.png",
-            reference_map,
-            title=f"reference: {batch['label'][0]}",
-        )
+        if not args.visual_preview:
+            plot_energy(
+                reference_dir / f"{stem}.png",
+                reference_map,
+                title=f"reference: {batch['label'][0]}",
+            )
 
         mode_metrics: dict[str, dict[str, float]] = {}
         candidate_names = list(decoded)
-        decoded_embeddings, frame_scores = content_metric.compare(
-            [reference] + [decoded[name] for name in candidate_names],
-            codec.codec_sample_rate,
-        )
-        decoded_timbre = timbre_metric.embeddings(
-            [reference] + [decoded[name] for name in candidate_names],
-            codec.codec_sample_rate,
-        )
+        if args.visual_preview:
+            decoded_embeddings, frame_scores, decoded_timbre = None, None, None
+        else:
+            decoded_embeddings, frame_scores = content_metric.compare(
+                [reference] + [decoded[name] for name in candidate_names],
+                codec.codec_sample_rate,
+            )
+            decoded_timbre = timbre_metric.embeddings(
+                [reference] + [decoded[name] for name in candidate_names],
+                codec.codec_sample_rate,
+            )
         for candidate_index, name in enumerate(candidate_names):
             folder = output_root / name
             folder.mkdir(parents=True, exist_ok=True)
             waveform = decoded[name]
             write_wav(folder / f"{stem}.wav", waveform, codec.codec_sample_rate)
             np.save(folder / f"{stem}.mel.npy", predicted_maps[name])
-            plot_energy(
-                folder / f"{stem}.png",
-                predicted_maps[name],
-                title=f"{name}: {batch['label'][0]}",
-            )
-            direct = energy_structure_metrics(reference_map, predicted_maps[name])
-            waveform_result = reconstruction_metrics(
-                reference,
-                waveform,
-                codec.codec_sample_rate,
-                max_lag_ms=float(raw_cfg["evaluation"]["max_envelope_lag_ms"]),
-            )
-            result = dict(direct)
-            result.update(factor_results[name])
-            result.update(
-                {f"decoded_{key}": value for key, value in waveform_result.items()}
-            )
-            result["predicted_map_decoded_consistency"] = energy_structure_metrics(
-                predicted_maps[name], log_mel(waveform, codec.codec_sample_rate)
-            )["morphology_ssim"]
-            result["latent_content_cosine"] = float(
-                F.cosine_similarity(
-                    content_sources[name], audio_state.content_global, dim=-1
-                ).item()
-            )
-            result["timbre_cosine"] = float(
-                F.cosine_similarity(
-                    timbre_sources[name], audio_state.timbre_global, dim=-1
-                ).item()
-            )
-            if decoded_timbre is not None:
-                result["wavlm_xvector_cosine"] = float(
-                    (decoded_timbre[0] * decoded_timbre[candidate_index + 1])
-                    .sum()
-                    .item()
-                )
-            if decoded_embeddings is not None:
-                result["content_cosine"] = float(
-                    (decoded_embeddings[0] * decoded_embeddings[candidate_index + 1])
-                    .sum()
-                    .item()
-                )
-                assert frame_scores is not None
-                result["speech_bertscore"] = frame_scores[candidate_index]
-                result["hubert_frame_matching_f1"] = frame_scores[candidate_index]
+            if args.visual_preview:
+                result = dict(factor_results[name])
+                result["visual_preview_only"] = 1.0
             else:
-                result["content_cosine"] = result["latent_content_cosine"]
+                plot_energy(
+                    folder / f"{stem}.png",
+                    predicted_maps[name],
+                    title=f"{name}: {batch['label'][0]}",
+                )
+                direct = energy_structure_metrics(reference_map, predicted_maps[name])
+                waveform_result = reconstruction_metrics(
+                    reference,
+                    waveform,
+                    codec.codec_sample_rate,
+                    max_lag_ms=float(raw_cfg["evaluation"]["max_envelope_lag_ms"]),
+                )
+                result = dict(direct)
+                result.update(factor_results[name])
+                result.update(
+                    {f"decoded_{key}": value for key, value in waveform_result.items()}
+                )
+                result["predicted_map_decoded_consistency"] = energy_structure_metrics(
+                    predicted_maps[name], log_mel(waveform, codec.codec_sample_rate)
+                )["morphology_ssim"]
+                result["latent_content_cosine"] = float(
+                    F.cosine_similarity(
+                        content_sources[name], audio_state.content_global, dim=-1
+                    ).item()
+                )
+                result["timbre_cosine"] = float(
+                    F.cosine_similarity(
+                        timbre_sources[name], audio_state.timbre_global, dim=-1
+                    ).item()
+                )
+                if decoded_timbre is not None:
+                    result["wavlm_xvector_cosine"] = float(
+                        (decoded_timbre[0] * decoded_timbre[candidate_index + 1])
+                        .sum()
+                        .item()
+                    )
+                if decoded_embeddings is not None:
+                    result["content_cosine"] = float(
+                        (decoded_embeddings[0] * decoded_embeddings[candidate_index + 1])
+                        .sum()
+                        .item()
+                    )
+                    assert frame_scores is not None
+                    result["speech_bertscore"] = frame_scores[candidate_index]
+                    result["hubert_frame_matching_f1"] = frame_scores[candidate_index]
+                else:
+                    result["content_cosine"] = result["latent_content_cosine"]
             mode_metrics[name] = result
             aggregate[name].append(result)
         retrieval_eeg.append(state.content_global[0].detach().cpu())
@@ -932,12 +1076,29 @@ def main() -> None:
         "schema_version": "openvoice-0724-synthesis-v1",
         "dataset": args.dataset,
         "split": args.split,
+        "output_split": output_split,
+        "evaluation_scope": (
+            "in_sample_train"
+            if args.split == "train"
+            else "exploratory_test"
+            if args.split == "test" and args.exploratory_test
+            else "validation"
+            if args.split == "validation"
+            else "locked_test"
+        ),
         "generalization": args.generalization,
         "holdout_label": args.holdout_label,
         "loso_subject": args.loso_subject,
         "seed": seed,
         "diagnostic_limit": int(args.limit),
+        "stratified_limit": int(args.stratified_limit),
+        "sampling": sampling,
+        "visual_preview": bool(args.visual_preview),
+        "input_dataset_record_count": int(len(dataset.rows)),
         "full_dataset_record_count": int(full_dataset_record_count),
+        "skipped_records": skipped_records,
+        "skipped_record_count": int(len(skipped_records)),
+        "completed_record_count": int(len(records)),
         "records": records,
         "aggregate": {name: summarize(values) for name, values in aggregate.items()},
         "retrieval": retrieval,
@@ -949,7 +1110,14 @@ def main() -> None:
         "decoded_content_metric_available": bool(
             content_metric.model is not None and not content_metric.disabled
         ),
-        "test_accessed": args.split == "test",
+        # ``test_accessed`` retains the existing formal-gate meaning: an
+        # explicitly exploratory diagnostic must never masquerade as locked
+        # test access in downstream lineage checks.
+        "test_accessed": bool(args.split == "test" and not args.exploratory_test),
+        "test_split_read": args.split == "test",
+        "formal_locked_test_accessed": bool(
+            args.split == "test" and not args.exploratory_test
+        ),
         "metrics_use_png_pixels": False,
         "frequency_axis_scaled": False,
     }

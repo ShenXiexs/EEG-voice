@@ -35,13 +35,13 @@ case "${1:-}" in
     ;;
   synthesize)
     if [[ -z "${2:-}" ]]; then
-      echo "usage: $0 synthesize {karaone|feis} [validation|test] [options]" >&2
+      echo "usage: $0 synthesize {karaone|feis} [train|validation|test] [options]" >&2
       exit 2
     fi
     dataset="$2"
     shift 2
     split="validation"
-    if [[ "${1:-}" == "validation" || "${1:-}" == "test" ]]; then
+    if [[ "${1:-}" == "train" || "${1:-}" == "validation" || "${1:-}" == "test" ]]; then
       split="$1"
       shift
     fi
@@ -51,13 +51,13 @@ case "${1:-}" in
     ;;
   plot)
     if [[ -z "${2:-}" ]]; then
-      echo "usage: $0 plot {karaone|feis} [validation|test] [options]" >&2
+      echo "usage: $0 plot {karaone|feis} [train|validation|test] [options]" >&2
       exit 2
     fi
     dataset="$2"
     shift 2
     split="test"
-    if [[ "${1:-}" == "validation" || "${1:-}" == "test" ]]; then
+    if [[ "${1:-}" == "train" || "${1:-}" == "validation" || "${1:-}" == "test" ]]; then
       split="$1"
       shift
     fi
