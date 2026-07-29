@@ -110,7 +110,13 @@ def main() -> None:
         reference_path = stem.with_name(stem.name + "__reference.wav")
         metadata_path = stem.with_suffix(".json")
         if args.resume and metadata_path.is_file() and reconstruction_path.is_file() and reference_path.is_file():
-            rows.append(json.loads(metadata_path.read_text(encoding="utf-8")))
+            row = json.loads(metadata_path.read_text(encoding="utf-8"))
+            # Refresh run-level gate metadata even when WAV synthesis is resumed.
+            # Older JSON files may contain 0/1 because bool subclasses int.
+            row["renderer_gate_passed"] = bool(gate.get("passed", False))
+            row["interpretation"] = "conditional_generative_approximation" if gate.get("passed", False) else "diagnostic_waveform_only"
+            write_json(metadata_path, row)
+            rows.append(row)
             continue
         state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"])
         mel = renderer(state.content_logits, state.prosody)

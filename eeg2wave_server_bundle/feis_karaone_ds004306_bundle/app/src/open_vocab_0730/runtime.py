@@ -13,6 +13,8 @@ import yaml
 
 
 VERSION = "openvoice-eeg-0730-explicit-cp-v1"
+FIXED_VERSION = "openvoice-eeg-0730-explicit-cp-fixed-v2"
+SUPPORTED_VERSIONS = {VERSION, FIXED_VERSION}
 
 
 def resolve_config_path(config_path: str | Path, value: str | Path) -> Path:
@@ -37,7 +39,7 @@ def ensure_output_firewall(config_path: str | Path, cfg: dict[str, Any]) -> None
 def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
     config_path = Path(path).resolve()
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    if cfg.get("version") != VERSION:
+    if cfg.get("version") not in SUPPORTED_VERSIONS:
         raise ValueError(f"unsupported v0730 config: {cfg.get('version')!r}")
     if "pot" not in str(cfg["split"]["unseen_label"]).lower():
         raise ValueError("v0730 requires the fixed unseen label 'pot'")
@@ -86,12 +88,14 @@ def json_safe(value: Any) -> Any:
         return json_safe(value.detach().cpu().tolist())
     if isinstance(value, np.ndarray):
         return json_safe(value.tolist())
+    # bool is a subclass of int in Python, so it must be handled first to keep
+    # JSON flags as true/false instead of 1/0.
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
     if isinstance(value, (np.floating, float)):
         return float(value) if np.isfinite(value) else None
     if isinstance(value, (np.integer, int)):
         return int(value)
-    if isinstance(value, (np.bool_, bool)):
-        return bool(value)
     if isinstance(value, Path):
         return str(value)
     return value
