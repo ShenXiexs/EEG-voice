@@ -1,0 +1,4 @@
+# v3 deliberately reuses the established application dependencies and adds
+# ECAPA only for the audio-only V1/V2 speaker oracle.
+-r requirements.txt
+speechbrain==1.0.3
