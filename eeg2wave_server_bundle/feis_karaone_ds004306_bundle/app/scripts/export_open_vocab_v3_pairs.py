@@ -21,7 +21,7 @@ if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
 from scripts.train_open_vocab_v3 import load_audio, load_eeg
-from src.open_vocab_v3.data import V3Dataset, channel_shuffled_eeg, collate, light_prepare_waveform, load_prepared, time_shuffled_eeg
+from src.open_vocab_v3.data import V3Dataset, _accepted_denoise_paths, channel_shuffled_eeg, collate, light_prepare_waveform, load_prepared, time_shuffled_eeg
 from src.open_vocab_v3.runtime import capture_lineage, default_device, load_config, move_batch, output_path, read_json, require_passed_gate, write_json
 from src.open_vocab_v3.vocoder import SpeechT5PowerDbHiFiGan, pcm16
 from src.open_vocab_0724.audio_features import AudioPreparationConfig
@@ -76,7 +76,7 @@ def main() -> None:
     args=parse();config_path,cfg=load_config(args.config);device=default_device(args.device);started=time.monotonic()
     validation_path=output_path(config_path,cfg,"validation_report")
     fit_gate_path=output_path(config_path,cfg,"fit_gate");fit_gate=require_passed_gate(config_path,cfg,"fit_gate",lineage_artifact_keys=("fit_checkpoint","micro_gate"))
-    expected_report_lineage=capture_lineage(config_path,cfg,artifact_keys=("fit_checkpoint","fit_gate"))
+    expected_report_lineage=capture_lineage(config_path,cfg,artifact_keys=("fit_checkpoint","fit_gate","training_review"))
     for report_key in ("validation_report","locked_report","locked_unseen_report"):
         report_path=output_path(config_path,cfg,report_key)
         if not report_path.is_file() or read_json(report_path).get("lineage")!=expected_report_lineage:
@@ -84,14 +84,14 @@ def main() -> None:
     records=load_prepared(output_path(config_path,cfg,"prepared_cache"));dataset=V3Dataset(records,("fit",),eligible_only=True)
     eeg,_=load_eeg(config_path,cfg,device,stage="fit");audio,_=load_audio(config_path,cfg,device);vocoder=SpeechT5PowerDbHiFiGan(output_path(config_path,cfg,"vocoder_root"),device=device)
     destination=output_path(config_path,cfg,"pair_root");destination.mkdir(parents=True,exist_ok=True)
-    paths=manifest_paths(output_path(config_path,cfg,"unified_manifest"));audio_root=output_path(config_path,cfg,"audio_root")
+    paths=manifest_paths(output_path(config_path,cfg,"unified_manifest"));audio_root=output_path(config_path,cfg,"audio_root");denoised=_accepted_denoise_paths(config_path,cfg)
     fit_keys=list(map(str,fit_gate.get("sample_keys",[])));fit_ranks=list(fit_gate.get("correct",{}).get("paired_rank_per_trial",[]))
     if len(fit_keys)!=len(fit_ranks):raise RuntimeError("fit gate lacks per-trial retrieval ranks")
     rank_by_key={key:int(rank) for key,rank in zip(fit_keys,fit_ranks)}
     rows=[];total=min(len(dataset),args.limit) if args.limit else len(dataset)
     for number,batch in enumerate(tqdm(DataLoader(dataset,batch_size=1,shuffle=False,collate_fn=collate,num_workers=0),total=total,desc="[v3 pairs] WAV export",unit="pair",dynamic_ncols=True,mininterval=.5)):
         batch=move_batch(batch,device);key=batch["sample_key"][0];stem=destination/key;meta=stem.with_suffix(".json")
-        names={name:stem.with_name(f"{stem.name}__{name}.wav") for name in ("cleaned_reference","v0_vocoder_oracle","v1_mfcc_oracle","eeg","zero_eeg","time_shuffled","channel_shuffled")}
+        names={name:stem.with_name(f"{stem.name}__{name}.wav") for name in ("cleaned_reference","v0_vocoder_oracle","analytic_mfcc_oracle","cvae_posterior_oracle","cvae_prior_mfcc_oracle","eeg","zero_eeg","time_shuffled","channel_shuffled")}
         figure=stem.with_name(f"{stem.name}__comparison.png")
         if args.resume and meta.is_file() and all(path.is_file() for path in names.values()) and figure.is_file():
             cached=json.loads(meta.read_text())
@@ -101,12 +101,14 @@ def main() -> None:
         target_mfcc=batch["mfcc"].cpu().numpy()[0];target_mel=batch["mel"].cpu().numpy()[0]
         kwargs=(batch["channel_xyz"].float(),batch["channel_mask"],batch["time_mask"])
         predicted={"eeg":eeg(batch["eeg"].float(),*kwargs)[0],"zero_eeg":eeg(torch.zeros_like(batch["eeg"]).float(),*kwargs)[0],"time_shuffled":eeg(time_shuffled_eeg(batch["eeg"].float(),batch["time_mask"]),*kwargs)[0],"channel_shuffled":eeg(channel_shuffled_eeg(batch["eeg"].float(),batch["channel_mask"]),*kwargs)[0]}
-        mel={"v1_mfcc_oracle":audio(batch["mfcc"].float(),batch["canonical_voice"].float())[0]}
-        for name,value in predicted.items():mel[name]=audio(value,batch["canonical_voice"].float())[0]
-        generated={"v0_vocoder_oracle":pcm16(vocoder.synthesize(torch.from_numpy(records.arrays["vocoder_mel"][source:source+1]).to(device))[0]),**{name:pcm16(vocoder.synthesize(value.unsqueeze(0))[0]) for name,value in mel.items()}}
-        ref,rate=light_cleaned_reference(audio_root/paths[key],cfg);write_wave(names["cleaned_reference"],ref,rate)
+        voice=batch["canonical_voice"].float();mean=batch["canonical_mfcc_mean"].float();std=batch["canonical_mfcc_std"].float()
+        prior=audio.generate(batch["mfcc"].float(),voice,mean,std,stochastic=False);posterior=audio.reconstruct(batch["mfcc"].float(),voice,mean,std,batch["mel"].float(),stochastic=False)
+        mel={"analytic_mfcc_oracle":prior["analytic_mel"],"cvae_posterior_oracle":posterior["mel"],"cvae_prior_mfcc_oracle":prior["mel"]}
+        for name,value in predicted.items():mel[name]=audio.generate(value,voice,mean,std,stochastic=False)["mel"]
+        generated={"v0_vocoder_oracle":pcm16(vocoder.synthesize(torch.from_numpy(records.arrays["vocoder_mel"][source:source+1]).to(device))[0]),**{name:pcm16(vocoder.synthesize(value)[0]) for name,value in mel.items()}}
+        ref,rate=light_cleaned_reference(denoised.get(key,audio_root/paths[key]),cfg);write_wave(names["cleaned_reference"],ref,rate)
         for name,wave in generated.items():write_wave(names[name],wave,int(cfg["vocoder"]["sample_rate"]))
-        heatmap(figure,target_mfcc,predicted["eeg"].cpu().numpy()[0],target_mel,mel["eeg"].cpu().numpy(),key)
+        heatmap(figure,target_mfcc,predicted["eeg"].cpu().numpy()[0],target_mel,mel["eeg"].cpu().numpy()[0],key)
         record = {
             "sample_key": key,
             "label": batch["label"][0],
@@ -123,7 +125,7 @@ def main() -> None:
     with (destination/"manifest.csv").open("w",newline="",encoding="utf-8") as handle:
         writer=csv.DictWriter(handle,fieldnames=list(rows[0]) if rows else ["sample_key"]);writer.writeheader();writer.writerows(rows)
     elapsed=time.monotonic()-started
-    write_json(destination/"export_manifest.json",{"schema_version":"openvoice-v3-training-pairs-v2","eligible_training_pairs":len(dataset),"exported_pairs":len(rows),"complete":len(rows)==len(dataset) if not args.limit else False,"limit":int(args.limit),"elapsed_seconds":elapsed,"seconds_per_pair":elapsed/max(len(rows),1),"fit_gate":str(fit_gate_path),"validation_report":str(validation_path),"lineage":capture_lineage(config_path,cfg,artifact_keys=("fit_checkpoint","fit_gate","validation_report","locked_report","locked_unseen_report")),"records":rows})
+    write_json(destination/"export_manifest.json",{"schema_version":"openvoice-v3-training-pairs-v3-cvae","eligible_training_pairs":len(dataset),"exported_pairs":len(rows),"complete":len(rows)==len(dataset) if not args.limit else False,"limit":int(args.limit),"elapsed_seconds":elapsed,"seconds_per_pair":elapsed/max(len(rows),1),"fit_gate":str(fit_gate_path),"validation_report":str(validation_path),"lineage":capture_lineage(config_path,cfg,artifact_keys=("fit_checkpoint","fit_gate","training_review","validation_report","locked_report","locked_unseen_report")),"records":rows})
     print(destination/"manifest.csv",flush=True)
 
 

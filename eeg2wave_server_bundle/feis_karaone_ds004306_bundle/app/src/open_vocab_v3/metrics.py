@@ -8,6 +8,46 @@ import torch
 import torch.nn.functional as F
 
 
+def cvae_audio_loss(
+    posterior_mel: torch.Tensor,
+    prior_mel: torch.Tensor,
+    analytic_mel: torch.Tensor,
+    target_mel: torch.Tensor,
+    posterior_mean: torch.Tensor,
+    posterior_logvar: torch.Tensor,
+    prior_mean: torch.Tensor,
+    prior_logvar: torch.Tensor,
+    *,
+    kl_beta: float,
+    free_bits: float,
+    prior_weight: float,
+    analytic_consistency_weight: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Conditional VAE objective with an explicitly usable audio-free prior."""
+    posterior_reconstruction = F.smooth_l1_loss(posterior_mel, target_mel)
+    prior_reconstruction = F.smooth_l1_loss(prior_mel, target_mel)
+    variance_ratio = torch.exp(posterior_logvar - prior_logvar)
+    mean_term = (posterior_mean - prior_mean).square() * torch.exp(-prior_logvar)
+    kl_per_dimension = 0.5 * (
+        prior_logvar - posterior_logvar + variance_ratio + mean_term - 1.0
+    )
+    kl = kl_per_dimension.clamp_min(float(free_bits)).sum(-1).mean()
+    residual_penalty = torch.mean(torch.abs(posterior_mel - analytic_mel)) / 80.0
+    total = (
+        posterior_reconstruction
+        + float(prior_weight) * prior_reconstruction
+        + float(kl_beta) * kl
+        + float(analytic_consistency_weight) * residual_penalty
+    )
+    return total, {
+        "posterior_mel": float(posterior_reconstruction.detach()),
+        "prior_mel": float(prior_reconstruction.detach()),
+        "kl": float(kl.detach()),
+        "kl_beta": float(kl_beta),
+        "analytic_residual": float(residual_penalty.detach()),
+    }
+
+
 def mfcc_l1(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(prediction, target)
 

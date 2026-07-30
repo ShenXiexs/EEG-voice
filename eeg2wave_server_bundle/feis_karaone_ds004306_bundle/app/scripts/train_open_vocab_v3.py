@@ -12,7 +12,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 APP = Path(__file__).resolve().parents[1]
@@ -20,7 +19,7 @@ if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
 from src.open_vocab_v3.data import V3Dataset, collate, load_prepared
-from src.open_vocab_v3.metrics import fit_loss, overfit_loss
+from src.open_vocab_v3.metrics import cvae_audio_loss, fit_loss, overfit_loss
 from src.open_vocab_v3.model import EEGMFCCEncoder, MFCCMelDecoder
 from src.open_vocab_v3.runtime import capture_lineage, checkpoint_path, default_device, load_config, move_batch, output_path, read_json, require_passed_gate, seed_everything, sha256_file, write_json
 
@@ -53,9 +52,11 @@ def load_audio(config_path: Path, cfg: dict[str, Any], device: torch.device) -> 
     model = MFCCMelDecoder(
         mfcc_bins=int(cfg["audio"]["mfcc_bins"]), mel_bins=int(cfg["audio"]["mel_bins"]),
         dimension=int(cfg["model"]["audio_dimension"]), voice_dim=int(cfg["speaker"]["embedding_dimension"]),
+        latent_dim=int(cfg["model"]["audio_latent_dimension"]),
+        residual_limit_db=float(cfg["model"]["audio_residual_limit_db"]),
     ).to(device)
     raw = torch.load(checkpoint_path(config_path, cfg, "audio"), map_location=device, weights_only=False)
-    if raw.get("schema_version") != "openvoice-v3-audio-v1":
+    if raw.get("schema_version") != "openvoice-v3-audio-cvae-v2":
         raise ValueError(f"not a v3 audio checkpoint: {raw.get('schema_version')}")
     model.load_state_dict(raw["state_dict"], strict=True)
     return model.eval(), raw
@@ -105,6 +106,8 @@ def train_audio(config_path: Path, cfg: dict[str, Any], records: Any, device: to
     model = MFCCMelDecoder(
         mfcc_bins=int(cfg["audio"]["mfcc_bins"]), mel_bins=int(cfg["audio"]["mel_bins"]),
         dimension=int(cfg["model"]["audio_dimension"]), voice_dim=int(cfg["speaker"]["embedding_dimension"]),
+        latent_dim=int(cfg["model"]["audio_latent_dimension"]),
+        residual_limit_db=float(cfg["model"]["audio_residual_limit_db"]),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"]["audio_lr"]), weight_decay=float(cfg["training"]["weight_decay"]))
     best, stale, started = math.inf, 0, time.monotonic()
@@ -119,12 +122,31 @@ def train_audio(config_path: Path, cfg: dict[str, Any], records: Any, device: to
                 break
             batch = move_batch(batch, device)
             voice = batch["speaker_reference"].float()
-            # Voice dropout teaches the fixed fit-only canonical voice without
-            # routing subject identity through the MFCC content target.
-            if float(cfg["training"]["canonical_voice_dropout"]) > 0:
-                drop = torch.rand(len(voice), device=device) < float(cfg["training"]["canonical_voice_dropout"])
-                voice = voice.clone(); voice[drop] = batch["canonical_voice"].float()[drop]
-            loss = F.smooth_l1_loss(model(batch["mfcc"].float(), voice), batch["mel"].float())
+            mfcc = batch["mfcc"].float()
+            mean = batch["speaker_reference_mfcc_mean"].float()
+            std = batch["speaker_reference_mfcc_std"].float()
+            target_mel = batch["mel"].float()
+            values = model.distributions(mfcc, voice, mean, std, target_mel)
+            posterior_latent = model._sample(
+                values["posterior_mean"], values["posterior_logvar"], stochastic=True
+            )
+            posterior_mel = model.decode(
+                values["analytic_mel"], values["content_hidden"], values["voice_hidden"], posterior_latent
+            )
+            prior_mel = model.decode(
+                values["analytic_mel"], values["content_hidden"], values["voice_hidden"], values["prior_mean"]
+            )
+            warmup = max(1, int(cfg["training"]["cvae_kl_warmup_epochs"]))
+            kl_beta = float(cfg["training"]["cvae_kl_beta_max"]) * min(1.0, float(epoch + 1) / warmup)
+            loss, components = cvae_audio_loss(
+                posterior_mel, prior_mel, values["analytic_mel"], target_mel,
+                values["posterior_mean"], values["posterior_logvar"],
+                values["prior_mean"], values["prior_logvar"],
+                kl_beta=kl_beta,
+                free_bits=float(cfg["training"]["cvae_free_bits"]),
+                prior_weight=float(cfg["training"]["cvae_prior_reconstruction_weight"]),
+                analytic_consistency_weight=float(cfg["training"]["cvae_analytic_consistency_weight"]),
+            )
             optimizer.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["training"]["grad_clip"])); optimizer.step()
             train_values.append(float(loss.detach()))
             if deadline_reached(args) or (args.smoke_steps and step + 1 >= args.smoke_steps):
@@ -133,12 +155,24 @@ def train_audio(config_path: Path, cfg: dict[str, Any], records: Any, device: to
             raise RuntimeError("v3 audio stage reached the shared deadline before one optimizer step")
         # This stage is audio-only.  Do not use the held-out EEG validation role
         # to select an oracle checkpoint before the training-first gates.
-        score = float(np.mean(train_values)); record = {"epoch": epoch + 1, "train_loss": score, "selection_loss": score, "elapsed_seconds": time.monotonic() - started}
+        score = float(np.mean(train_values)); record = {
+            "epoch": epoch + 1, "train_loss": score, "selection_loss": score,
+            "last_components": components, "elapsed_seconds": time.monotonic() - started,
+        }
         _append(history, record)
         print(f"[v3 audio] epoch={epoch + 1}/{total} train={score:.5f} elapsed={record['elapsed_seconds']:.1f}s", flush=True)
         if score < best:
             best, stale = score, 0
-            save_checkpoint(checkpoint_path(config_path, cfg, "audio"), schema="openvoice-v3-audio-v1", model=model, epoch=epoch, score=score, extra={"fit_role": "fit", "voice_condition": "non_target_ecapa_reference_or_fit_medoid_canonical"})
+            save_checkpoint(
+                checkpoint_path(config_path, cfg, "audio"), schema="openvoice-v3-audio-cvae-v2",
+                model=model, epoch=epoch, score=score,
+                extra={
+                    "fit_role": "fit", "decoder": "conditional_variational_residual",
+                    "analytic_backend": "orthonormal_inverse_dct_librosa_equivalent",
+                    "voice_condition": "non_target_ecapa_reference",
+                    "eeg_uses": "conditional_prior_mean_or_sample_only",
+                },
+            )
         else:
             stale += 1
         if stale >= int(cfg["training"]["audio_patience"]):
@@ -243,7 +277,7 @@ def update_run_manifest(
     else:
         payload={}
     phases=dict(payload.get("training_phases",{}));phases[args.phase]=phase_result
-    write_json(path,{"schema_version":"openvoice-v3-run-v2","prepared_lineage":capture_lineage(config_path,cfg),"requested_wall_hours":float(args.wall_hours or cfg["training"]["wall_hours"]),"shared_deadline_epoch":float(args.deadline_epoch),"training_phases":phases,"total_training_elapsed_seconds":sum(float(value.get("elapsed_seconds",0.0)) for value in phases.values()),"last_device":str(device)})
+    write_json(path,{"schema_version":"openvoice-v3-run-v3-cvae-denoise-training-review","prepared_lineage":capture_lineage(config_path,cfg),"audio_decoder":"fixed inverse-DCT baseline + conditional variational residual","requested_wall_hours":float(args.wall_hours or cfg["training"]["wall_hours"]),"shared_deadline_epoch":float(args.deadline_epoch),"training_phases":phases,"total_training_elapsed_seconds":sum(float(value.get("elapsed_seconds",0.0)) for value in phases.values()),"last_device":str(device)})
 
 
 def main() -> None:

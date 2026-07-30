@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 
 from src.open_vocab_0724.audio_features import AudioPreparationConfig
 
-from .data import PreparedRecords, _read_waveform, light_prepare_waveform
+from .data import PreparedRecords, _accepted_denoise_paths, _read_waveform, light_prepare_waveform
 
 
 class ECAPAEncoder:
@@ -60,6 +60,7 @@ def attach_speaker_embeddings(
     audio_root = (config_path.parent / cfg["data"]["audio_root"]).resolve()
     manifest = (config_path.parent / cfg["data"]["unified_manifest"]).resolve()
     paths = _audio_paths(manifest)
+    denoised_paths = _accepted_denoise_paths(config_path, cfg)
     prep_cfg = AudioPreparationConfig(
         sample_rate=int(cfg["audio"]["sample_rate"]),
         max_active_seconds=float(cfg["audio"]["max_active_seconds"]),
@@ -69,7 +70,7 @@ def attach_speaker_embeddings(
     subjects = records.arrays["subjects"].astype(str)
     embeddings: list[np.ndarray] = []
     for key in tqdm(keys.tolist(), desc="[v3 prepare] ECAPA audio references", unit="trial", dynamic_ncols=True):
-        waveform, rate = _read_waveform(audio_root / paths[key])
+        waveform, rate = _read_waveform(denoised_paths.get(key, audio_root / paths[key]))
         prepared, _ = light_prepare_waveform(waveform, rate, prep_cfg)
         embeddings.append(encoder.encode(prepared.waveform[: max(1, prepared.valid_samples)]))
     values = np.stack(embeddings).astype(np.float32)
@@ -79,6 +80,8 @@ def attach_speaker_embeddings(
             f"configured ECAPA dimension is {expected_dimension}, but {source} returned {values.shape[1]}"
         )
     reference = np.zeros_like(values)
+    reference_mfcc_mean = np.zeros_like(records.arrays["mfcc_mean"], dtype=np.float32)
+    reference_mfcc_std = np.zeros_like(records.arrays["mfcc_std"], dtype=np.float32)
     reference_keys: list[str] = []
     fit = (records.roles == "fit") & records.arrays["fit_eligible"].astype(bool)
     eligible = records.arrays["fit_eligible"].astype(bool)
@@ -95,9 +98,12 @@ def attach_speaker_embeddings(
         selected = sorted(candidates, key=lambda item: keys[item])[: int(cfg["speaker"]["reference_trials"])]
         vector = values[selected].mean(0)
         reference[index] = vector / max(float(np.linalg.norm(vector)), 1.0e-8)
+        reference_mfcc_mean[index] = records.arrays["mfcc_mean"][selected].mean(0)
+        reference_mfcc_std[index] = records.arrays["mfcc_std"][selected].mean(0)
         reference_keys.append("|".join(keys[selected].tolist()))
     subject_centroids = []
-    for subject in sorted(set(subjects[fit].tolist())):
+    center_subjects = sorted(set(subjects[fit].tolist()))
+    for subject in center_subjects:
         # Canonical voice is fit-only by construction.  Do not derive it via
         # reference vectors, because those may intentionally include a
         # same-subject non-target trial for the separate V2 audio-only oracle.
@@ -105,15 +111,25 @@ def attach_speaker_embeddings(
         subject_centroids.append(vector / max(float(np.linalg.norm(vector)), 1.0e-8))
     centers = np.stack(subject_centroids)
     similarity = centers @ centers.T
-    medoid = centers[np.argmax(similarity.mean(1))]
+    medoid_index = int(np.argmax(similarity.mean(1)))
+    medoid = centers[medoid_index]
+    medoid_subject = center_subjects[medoid_index]
+    medoid_trials = (subjects == medoid_subject) & fit
     records.arrays["speaker_target_embedding"] = values
     records.arrays["speaker_reference_embedding"] = reference
+    records.arrays["speaker_reference_mfcc_mean"] = reference_mfcc_mean
+    records.arrays["speaker_reference_mfcc_std"] = reference_mfcc_std
     records.arrays["speaker_reference_keys"] = np.asarray(reference_keys)
     records.arrays["canonical_voice"] = medoid.astype(np.float32)
+    records.arrays["canonical_mfcc_mean"] = records.arrays["mfcc_mean"][medoid_trials].mean(0).astype(np.float32)
+    records.arrays["canonical_mfcc_std"] = records.arrays["mfcc_std"][medoid_trials].mean(0).astype(np.float32)
     return {
         "backend": "speechbrain_ecapa", "model_id": source, "model_cache": str(cache_dir),
         "embedding_dimension": int(values.shape[1]), "reference_trials": int(cfg["speaker"]["reference_trials"]),
-        "canonical_voice_policy": "fit_subject_centroid_medoid", "canonical_voice_subject_count": len(subject_centroids),
+        "canonical_voice_policy": "fit_subject_centroid_medoid",
+        "canonical_voice_subject": medoid_subject,
+        "canonical_voice_subject_count": len(subject_centroids),
+        "accepted_denoised_trials": len(denoised_paths),
     }
 
 

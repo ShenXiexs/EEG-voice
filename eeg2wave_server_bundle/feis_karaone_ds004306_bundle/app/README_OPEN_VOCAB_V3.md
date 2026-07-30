@@ -1,48 +1,95 @@
-# v3：内容优先 EEG → MFCC training-first
+# v3：内容优先 EEG → MFCC、CVAE 与 training-first
 
-v3 是独立于 v1/v2 的最小闭环，不训练 EEG 音色、F0、能量、时长、prosody、CVAE residual 或文本锚点。EEG 主链仅为：
+v3 独立于 v1/v2。EEG 不直接预测 waveform、speaker、F0、能量或 duration。主链为：
 
-`EEG → 40×256 content-normalized MFCC → deterministic MFCC-to-Mel audio oracle → frozen SpeechT5 HiFi-GAN → WAV`
+`EEG → 40×256 CMVN MFCC → fixed inverse-DCT Mel baseline → conditional VAE Mel residual → frozen SpeechT5 HiFi-GAN → WAV`
 
-MFCC 是 VAD active crop 后的 utterance-level CMVN 表征，且 c0 被置零；它是内容优先的低维声学目标，不是“纯内容”或完整音频。
+MFCC 是 VAD active crop、utterance CMVN、c0 置零后的内容优先低维声学表示，并非纯文本内容。固定 inverse-DCT 后端与 `librosa.feature.inverse.mfcc_to_mel` 做数值一致性 gate；CVAE 只学习它无法解释的 bounded Mel residual。
 
-## 一次性运行
+CVAE posterior 只能用于 audio-only training 和 posterior oracle。EEG、validation 和 locked test 只能使用不读取目标 Mel 的 conditional prior mean/sample。
 
-在 `app` 目录执行：
+## 首次依赖
 
 ```bash
-./bootstrap_open_vocab_v3.sh       # 首次一次：安装 SpeechBrain 的 ECAPA 依赖
+cd /Users/samxie/Research/EEG-Voice/ref_github/speech_decoding/eeg2wave_server_bundle/feis_karaone_ds004306_bundle/app
+./bootstrap_open_vocab_v3.sh
+```
+
+该环境增加 SpeechBrain ECAPA、librosa 和官方 `deepfilternet` Python backend。DeepFilterNet 按官方接口在 48 kHz 运行并启用 delay compensation。
+
+## 两阶段运行：held-out 前必须试听 training WAV
+
+第一阶段：审计、可选去噪、audio oracles、50-pair overfit、full fit 和 training preview。
+
+```bash
 ./run_open_vocab_v3_all.sh
 ```
 
-默认总训练时间上限为 9.5 小时（audio decoder、50-pair EEG、full fit 共用一个绝对 deadline）；批量 WAV 导出不计入该预算。可选环境变量：`BUDGET_HOURS=9.5`、`TRAIN_DEVICE=auto`、`EVAL_DEVICE=cpu`、`EXPORT_DEVICE=cpu`。CPU 是 evaluation/export 默认值，以规避此前 PyTorch MPS 多次 counterfactual forward 的已知崩溃。
+脚本会在以下目录生成两组 training WAV：
 
-所有 v3 写入均在：
+- `../artifacts/open_vocab_v3_mfcc_training_first/pairs/micro_50_preview/`
+- `../artifacts/open_vocab_v3_mfcc_training_first/pairs/full_fit_preview/`
 
-`../artifacts/open_vocab_v3_mfcc_training_first/`
+随后脚本以退出码 3 正常暂停，不会读取 validation/locked role。每个 preview trial 包含 cleaned reference、V0、fixed analytic MFCC oracle、CVAE posterior oracle、CVAE prior oracle、EEG prior mean、多个 prior samples 和 zero/time/channel controls。
 
-v0724/v0730 仅作为只读源缓存，入口内置输出路径防火墙。
+试听 full-fit preview 后批准绑定到当前 preview/checkpoint/cache hash 的人工 gate：
+
+```bash
+./approve_open_vocab_v3_training_preview.sh samxie "内容可辨、未见统一模板塌缩"
+./run_open_vocab_v3_after_review.sh
+```
+
+如果不满意，不运行批准命令；修改模型或数据后旧批准会因 lineage 不一致自动失效。
+
+训练总预算默认 9.5 小时，audio CVAE、micro EEG 和 full-fit EEG 共用一个绝对 deadline。去噪、特征准备、评估和 WAV 导出不计入训练预算。evaluation/export 默认 CPU，避免此前 MPS counterfactual forward 的 buffer assertion。
+
+## 选择性去噪
+
+原 WAV 始终只读。第一阶段先生成：
+
+`../artifacts/open_vocab_v3_mfcc_training_first/denoise/selection.csv`
+
+默认只列出低 active/inactive contrast 或命名异常 trial，且 `apply=0`。确认属于加性噪声后，把对应行改成 `apply=1` 再重新运行第一阶段。只有同时通过以下 preservation checks 的 DeepFilterNet 输出才进入 prepared cache：
+
+- envelope lag；
+- VAD start/end shift；
+- duration change；
+- pre/post DTW-HuBERT cosine；
+- pre/post ECAPA cosine。
+
+未通过的 enhanced WAV 留作审计，但 `accepted=false`，训练继续使用原音频。`MM18:94`、`MM14:36`、`MM16:56` 在未获得 accepted enhancement 前仍排除出 fit。低对比度样本不会自动去噪。
 
 ## Fail-closed 顺序
 
-1. light audio audit（DC removal、VAD crop、RMS normalization、长度与 active/inactive contrast 审核；不自动 DeepFilterNet）
-2. V0：immutable v0728 power-dB Mel `/10` → frozen SpeechT5 vocoder
-3. audio-only MFCC→Mel training，随后 V1 内容 oracle、V2 音色 oracle
-4. MM05 × 10 labels × 5 trials 的 direct EEG→MFCC 50-pair gate
-5. all eligible fit records 的 full-fit gate
-6. 仅当第 5 步通过，运行 subject-holdout、locked seen-label、`pot` locked-unseen exploratory report 和 training-pair WAV export
+1. raw audio audit → explicit selective DeepFilterNet → post-denoise feature audit；
+2. V0：v0728 power-dB Mel → frozen SpeechT5 HiFi-GAN；
+3. audio CVAE training；
+4. V1：fixed analytic、posterior oracle、prior-mean content oracle；
+5. V2：target/canonical speaker swap 与 content-preservation gate；
+6. MM05 × 10 labels × 5 trials 的 direct EEG→MFCC overfit gate及 WAV preview；
+7. all eligible fit records full-fit gate及 50 个 WAV preview；
+8. exact-preview human approval；
+9. subject-holdout validation、locked seen-label、`pot` exploratory；
+10. 全部 eligible training-pair export。
 
-任一 V0/V1/V2/50-pair/full-fit gate 未通过，shell 会以非零状态停止，后续阶段不会运行。超过 2.56 秒 active duration 的 trial 会出现在 `audit/audio_audit.*`，但不会进入 fit；`MM18:94`、`MM14:36`、`MM16:56` 在人工确认前直接排除出 fit。低对比度样本进入审计队列但不自动排除或去噪。
+V0/V1/V2/micro/full-fit 或人工 listening gate 任一未通过，后续阶段停止。prepared manifest 绑定 raw/post audio audit、denoise selection/manifest、speaker manifest 和 cache；每个模型 gate 继续绑定配置、上游 gate 和 checkpoint hash。
 
-Micro 与 full-fit 使用两个独立 checkpoint。prepared manifest 同时绑定 cache、音频审计和 speaker manifest；每个 gate 再绑定配置、上游 gate 和对应 checkpoint hash。旧 gate 或不完整审计不能授权新的 cache/checkpoint 继续运行。
+## 内容与音色证据
+
+- V1 primary 使用 conditional prior mean，不允许目标 Mel；posterior 只作为 audio upper bound。
+- V1 同时报告 fixed librosa-equivalent analytic backend、prior、posterior，以及 prior–posterior Mel gap。
+- V2 的 target voice 来自同 subject 的 non-target fit trials。
+- V2 先估计 KaraOne real-audio same/different-speaker 分布，再要求至少 80% target-voice generations 超过 different-speaker/same-label P90、speaker swap bootstrap CI 大于零，并保持 content retrieval。
+- primary EEG WAV 永远使用 fit-only canonical speaker medoid，不使用 validation/test subject reference audio。
 
 ## 主要输出
 
-- `gates/V0_vocoder_oracle.json`：完整 Mel 参数和数值范围、vocoder manifest/hash、WAV hash、label retrieval、DTW-HuBERT。
-- `gates/C_50_pair_overfit.json`：label retrieval、strict same-label trial R@1、zero/time/channel controls。
-- `gates/D_full_fit.json`：full-fit gate；strict one-to-one R@1 的 bootstrap CI 必须高于 chance。
-- `evaluation/*.json`：held-out MFCC 指标、locked-unseen `pot` exploratory，以及以 fit-only canonical voice 合成的 pooled-HuBERT retrieval、paired DTW-HuBERT 与 correct-minus-control bootstrap CI。
-- `pairs/training_fit_eligible/`：每个合格 fit trial 的 cleaned reference、V0/V1、correct EEG/zero/time/channel WAV、MFCC/Mel comparison PNG、trial retrieval rank 和 manifest；manifest 独立记录导出耗时。
-- `run_manifest.json`：audio/micro/full-fit 三阶段耗时、checkpoint hash 与累计训练耗时。
+- `audit/raw_audio_audit.*`、`denoise/selection.csv`、`denoise/manifest.json`；
+- `gates/V0_*`、`V1_*`、`V2_*`、`C_50_pair_*`、`D_full_fit_*`；
+- `gates/E_training_wav_human_review.json`；
+- `pairs/micro_50_preview/`、`pairs/full_fit_preview/`；
+- `evaluation/*.json`；
+- `pairs/training_fit_eligible/`；
+- `run_manifest.json`。
 
-`target reference voice` 只在 V2 audio-only oracle 中使用，且总是同 subject 的 non-target trial reference；primary EEG validation/test WAV 始终使用 fit-only canonical voice medoid。
+所有 v3 写入均位于 `../artifacts/open_vocab_v3_mfcc_training_first/`。v0724/v0730 只作为只读来源，不会被覆盖。

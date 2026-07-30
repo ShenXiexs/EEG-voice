@@ -19,10 +19,11 @@ if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
 from scripts.train_open_vocab_v3 import load_audio, load_eeg, micro_dataset
-from src.open_vocab_v3.data import V3Dataset, canonical_mfcc_from_waveform, channel_shuffled_eeg, collate, light_prepare_waveform, load_prepared, time_shuffled_eeg
+from src.open_vocab_v3.data import V3Dataset, _accepted_denoise_paths, canonical_mfcc_from_waveform, channel_shuffled_eeg, collate, light_prepare_waveform, load_prepared, time_shuffled_eeg
 from src.open_vocab_v3.hubert import HubertMetric, dtw_cosine
 from src.open_vocab_v3.metrics import bootstrap_mean_gain, mfcc_distance, paired_r_at_1_above_chance, paired_win_rate, retrieval, same_label_template, variance_ratio
-from src.open_vocab_v3.runtime import capture_lineage, default_device, load_config, move_batch, output_path, require_passed_gate, resolve_config_path, sha256_file, write_json
+from src.open_vocab_v3.model import librosa_mfcc_to_mel_reference
+from src.open_vocab_v3.runtime import capture_lineage, default_device, load_config, move_batch, output_path, read_json, require_passed_gate, resolve_config_path, sha256_file, write_json
 from src.open_vocab_v3.speaker import ECAPAEncoder, speaker_distribution
 from src.open_vocab_v3.vocoder import SpeechT5PowerDbHiFiGan, pcm16
 from src.open_vocab_0724.audio_features import AudioPreparationConfig
@@ -190,19 +191,30 @@ def gate_v1(config_path: Path, cfg: dict[str, Any], records: Any, device: torch.
     dataset = selected_dataset(records, ("fit",), eligible=True, max_per_label=limit or int(cfg["evaluation"]["oracle_per_label"]))
     decoder, _ = load_audio(config_path, cfg, device); backend = _vocoder(config_path, cfg, device)
     teacher = HubertMetric(output_path(config_path, cfg, "hubert_root"), layer=int(cfg["teachers"]["hubert_layer"]), device=device)
-    paths = audio_paths(output_path(config_path, cfg, "unified_manifest")); root = output_path(config_path, cfg, "audio_root")
-    generated=[]; references=[]; rates=[]; labels=[]; input_mfcc=[]; output_mfcc=[]
+    paths = audio_paths(output_path(config_path, cfg, "unified_manifest")); root = output_path(config_path, cfg, "audio_root"); denoised = _accepted_denoise_paths(config_path, cfg)
+    generated_prior=[]; generated_posterior=[]; generated_analytic=[]
+    references=[]; rates=[]; labels=[]; input_mfcc=[]; output_mfcc=[]; mel_gaps=[];analytic_values=[];analytic_means=[];analytic_stds=[]
     for batch in tqdm(batches(dataset, batch_size=1, device=device), total=len(dataset), desc="[v3 V1] content oracle", unit="pair", dynamic_ncols=True):
         voice = batch["canonical_voice"].float()
-        mel = decoder(batch["mfcc"].float(), voice)
-        wave = pcm16(backend.synthesize(mel)[0])
-        key=batch["sample_key"][0]; reference,rate=cleaned_reference(root/paths[key],cfg)
-        generated.append(wave);references.append(reference);rates.append(rate);labels.append(batch["label"][0]);input_mfcc.append(batch["mfcc"][0].cpu().numpy());output_mfcc.append(canonical_mfcc_from_waveform(wave,int(cfg["vocoder"]["sample_rate"]),cfg))
+        mean=batch["canonical_mfcc_mean"].float();std=batch["canonical_mfcc_std"].float()
+        prior=decoder.generate(batch["mfcc"].float(),voice,mean,std,stochastic=False)
+        posterior=decoder.reconstruct(batch["mfcc"].float(),voice,mean,std,batch["mel"].float(),stochastic=False)
+        analytic=prior["analytic_mel"]
+        prior_wave=pcm16(backend.synthesize(prior["mel"])[0])
+        posterior_wave=pcm16(backend.synthesize(posterior["mel"])[0])
+        analytic_wave=pcm16(backend.synthesize(analytic)[0])
+        key=batch["sample_key"][0]; reference,rate=cleaned_reference(denoised.get(key,root/paths[key]),cfg)
+        generated_prior.append(prior_wave);generated_posterior.append(posterior_wave);generated_analytic.append(analytic_wave)
+        references.append(reference);rates.append(rate);labels.append(batch["label"][0]);input_mfcc.append(batch["mfcc"][0].cpu().numpy());output_mfcc.append(canonical_mfcc_from_waveform(prior_wave,int(cfg["vocoder"]["sample_rate"]),cfg));mel_gaps.append(float(torch.mean(torch.abs(prior["mel"]-posterior["mel"])).cpu()));analytic_values.append(analytic[0].cpu().numpy());analytic_means.append(mean[0].cpu().numpy());analytic_stds.append(std[0].cpu().numpy())
     input_array=np.stack(input_mfcc); output_array=np.stack(output_mfcc); template=same_label_template(input_array,labels)
     feature_ratio=float(mfcc_distance(output_array,input_array).mean()/max(float(mfcc_distance(template,input_array).mean()),1e-8))
-    content=hubert_retrieval(generated,references,rates,labels,teacher); threshold=cfg["gates"]["v1"]
-    checks={"mfcc_relative_to_template":feature_ratio<=float(threshold["mfcc_template_ratio_max"]),"label_retrieval":content["label_top1"]>=float(threshold["label_top1_min"]),"dtw_gap":content["dtw_hubert_correct_minus_wrong_median"]>=float(threshold["dtw_gap_min"])}
-    return {"gate":"V1","n":len(labels),"metrics":{**content,"generated_to_input_mfcc_template_ratio":feature_ratio},"thresholds":threshold,"checks":checks,"passed":bool(all(checks.values()))}
+    content=hubert_retrieval(generated_prior,references,rates,labels,teacher)
+    posterior_content=hubert_retrieval(generated_posterior,references,rates,labels,teacher)
+    analytic_content=hubert_retrieval(generated_analytic,references,rates,labels,teacher)
+    librosa_reference=librosa_mfcc_to_mel_reference(np.stack(input_mfcc),np.stack(analytic_means),np.stack(analytic_stds),mel_bins=int(cfg["audio"]["mel_bins"]));analytic_error=float(np.max(np.abs(np.stack(analytic_values)-librosa_reference)))
+    prior_posterior_gap=float(np.mean(mel_gaps));threshold=cfg["gates"]["v1"]
+    checks={"mfcc_relative_to_template":feature_ratio<=float(threshold["mfcc_template_ratio_max"]),"label_retrieval":content["label_top1"]>=float(threshold["label_top1_min"]),"dtw_gap":content["dtw_hubert_correct_minus_wrong_median"]>=float(threshold["dtw_gap_min"]),"prior_posterior_gap":prior_posterior_gap<=float(threshold["prior_posterior_mel_gap_max"]),"librosa_backend_conformance":analytic_error<=float(threshold["analytic_backend_max_abs_error"])}
+    return {"gate":"V1","n":len(labels),"metrics":{"prior_mean":content,"posterior_oracle":posterior_content,"fixed_analytic_backend":analytic_content,"analytic_backend":"librosa.feature.inverse.mfcc_to_mel with differentiable torch equivalent","analytic_backend_max_abs_error":analytic_error,"generated_to_input_mfcc_template_ratio":feature_ratio,"prior_posterior_mel_l1":prior_posterior_gap},"thresholds":threshold,"checks":checks,"passed":bool(all(checks.values()))}
 
 
 @torch.no_grad()
@@ -213,11 +225,11 @@ def gate_v2(config_path: Path, cfg: dict[str, Any], records: Any, device: torch.
     decoder,_=load_audio(config_path,cfg,device);backend=_vocoder(config_path,cfg,device)
     encoder=ECAPAEncoder(source=str(cfg["speaker"]["model_id"]),savedir=output_path(config_path,cfg,"speaker_model_root"),device=device)
     teacher=HubertMetric(output_path(config_path,cfg,"hubert_root"),layer=int(cfg["teachers"]["hubert_layer"]),device=device)
-    generated_target=[];generated_canonical=[];references=[];rates=[];labels=[];target_embeddings=[]
+    generated_target=[];generated_canonical=[];references=[];rates=[];labels=[];target_embeddings=[];denoised=_accepted_denoise_paths(config_path,cfg)
     for batch in tqdm(batches(dataset,batch_size=1,device=device),total=len(dataset),desc="[v3 V2] timbre oracle",unit="pair",dynamic_ncols=True):
-        mel_target=decoder(batch["mfcc"].float(),batch["speaker_reference"].float()); mel_canonical=decoder(batch["mfcc"].float(),batch["canonical_voice"].float())
+        mel_target=decoder(batch["mfcc"].float(),batch["speaker_reference"].float(),batch["speaker_reference_mfcc_mean"].float(),batch["speaker_reference_mfcc_std"].float()); mel_canonical=decoder(batch["mfcc"].float(),batch["canonical_voice"].float(),batch["canonical_mfcc_mean"].float(),batch["canonical_mfcc_std"].float())
         generated_target.append(pcm16(backend.synthesize(mel_target)[0]));generated_canonical.append(pcm16(backend.synthesize(mel_canonical)[0]))
-        key=batch["sample_key"][0];reference,rate=cleaned_reference(output_path(config_path,cfg,"audio_root") / audio_paths(output_path(config_path,cfg,"unified_manifest"))[key],cfg)
+        key=batch["sample_key"][0];raw_path=output_path(config_path,cfg,"audio_root") / audio_paths(output_path(config_path,cfg,"unified_manifest"))[key];reference,rate=cleaned_reference(denoised.get(key,raw_path),cfg)
         references.append(reference);rates.append(rate);labels.append(batch["label"][0]);target_embeddings.append(batch["speaker_reference"][0].cpu().numpy())
     target_embeddings=np.stack(target_embeddings); predicted=np.stack([encoder.encode(wave) for wave in generated_target]); canonical=np.stack([encoder.encode(wave) for wave in generated_canonical])
     score=np.sum(predicted*target_embeddings,axis=1); swapped=np.sum(canonical*target_embeddings,axis=1)
@@ -228,8 +240,8 @@ def gate_v2(config_path: Path, cfg: dict[str, Any], records: Any, device: torch.
     content_canonical=hubert_retrieval(generated_canonical,references,rates,labels,teacher)
     content_delta=abs(float(content_target["label_top1"])-float(content_canonical["label_top1"]))
     speaker_swap_bootstrap=bootstrap_scalar_gain(score,swapped,samples=int(cfg["evaluation"]["bootstrap_samples"]),seed=int(cfg["training"]["seed"])+60)
-    threshold=cfg["gates"]["v2"];checks={"target_over_different_speaker_p90":float(score.mean())>p90,"speaker_swap_effect":float((score-swapped).mean())>=float(threshold["speaker_swap_margin_min"]),"speaker_swap_ci":speaker_swap_bootstrap["ci_low"]>0.0,"content_preserved":content_delta<=float(threshold["content_change_max"])}
-    return {"gate":"V2","n":len(labels),"metrics":{"target_speaker_similarity_mean":float(score.mean()),"canonical_speaker_similarity_mean":float(swapped.mean()),"speaker_swap_margin":float((score-swapped).mean()),"speaker_swap_bootstrap":speaker_swap_bootstrap,"different_speaker_same_label_p90":p90,"content_retrieval_target_voice":content_target,"content_retrieval_canonical_voice":content_canonical,"content_retrieval_absolute_change":content_delta,"real_audio_distribution":distribution},"thresholds":threshold,"checks":checks,"passed":bool(all(checks.values()))}
+    over_p90=float(np.mean(score>p90));threshold=cfg["gates"]["v2"];checks={"target_over_different_speaker_p90":over_p90>=float(threshold["target_over_p90_fraction_min"]),"speaker_swap_effect":float((score-swapped).mean())>=float(threshold["speaker_swap_margin_min"]),"speaker_swap_ci":speaker_swap_bootstrap["ci_low"]>0.0,"content_preserved":content_delta<=float(threshold["content_change_max"])}
+    return {"gate":"V2","n":len(labels),"metrics":{"target_speaker_similarity_mean":float(score.mean()),"target_over_different_speaker_same_label_p90_fraction":over_p90,"canonical_speaker_similarity_mean":float(swapped.mean()),"speaker_swap_margin":float((score-swapped).mean()),"speaker_swap_bootstrap":speaker_swap_bootstrap,"different_speaker_same_label_p90":p90,"content_retrieval_target_voice":content_target,"content_retrieval_canonical_voice":content_canonical,"content_retrieval_absolute_change":content_delta,"real_audio_distribution":distribution},"thresholds":threshold,"checks":checks,"passed":bool(all(checks.values()))}
 
 
 @torch.no_grad()
@@ -247,6 +259,8 @@ def heldout_wav_metrics(
     backend = _vocoder(config_path, cfg, device)
     teacher = HubertMetric(output_path(config_path, cfg, "hubert_root"), layer=int(cfg["teachers"]["hubert_layer"]), device=device)
     voice = np.asarray(records.arrays["canonical_voice"], dtype=np.float32)
+    cepstral_mean = np.asarray(records.arrays["canonical_mfcc_mean"], dtype=np.float32)
+    cepstral_std = np.asarray(records.arrays["canonical_mfcc_std"], dtype=np.float32)
     if voice.ndim != 1:
         raise ValueError("v3 canonical voice must be a single fit-only ECAPA medoid")
     generated: dict[str, list[np.ndarray]] = {name: [] for name in predictions}
@@ -256,7 +270,9 @@ def heldout_wav_metrics(
             block = np.asarray(value[start : start + batch_size], dtype=np.float32)
             mfcc = torch.from_numpy(block).to(device)
             voices = torch.from_numpy(np.repeat(voice[None], len(block), axis=0)).to(device)
-            rendered = pcm16(backend.synthesize(decoder(mfcc, voices)))
+            means = torch.from_numpy(np.repeat(cepstral_mean[None], len(block), axis=0)).to(device)
+            stds = torch.from_numpy(np.repeat(cepstral_std[None], len(block), axis=0)).to(device)
+            rendered = pcm16(backend.synthesize(decoder(mfcc, voices, means, stds)))
             if rendered.ndim == 1:
                 rendered = rendered[None]
             if len(rendered) != len(block):
@@ -264,7 +280,8 @@ def heldout_wav_metrics(
             generated[name].extend([np.asarray(wave, dtype=np.float32) for wave in rendered])
     paths = audio_paths(output_path(config_path, cfg, "unified_manifest"))
     audio_root = output_path(config_path, cfg, "audio_root")
-    references, rates = zip(*[cleaned_reference(audio_root / paths[key], cfg) for key in keys])
+    denoised = _accepted_denoise_paths(config_path, cfg)
+    references, rates = zip(*[cleaned_reference(denoised.get(key, audio_root / paths[key]), cfg) for key in keys])
     metrics = {
         name: hubert_pair_metrics(waves, list(references), list(rates), labels, teacher)
         for name, waves in generated.items()
@@ -361,7 +378,14 @@ def main() -> None:
                 lineage_keys=("fit_checkpoint","micro_gate")
             else:
                 require_passed_gate(config_path,cfg,"fit_gate",lineage_artifact_keys=("fit_checkpoint","micro_gate"))
-                lineage_keys=("fit_checkpoint","fit_gate")
+                review_path=output_path(config_path,cfg,"training_review")
+                if not review_path.is_file():
+                    raise RuntimeError("v3 fail-closed: listen to and approve the full-fit training WAV preview before held-out evaluation")
+                review=read_json(review_path)
+                expected_review=capture_lineage(config_path,cfg,artifact_keys=("fit_checkpoint","fit_gate","fit_preview_manifest"))
+                if not review.get("passed",False) or review.get("lineage")!=expected_review:
+                    raise RuntimeError("v3 fail-closed: training WAV human review is rejected or stale")
+                lineage_keys=("fit_checkpoint","fit_gate","training_review")
             report=eeg_stage(config_path,cfg,records,device,phase)
             report["lineage"]=capture_lineage(config_path,cfg,artifact_keys=lineage_keys)
             if phase=="locked_unseen":

@@ -14,5 +14,5 @@ fi
 cd "$APP_DIR"
 echo "[v3 bootstrap] python=$PY"
 "$PY" -m pip install -r requirements_v3.txt
-"$PY" -c 'import speechbrain, torch, transformers; print({"speechbrain": speechbrain.__version__, "torch": torch.__version__, "transformers": transformers.__version__})'
+"$PY" -c 'import importlib.metadata, librosa, speechbrain, torch, transformers; import df; print({"speechbrain": speechbrain.__version__, "deepfilternet": importlib.metadata.version("deepfilternet"), "librosa": librosa.__version__, "torch": torch.__version__, "transformers": transformers.__version__})'
 echo "[v3 bootstrap] complete"

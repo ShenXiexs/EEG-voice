@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -22,7 +23,7 @@ from src.open_vocab_0724.audio_features import (
 
 
 SOURCE_SPLITS = ("train", "validation", "locked_test", "diagnostic")
-PREPARATION_SCHEMA = "openvoice-v3-mfcc-preparation-v3-dc-cmvn-256-audit"
+PREPARATION_SCHEMA = "openvoice-v3-mfcc-preparation-v4-cvae-denoise-cmvn-256"
 PAIR_ROLES = (
     "fit",
     "subject_holdout_seen",
@@ -135,7 +136,9 @@ def _interpolate(value: np.ndarray, frames: int) -> np.ndarray:
     return F.interpolate(source, size=frames, mode="linear", align_corners=False).squeeze(0).numpy()
 
 
-def _mfcc_from_mel(mel_db: np.ndarray, active: np.ndarray, valid: np.ndarray, bins: int) -> tuple[np.ndarray, np.ndarray]:
+def _mfcc_from_mel(
+    mel_db: np.ndarray, active: np.ndarray, valid: np.ndarray, bins: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return raw CMVN MFCC and a content-only canonical representation.
 
     The c0 coefficient is zeroed after utterance CMVN.  This deliberately
@@ -146,14 +149,37 @@ def _mfcc_from_mel(mel_db: np.ndarray, active: np.ndarray, valid: np.ndarray, bi
     if int(support.sum()) < 2:
         support = np.asarray(valid, dtype=bool)
     if int(support.sum()) < 2:
-        return np.zeros_like(raw, dtype=np.float32), np.zeros((bins, raw.shape[1]), dtype=np.float32)
+        zeros = np.zeros_like(raw, dtype=np.float32)
+        return zeros, zeros, zeros, np.zeros(bins, dtype=np.float32), np.ones(bins, dtype=np.float32)
     mean = raw[:, support].mean(axis=1, keepdims=True)
     scale = np.maximum(raw[:, support].std(axis=1, keepdims=True), 1.0e-4)
     normalized = ((raw - mean) / scale).astype(np.float32)
     normalized[0] = 0.0
     indices = np.flatnonzero(support)
     canonical = _interpolate(normalized[:, indices[0] : indices[-1] + 1], raw.shape[1])
-    return normalized, canonical.astype(np.float32)
+    return (
+        raw.astype(np.float32), normalized, canonical.astype(np.float32),
+        mean[:, 0].astype(np.float32), scale[:, 0].astype(np.float32),
+    )
+
+
+def _accepted_denoise_paths(config_path: Path, cfg: dict[str, Any]) -> dict[str, Path]:
+    value = cfg.get("paths", {}).get("denoise_manifest")
+    if not value:
+        return {}
+    manifest_path = (config_path.parent / value).resolve()
+    if not manifest_path.is_file():
+        return {}
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    accepted: dict[str, Path] = {}
+    for item in payload.get("records", []):
+        if not bool(item.get("accepted", False)):
+            continue
+        path = Path(str(item.get("enhanced_wav", ""))).resolve()
+        if not path.is_file():
+            raise RuntimeError(f"accepted denoised audio is missing: {path}")
+        accepted[str(item["sample_key"])] = path
+    return accepted
 
 
 def _canonical_mel(mel: np.ndarray, active: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -191,6 +217,7 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         subject_holdout=cfg["split"]["subject_holdout"], unseen_label=cfg["split"]["unseen_label"],
     )
     paths = _manifest_audio_paths(manifest)
+    denoised_paths = _accepted_denoise_paths(config_path, cfg)
     frames = int(cfg["audio"]["canonical_frames"])
     sample_rate = int(cfg["audio"]["sample_rate"])
     prep_cfg = AudioPreparationConfig(
@@ -206,7 +233,8 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         min_db=float(cfg["audio"]["mel_db_min"]),
         max_db=float(cfg["audio"]["mel_db_max"]),
     )
-    raw_mfcc, canonical_mfcc, raw_mel, canonical_mel = [], [], [], []
+    raw_mfcc, normalized_mfcc, canonical_mfcc, mfcc_mean, mfcc_std = [], [], [], [], []
+    raw_mel, canonical_mel = [], []
     frame_mask, activity_mask, valid_samples, active_seconds, fit_eligible = [], [], [], [], []
     audit: list[dict[str, Any]] = []
     manual_review = set(map(str, cfg["audio"].get("manual_review_sample_keys", ())))
@@ -214,17 +242,22 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         relative = paths.get(str(key))
         if relative is None:
             raise KeyError(f"KaraOne sample {key} absent from unified manifest")
-        waveform, native_rate = _read_waveform(audio_root / relative)
+        original_path = audio_root / relative
+        selected_path = denoised_paths.get(str(key), original_path)
+        waveform, native_rate = _read_waveform(selected_path)
         prepared, dc_offset = light_prepare_waveform(waveform, native_rate, prep_cfg)
         acoustic = extract_acoustic_features(
             prepared.waveform, valid_samples=prepared.valid_samples, config=feature_cfg
         )
-        mfcc, mfcc_canonical = _mfcc_from_mel(
+        mfcc_unscaled, mfcc_normalized, mfcc_canonical, utterance_mean, utterance_std = _mfcc_from_mel(
             acoustic.log_mel_energy, acoustic.activity_mask, acoustic.frame_valid_mask,
             int(cfg["audio"]["mfcc_bins"]),
         )
-        raw_mfcc.append(mfcc)
+        raw_mfcc.append(mfcc_unscaled)
+        normalized_mfcc.append(mfcc_normalized)
         canonical_mfcc.append(mfcc_canonical)
+        mfcc_mean.append(utterance_mean)
+        mfcc_std.append(utterance_std)
         raw_mel.append(acoustic.log_mel_energy)
         canonical_mel.append(_canonical_mel(acoustic.log_mel_energy, acoustic.activity_mask, acoustic.frame_valid_mask))
         frame_mask.append(acoustic.frame_valid_mask)
@@ -243,7 +276,7 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
             np.isfinite(contrast_db)
             and contrast_db < float(cfg["audio"]["low_contrast_db_threshold"])
         )
-        pending_manual_review = str(key) in manual_review
+        pending_manual_review = str(key) in manual_review and str(key) not in denoised_paths
         eligible = bool(
             prepared.reconstruction_eligible
             and prepared.active_duration_seconds <= float(cfg["audio"]["max_active_seconds"])
@@ -256,6 +289,8 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         audit.append(
             {
                 "sample_key": str(key), "audio_relpath": relative, "role": str(roles[index]),
+                "feature_audio_path": str(selected_path),
+                "used_accepted_denoising": str(key) in denoised_paths,
                 "label": str(arrays["labels"][index]), "subject": str(arrays["subjects"][index]),
                 "native_sample_rate": native_rate, "valid_samples": int(prepared.valid_samples),
                 "dc_removed": True, "dc_offset": dc_offset,
@@ -283,7 +318,10 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         {
             "v3_preparation_schema": np.asarray(PREPARATION_SCHEMA),
             "mfcc_raw": np.stack(raw_mfcc).astype(np.float32),
+            "mfcc_cmvn": np.stack(normalized_mfcc).astype(np.float32),
             "mfcc": np.stack(canonical_mfcc).astype(np.float32),
+            "mfcc_mean": np.stack(mfcc_mean).astype(np.float32),
+            "mfcc_std": np.stack(mfcc_std).astype(np.float32),
             "mel_raw": np.stack(raw_mel).astype(np.float32),
             "mel": np.stack(canonical_mel).astype(np.float32),
             "mfcc_mask": np.stack(frame_mask).astype(bool),
@@ -305,7 +343,8 @@ def load_prepared(path: Path) -> PreparedRecords:
     raw = np.load(path, allow_pickle=False)
     required = {
         "eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask", "mel",
-        "mfcc", "mfcc_raw", "mfcc_mask", "activity_v3", "fit_eligible", "sample_keys",
+        "mfcc", "mfcc_raw", "mfcc_cmvn", "mfcc_mean", "mfcc_std", "mfcc_mask",
+        "activity_v3", "fit_eligible", "sample_keys",
         "audio_keys", "labels", "subjects", "roles", "v3_preparation_schema",
     }
     missing = required - set(raw.files)
@@ -349,11 +388,23 @@ class V3Dataset(Dataset[dict[str, Any]]):
             "speaker_reference": value["speaker_reference_embedding"][index] if "speaker_reference_embedding" in value else np.zeros(192, dtype=np.float32),
             "speaker_target": value["speaker_target_embedding"][index] if "speaker_target_embedding" in value else np.zeros(192, dtype=np.float32),
             "canonical_voice": value["canonical_voice"] if "canonical_voice" in value else np.zeros(192, dtype=np.float32),
+            "target_mfcc_mean": value["mfcc_mean"][index],
+            "target_mfcc_std": value["mfcc_std"][index],
+            "speaker_reference_mfcc_mean": value["speaker_reference_mfcc_mean"][index] if "speaker_reference_mfcc_mean" in value else value["mfcc_mean"][index],
+            "speaker_reference_mfcc_std": value["speaker_reference_mfcc_std"][index] if "speaker_reference_mfcc_std" in value else value["mfcc_std"][index],
+            "canonical_mfcc_mean": value["canonical_mfcc_mean"] if "canonical_mfcc_mean" in value else value["mfcc_mean"].mean(0),
+            "canonical_mfcc_std": value["canonical_mfcc_std"] if "canonical_mfcc_std" in value else value["mfcc_std"].mean(0),
         }
 
 
 def collate(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    tensors = ("eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask", "mfcc", "mel", "mfcc_mask", "activity", "speaker_reference", "speaker_target", "canonical_voice")
+    tensors = (
+        "eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask",
+        "mfcc", "mel", "mfcc_mask", "activity", "speaker_reference", "speaker_target",
+        "canonical_voice", "target_mfcc_mean", "target_mfcc_std",
+        "speaker_reference_mfcc_mean", "speaker_reference_mfcc_std",
+        "canonical_mfcc_mean", "canonical_mfcc_std",
+    )
     result: dict[str, Any] = {key: torch.as_tensor(np.stack([item[key] for item in items])) for key in tensors}
     for key in ("channel_mask", "time_mask", "hubert_mask", "mfcc_mask", "activity"):
         result[key] = result[key].bool()
@@ -409,5 +460,8 @@ def canonical_mfcc_from_waveform(waveform: np.ndarray, sample_rate: int, cfg: di
     )
     prepared, _ = light_prepare_waveform(waveform, sample_rate, prep_cfg)
     acoustic = extract_acoustic_features(prepared.waveform, valid_samples=prepared.valid_samples, config=feature_cfg)
-    _, canonical = _mfcc_from_mel(acoustic.log_mel_energy, acoustic.activity_mask, acoustic.frame_valid_mask, int(cfg["audio"]["mfcc_bins"]))
+    _, _, canonical, _, _ = _mfcc_from_mel(
+        acoustic.log_mel_energy, acoustic.activity_mask, acoustic.frame_valid_mask,
+        int(cfg["audio"]["mfcc_bins"]),
+    )
     return canonical.astype(np.float32)

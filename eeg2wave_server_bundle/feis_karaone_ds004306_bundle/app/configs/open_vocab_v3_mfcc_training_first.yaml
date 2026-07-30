@@ -15,8 +15,13 @@ paths:
   output_root: ../../artifacts/open_vocab_v3_mfcc_training_first
   prepared_cache: ../../artifacts/open_vocab_v3_mfcc_training_first/cache/prepared_mfcc_v3.npz
   prepared_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/cache/prepared_mfcc_v3_manifest.json
+  raw_audio_audit: ../../artifacts/open_vocab_v3_mfcc_training_first/audit/raw_audio_audit.json
+  raw_audio_audit_csv: ../../artifacts/open_vocab_v3_mfcc_training_first/audit/raw_audio_audit.csv
   audio_audit: ../../artifacts/open_vocab_v3_mfcc_training_first/audit/audio_audit.json
   audio_audit_csv: ../../artifacts/open_vocab_v3_mfcc_training_first/audit/audio_audit.csv
+  denoise_selection: ../../artifacts/open_vocab_v3_mfcc_training_first/denoise/selection.csv
+  denoise_root: ../../artifacts/open_vocab_v3_mfcc_training_first/denoise/wav
+  denoise_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/denoise/manifest.json
   speaker_model_root: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speechbrain_ecapa
   speaker_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speechbrain_ecapa_manifest.json
   vocoder_root: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speecht5_hifigan
@@ -33,6 +38,11 @@ paths:
   validation_report: ../../artifacts/open_vocab_v3_mfcc_training_first/evaluation/subject_holdout_seen.json
   locked_report: ../../artifacts/open_vocab_v3_mfcc_training_first/evaluation/locked_seen_label.json
   locked_unseen_report: ../../artifacts/open_vocab_v3_mfcc_training_first/evaluation/locked_unseen_pot_exploratory.json
+  micro_preview_root: ../../artifacts/open_vocab_v3_mfcc_training_first/pairs/micro_50_preview
+  micro_preview_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/pairs/micro_50_preview/preview_manifest.json
+  fit_preview_root: ../../artifacts/open_vocab_v3_mfcc_training_first/pairs/full_fit_preview
+  fit_preview_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/pairs/full_fit_preview/preview_manifest.json
+  training_review: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/E_training_wav_human_review.json
   pair_root: ../../artifacts/open_vocab_v3_mfcc_training_first/pairs/training_fit_eligible
   run_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/run_manifest.json
   # Kept here as well as under data because evaluation/export need these
@@ -61,6 +71,20 @@ audio:
     - "karaone:MM18:94"
     - "karaone:MM14:36"
     - "karaone:MM16:56"
+
+denoise:
+  enabled: true
+  backend: DeepFilterNet3
+  processing_sample_rate: 48000
+  compensate_delay: true
+  post_filter: false
+  attenuation_limit_db: 18.0
+  auto_select_low_contrast: false
+  max_envelope_lag_ms: 30.0
+  max_vad_boundary_shift_ms: 40.0
+  max_duration_change_ms: 30.0
+  min_hubert_dtw_cosine: 0.90
+  min_ecapa_cosine: 0.90
 
 # Immutable source-Mel contract used only by V0.  These values match
 # configs/open_vocab_0728_duallatent_v1.yaml and its cache builder.
@@ -91,6 +115,8 @@ teachers:
 
 model:
   audio_dimension: 128
+  audio_latent_dimension: 32
+  audio_residual_limit_db: 24.0
   eeg_dimension: 128
   heads: 4
   layers: 2
@@ -109,7 +135,13 @@ training:
   eeg_lr: 0.0003
   weight_decay: 0.0001
   grad_clip: 1.0
-  canonical_voice_dropout: 0.25
+  # Never pair a canonical voice condition with another speaker's target Mel.
+  canonical_voice_dropout: 0.0
+  cvae_kl_beta_max: 0.02
+  cvae_kl_warmup_epochs: 12
+  cvae_free_bits: 0.05
+  cvae_prior_reconstruction_weight: 0.35
+  cvae_analytic_consistency_weight: 0.05
   wall_hours: 9.5
 
 micro_gate:
@@ -120,6 +152,8 @@ evaluation:
   batch_size: 8
   bootstrap_samples: 1000
   oracle_per_label: 5
+  training_preview_per_label: 5
+  variational_samples: 3
 
 gates:
   v0:
@@ -129,8 +163,11 @@ gates:
     mfcc_template_ratio_max: 0.50
     label_top1_min: 0.90
     dtw_gap_min: 0.20
+    prior_posterior_mel_gap_max: 8.0
+    analytic_backend_max_abs_error: 0.0001
   v2:
     speaker_swap_margin_min: 0.03
+    target_over_p90_fraction_min: 0.80
     content_change_max: 0.05
   micro:
     label_top1_min: 0.95

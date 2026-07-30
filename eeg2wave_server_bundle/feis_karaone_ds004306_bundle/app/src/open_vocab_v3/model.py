@@ -2,9 +2,27 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.fft import idct
+
+
+def librosa_mfcc_to_mel_reference(
+    mfcc: np.ndarray, cepstral_mean: np.ndarray, cepstral_std: np.ndarray, *, mel_bins: int = 80
+) -> np.ndarray:
+    """Authoritative library reference for the fixed analytic backend."""
+    try:
+        import librosa
+    except ImportError as error:  # pragma: no cover - dependency bootstrap path
+        raise RuntimeError("librosa is required for the MFCC inversion conformance gate") from error
+    values=[]
+    for normalized,mean,std in zip(np.asarray(mfcc),np.asarray(cepstral_mean),np.asarray(cepstral_std)):
+        restored=normalized*np.maximum(std[:,None],1.0e-4)+mean[:,None]
+        power=librosa.feature.inverse.mfcc_to_mel(restored,n_mels=int(mel_bins),dct_type=2,norm="ortho",ref=1.0)
+        values.append(np.clip(librosa.power_to_db(power,ref=1.0,top_db=None),-80.0,0.0))
+    return np.stack(values).astype(np.float32)
 
 
 def _encoder(dimension: int, heads: int, layers: int, dropout: float) -> nn.TransformerEncoder:
@@ -29,37 +47,190 @@ def _position(steps: int, dimension: int) -> torch.Tensor:
     return output
 
 
-class MFCCMelDecoder(nn.Module):
-    """Small audio-only decoder used by V1/V2, never by the EEG encoder.
+class AnalyticMFCCToMel(nn.Module):
+    """Fixed orthonormal inverse-DCT MFCC-to-log-Mel backend.
 
-    The speaker condition is deliberately isolated from the EEG path.  In v3
-    primary synthesis callers pass ``canonical_voice``; target voice is used
-    only by the V2 audio oracle.
+    It is the differentiable equivalent of the standard librosa/scipy MFCC
+    inversion.  The omitted high-order cepstra are zero-filled.  Utterance
+    CMVN is restored with statistics from a non-target speaker reference (or
+    the fit-only canonical voice), never with statistics from the target test
+    waveform.
     """
 
-    def __init__(self, *, mfcc_bins: int = 40, mel_bins: int = 80, dimension: int = 128, voice_dim: int = 192):
+    def __init__(self, *, mfcc_bins: int = 40, mel_bins: int = 80):
         super().__init__()
-        self.mfcc_bins = mfcc_bins
-        self.mel_bins = mel_bins
-        self.voice_dim = voice_dim
-        self.input = nn.Conv1d(mfcc_bins, dimension, 5, padding=2)
-        self.voice = nn.Sequential(nn.Linear(voice_dim, dimension * 2), nn.GELU(), nn.Linear(dimension * 2, dimension * 2))
-        self.blocks = nn.Sequential(
-            nn.Conv1d(dimension, dimension, 5, padding=2), nn.GELU(),
-            nn.Conv1d(dimension, dimension, 5, padding=2), nn.GELU(),
+        basis = idct(np.eye(mel_bins), type=2, axis=0, norm="ortho")[:, :mfcc_bins]
+        self.register_buffer("inverse_dct_basis", torch.from_numpy(basis.astype(np.float32)))
+        self.mfcc_bins = int(mfcc_bins)
+        self.mel_bins = int(mel_bins)
+
+    def forward(
+        self, mfcc: torch.Tensor, cepstral_mean: torch.Tensor, cepstral_std: torch.Tensor
+    ) -> torch.Tensor:
+        if mfcc.ndim != 3 or mfcc.shape[1] != self.mfcc_bins:
+            raise ValueError(f"analytic backend expects MFCC [B,{self.mfcc_bins},T]")
+        expected = (mfcc.shape[0], self.mfcc_bins)
+        if cepstral_mean.shape != expected or cepstral_std.shape != expected:
+            raise ValueError(f"cepstral mean/std must both be {expected}")
+        restored = mfcc * cepstral_std.clamp_min(1.0e-4).unsqueeze(-1) + cepstral_mean.unsqueeze(-1)
+        mel_db = torch.einsum("mk,bkt->bmt", self.inverse_dct_basis, restored)
+        return mel_db.clamp(-80.0, 0.0)
+
+
+class MFCCMelDecoder(nn.Module):
+    """Conditional variational MFCC-to-Mel residual decoder.
+
+    The fixed analytic inverse-DCT backend carries the content path.  A CVAE
+    models only its bounded Mel residual.  The posterior sees real Mel during
+    audio-only training/oracle evaluation; EEG synthesis uses the conditional
+    prior and therefore cannot access target audio.
+    """
+
+    def __init__(
+        self,
+        *,
+        mfcc_bins: int = 40,
+        mel_bins: int = 80,
+        dimension: int = 128,
+        voice_dim: int = 192,
+        latent_dim: int = 32,
+        residual_limit_db: float = 24.0,
+    ):
+        super().__init__()
+        self.mfcc_bins = int(mfcc_bins)
+        self.mel_bins = int(mel_bins)
+        self.voice_dim = int(voice_dim)
+        self.latent_dim = int(latent_dim)
+        self.residual_limit_db = float(residual_limit_db)
+        self.analytic_backend = AnalyticMFCCToMel(mfcc_bins=mfcc_bins, mel_bins=mel_bins)
+        self.content = nn.Sequential(
+            nn.Conv1d(mfcc_bins, dimension, 5, padding=2), nn.GELU(),
             nn.Conv1d(dimension, dimension, 5, padding=2), nn.GELU(),
         )
-        self.output = nn.Conv1d(dimension, mel_bins, 1)
+        self.voice = nn.Sequential(
+            nn.Linear(voice_dim, dimension), nn.GELU(), nn.Linear(dimension, dimension)
+        )
+        self.prior = nn.Sequential(
+            nn.Linear(dimension * 2, dimension), nn.GELU(), nn.Linear(dimension, latent_dim * 2)
+        )
+        self.posterior_audio = nn.Sequential(
+            nn.Conv1d(mel_bins * 2, dimension, 5, padding=2), nn.GELU(),
+            nn.Conv1d(dimension, dimension, 5, padding=2), nn.GELU(),
+            nn.AdaptiveAvgPool1d(1), nn.Flatten(),
+        )
+        self.posterior = nn.Sequential(
+            nn.Linear(dimension * 3, dimension), nn.GELU(), nn.Linear(dimension, latent_dim * 2)
+        )
+        self.latent = nn.Linear(latent_dim, dimension)
+        self.film = nn.Linear(dimension, dimension * 2)
+        self.decoder = nn.Sequential(
+            nn.Conv1d(dimension, dimension, 5, padding=2), nn.GELU(),
+            nn.Conv1d(dimension, dimension, 5, padding=2), nn.GELU(),
+            nn.Conv1d(dimension, dimension, 5, padding=2), nn.GELU(),
+            nn.Conv1d(dimension, mel_bins, 1),
+        )
 
-    def forward(self, mfcc: torch.Tensor, voice: torch.Tensor) -> torch.Tensor:
-        if mfcc.ndim != 3 or mfcc.shape[1] != self.mfcc_bins:
-            raise ValueError(f"MFCC decoder expects [B,{self.mfcc_bins},T]")
+    @staticmethod
+    def _stats(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mean, logvar = value.chunk(2, dim=-1)
+        return mean, logvar.clamp(-8.0, 6.0)
+
+    @staticmethod
+    def _sample(mean: torch.Tensor, logvar: torch.Tensor, stochastic: bool) -> torch.Tensor:
+        if not stochastic:
+            return mean
+        return mean + torch.randn_like(mean) * torch.exp(0.5 * logvar)
+
+    def distributions(
+        self,
+        mfcc: torch.Tensor,
+        voice: torch.Tensor,
+        cepstral_mean: torch.Tensor,
+        cepstral_std: torch.Tensor,
+        target_mel: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         if voice.shape != (mfcc.shape[0], self.voice_dim):
             raise ValueError(f"voice must be [B,{self.voice_dim}]")
-        hidden = self.input(mfcc)
-        scale, bias = self.voice(voice).chunk(2, dim=1)
+        analytic = self.analytic_backend(mfcc, cepstral_mean, cepstral_std)
+        content = self.content(mfcc)
+        content_pool = content.mean(-1)
+        voice_hidden = self.voice(voice)
+        prior_mean, prior_logvar = self._stats(self.prior(torch.cat((content_pool, voice_hidden), dim=-1)))
+        result = {
+            "analytic_mel": analytic,
+            "content_hidden": content,
+            "voice_hidden": voice_hidden,
+            "prior_mean": prior_mean,
+            "prior_logvar": prior_logvar,
+        }
+        if target_mel is not None:
+            if target_mel.shape != analytic.shape:
+                raise ValueError(f"target Mel must have shape {tuple(analytic.shape)}")
+            normalized_target = target_mel / 40.0 + 1.0
+            normalized_analytic = analytic / 40.0 + 1.0
+            audio_hidden = self.posterior_audio(torch.cat((normalized_target, normalized_analytic), dim=1))
+            posterior_mean, posterior_logvar = self._stats(
+                self.posterior(torch.cat((content_pool, voice_hidden, audio_hidden), dim=-1))
+            )
+            result.update({"posterior_mean": posterior_mean, "posterior_logvar": posterior_logvar})
+        return result
+
+    def decode(
+        self,
+        analytic: torch.Tensor,
+        content: torch.Tensor,
+        voice_hidden: torch.Tensor,
+        latent: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = content + self.latent(latent).unsqueeze(-1)
+        scale, bias = self.film(voice_hidden).chunk(2, dim=-1)
         hidden = hidden * (1.0 + 0.1 * torch.tanh(scale).unsqueeze(-1)) + 0.1 * bias.unsqueeze(-1)
-        return -80.0 + 80.0 * torch.sigmoid(self.output(self.blocks(hidden)))
+        residual = self.residual_limit_db * torch.tanh(self.decoder(hidden))
+        return (analytic + residual).clamp(-80.0, 0.0)
+
+    def generate(
+        self,
+        mfcc: torch.Tensor,
+        voice: torch.Tensor,
+        cepstral_mean: torch.Tensor,
+        cepstral_std: torch.Tensor,
+        *,
+        stochastic: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        values = self.distributions(mfcc, voice, cepstral_mean, cepstral_std)
+        latent = self._sample(values["prior_mean"], values["prior_logvar"], stochastic)
+        values["latent"] = latent
+        values["mel"] = self.decode(
+            values["analytic_mel"], values["content_hidden"], values["voice_hidden"], latent
+        )
+        return values
+
+    def reconstruct(
+        self,
+        mfcc: torch.Tensor,
+        voice: torch.Tensor,
+        cepstral_mean: torch.Tensor,
+        cepstral_std: torch.Tensor,
+        target_mel: torch.Tensor,
+        *,
+        stochastic: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        values = self.distributions(mfcc, voice, cepstral_mean, cepstral_std, target_mel)
+        latent = self._sample(values["posterior_mean"], values["posterior_logvar"], stochastic)
+        values["latent"] = latent
+        values["mel"] = self.decode(
+            values["analytic_mel"], values["content_hidden"], values["voice_hidden"], latent
+        )
+        return values
+
+    def forward(
+        self,
+        mfcc: torch.Tensor,
+        voice: torch.Tensor,
+        cepstral_mean: torch.Tensor,
+        cepstral_std: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.generate(mfcc, voice, cepstral_mean, cepstral_std, stochastic=False)["mel"]
 
 
 class EEGMFCCEncoder(nn.Module):

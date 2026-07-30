@@ -39,7 +39,10 @@ def write_audit_csv(path: Path, rows: list[dict[str, object]]) -> None:
 def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, records) -> None:
     path = output_path(config_path, cfg, "prepared_manifest")
     supporting_artifacts = {}
-    for key in ("audio_audit", "audio_audit_csv"):
+    for key in (
+        "raw_audio_audit", "raw_audio_audit_csv", "denoise_selection", "denoise_manifest",
+        "audio_audit", "audio_audit_csv",
+    ):
         artifact = output_path(config_path, cfg, key)
         if not artifact.is_file():
             raise RuntimeError(f"v3 preparation artifact is missing: {artifact}")
@@ -133,12 +136,13 @@ def main() -> None:
     manual_review = [row for row in audit if bool(row["manual_review_required"])]
     low_contrast = [row for row in audit if bool(row["low_contrast"])]
     report = {
-        "schema_version": "openvoice-v3-audio-audit-v2",
+        "schema_version": "openvoice-v3-audio-audit-v3-selective-denoise",
         "prepared_cache": str(cache_path),
         "counts": counts,
         "fit_eligible": int(((records.roles == "fit") & records.arrays["fit_eligible"]).sum()),
         "fit_excluded": int(((records.roles == "fit") & ~records.arrays["fit_eligible"]).sum()),
         "no_automatic_deepfilternet": True,
+        "accepted_denoised_count": sum(bool(row.get("used_accepted_denoising", False)) for row in audit),
         "flagged_count": len(flagged),
         "flagged_samples": flagged,
         "manual_review_count": len(manual_review),
