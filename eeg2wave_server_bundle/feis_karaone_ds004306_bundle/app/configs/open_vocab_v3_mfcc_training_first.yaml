@@ -1,4 +1,11 @@
-version: openvoice-eeg-v3-mfcc-training-first
+version: openvoice-eeg-v3-encodec-clip-mfcc-v1
+
+# `run_open_vocab_v3_explore_20h.sh` sets OPEN_VOCAB_V3_EXPLORATION=1 and
+# redirects all v3 output paths to this sibling root.  The data/model contract
+# stays identical, while failed gates can never contaminate primary artifacts.
+exploration:
+  output_root_name: open_vocab_v3_mfcc_training_first_explore
+  gate_policy: record_failures_and_continue
 
 # This file is intentionally an independent v3 namespace.  The v0724/v0730
 # caches are read-only sources; no v3 command can write into their directories.
@@ -13,8 +20,13 @@ paths:
   # Immutable feature/split source.  It is only read while constructing v3.
   source_cache_root: ../../artifacts/open_vocab_0728_duallatent_v1/cache/v3
   output_root: ../../artifacts/open_vocab_v3_mfcc_training_first
-  prepared_cache: ../../artifacts/open_vocab_v3_mfcc_training_first/cache/prepared_mfcc_v3.npz
-  prepared_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/cache/prepared_mfcc_v3_manifest.json
+  # Never reuse the abandoned direct-EEG→MFCC cache/checkpoints.  Those files
+  # stay in this artifact root for auditability, but this schema has its own
+  # immutable names and every loader checks the schema marker below.
+  prepared_cache: ../../artifacts/open_vocab_v3_mfcc_training_first/cache/prepared_encodec_clip_mfcc_v1.npz
+  prepared_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/cache/prepared_encodec_clip_mfcc_v1_manifest.json
+  encodec_cache: ../../artifacts/open_vocab_v3_mfcc_training_first/cache/encodec_tokens_fit_v1.npz
+  encodec_cache_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/cache/encodec_tokens_fit_v1_manifest.json
   raw_audio_audit: ../../artifacts/open_vocab_v3_mfcc_training_first/audit/raw_audio_audit.json
   raw_audio_audit_csv: ../../artifacts/open_vocab_v3_mfcc_training_first/audit/raw_audio_audit.csv
   audio_audit: ../../artifacts/open_vocab_v3_mfcc_training_first/audit/audio_audit.json
@@ -29,17 +41,25 @@ paths:
   vocoder_root: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speecht5_hifigan
   vocoder_base_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speecht5_hifigan_base_manifest.json
   vocoder_adapted_root: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speecht5_hifigan_karaone_fit
+  encodec_root: ../../../karaone_overt_recon_bundle/models/encodec_24khz
+  encodec_adapted_root: ../../artifacts/open_vocab_v3_mfcc_training_first/models/encodec_24khz_karaone_fit_v1
+  encodec_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/models/encodec_24khz_karaone_fit_v1/adaptation_manifest.json
   vocoder_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speecht5_hifigan_manifest.json
   audio_adaptation_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/A0_audio_domain_adaptation.json
   hubert_root: ../../../feis_subject_aware_bundle/models/hubert-base-ls960
-  audio_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/audio_oracle/checkpoints/best.pt
-  micro_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/eeg_mfcc/micro_50/checkpoints/best.pt
-  fit_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/eeg_mfcc/full_fit/checkpoints/best.pt
-  v0_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/V0_vocoder_oracle.json
-  v1_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/V1_content_audio_oracle.json
-  v2_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/V2_timbre_audio_oracle.json
-  micro_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/C_50_pair_overfit.json
-  fit_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/D_full_fit.json
+  audio_content_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/audio_content_encodec_v1/checkpoints/best.pt
+  cvae_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/mfcc_native_mel_cvae_v1/checkpoints/best.pt
+  micro_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/eeg_encodec_clip_mfcc_v1/micro_50/checkpoints/best.pt
+  fit_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/eeg_encodec_clip_mfcc_v1/full_fit/checkpoints/best.pt
+  t0_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/T0_encodec_roundtrip.json
+  t0b_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/T0b_native_speecht5_roundtrip.json
+  t1_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/T1_audio_tokens_to_mfcc.json
+  t1d_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/T1d_content_timbre_probe.json
+  t2_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/T2_mfcc_canonical_voice.json
+  t2v_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/T2v_variational_validity.json
+  t3_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/T3_voice_swap.json
+  micro_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/C_encodec_clip_50_pair_overfit.json
+  fit_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/D_encodec_clip_full_fit.json
   validation_report: ../../artifacts/open_vocab_v3_mfcc_training_first/evaluation/subject_holdout_seen.json
   locked_report: ../../artifacts/open_vocab_v3_mfcc_training_first/evaluation/locked_seen_label.json
   locked_unseen_report: ../../artifacts/open_vocab_v3_mfcc_training_first/evaluation/locked_unseen_pot_exploratory.json
@@ -48,7 +68,7 @@ paths:
   fit_preview_root: ../../artifacts/open_vocab_v3_mfcc_training_first/pairs/full_fit_preview
   fit_preview_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/pairs/full_fit_preview/preview_manifest.json
   training_review: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/E_training_wav_human_review.json
-  pair_root: ../../artifacts/open_vocab_v3_mfcc_training_first/pairs/training_fit_eligible
+  pair_root: ../../artifacts/open_vocab_v3_mfcc_training_first/pairs/encodec_clip_mfcc_training_fit_v1
   run_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/run_manifest.json
   # Kept here as well as under data because evaluation/export need these
   # read-only locations without writing to them.
@@ -71,6 +91,13 @@ audio:
   n_fft: 512
   mel_db_min: -80.0
   mel_db_max: 0.0
+  encodec_sample_rate: 24000
+  encodec_bandwidth: 6.0
+  encodec_codebooks: 8
+  encodec_codebook_size: 1024
+  encodec_steps: 192
+  content_tokens: 32
+  native_mel_frames: 160
   low_contrast_db_threshold: 6.0
   manual_review_sample_keys:
     - "karaone:MM18:94"
@@ -122,6 +149,9 @@ audio_adaptation:
   # Scientific/primary path.  The separate transductive runner can use all
   # eligible WAVs, but its checkpoint is never consumed by held-out reports.
   primary_scope: fit
+  encodec_epochs: 6
+  encodec_batch_size: 2
+  encodec_lr: 0.00001
   vocoder_epochs: 6
   vocoder_batch_size: 2
   vocoder_lr: 0.00001
@@ -130,7 +160,6 @@ audio_adaptation:
   speaker_lr: 0.00001
   min_relative_loss_improvement: 0.01
   min_changed_parameter_fraction: 0.50
-  input_mel_hop_samples: 160
   waveform_l1_weight: 0.10
   envelope_weight: 0.10
   stft_fft_sizes: [512, 1024, 2048]
@@ -142,17 +171,22 @@ teachers:
 model:
   audio_dimension: 128
   audio_latent_dimension: 32
-  audio_residual_limit_db: 24.0
+  audio_residual_limit_log10: 3.0
   eeg_dimension: 128
   heads: 4
   layers: 2
   dropout: 0.10
+  content_dimension: 128
+  content_layers: 2
+  content_token_steps: 32
+  speaker_adversarial_weight: 0.05
 
 training:
   seed: 31
   audio_batch_size: 16
   eeg_batch_size: 10
   audio_epochs: 32
+  audio_content_epochs: 48
   audio_patience: 5
   micro_epochs: 240
   fit_epochs: 80
@@ -182,16 +216,32 @@ evaluation:
   variational_samples: 3
 
 gates:
-  v0:
+  t0:
+    label_top1_min: 0.95
+    hubert_dtw_min: 0.90
+    ssim_min: 0.90
+    logmel_mae_db_max: 6.0
+    frozen_relative_degradation_max: 0.05
+  t0b:
+    label_top1_min: 0.90
+    hubert_dtw_min: 0.80
+    dtw_gap_min: 0.20
+  t1:
+    label_top1_min: 0.95
+    paired_r_at_1_min: 0.80
+    template_ratio_max: 0.50
+    variance_ratio_min: 0.50
+  t1d:
+    label_probe_min: 0.90
+    speaker_probe_max: 0.25
+  t2:
     label_top1_min: 0.90
     dtw_gap_min: 0.20
-  v1:
-    mfcc_template_ratio_max: 0.50
+    prior_posterior_label_gap_max: 0.05
+  t2v:
+    posterior_analytic_improvement_min: 0.20
     label_top1_min: 0.90
-    dtw_gap_min: 0.20
-    prior_posterior_mel_gap_max: 8.0
-    analytic_backend_max_abs_error: 0.0001
-  v2:
+  t3:
     speaker_swap_margin_min: 0.03
     target_over_p90_fraction_min: 0.80
     content_change_max: 0.05
@@ -210,3 +260,13 @@ gates:
 vocoder:
   repo_id: microsoft/speecht5_hifigan
   sample_rate: 16000
+  # The only Mel space permitted after this schema upgrade.  It is used in
+  # adaptation, T0b, CVAE, and every export; no legacy power-dB /10 adapter.
+  native_contract: speecht5_native_log_mel_v1
+  n_fft: 1024
+  win_length: 1024
+  hop_length: 256
+  fmin_hz: 80.0
+  fmax_hz: 7600.0
+  mel_scale: slaney
+  mel_norm: slaney

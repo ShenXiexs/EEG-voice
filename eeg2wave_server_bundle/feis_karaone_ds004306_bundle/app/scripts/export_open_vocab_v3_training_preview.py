@@ -37,7 +37,9 @@ def selected_fit(records,per_label:int)->Subset:
 def main()->None:
     parser=argparse.ArgumentParser(description="Export v3 micro/full-fit training WAV previews")
     parser.add_argument("--config",type=Path,required=True);parser.add_argument("--stage",choices=("micro","fit"),required=True);parser.add_argument("--device",default="cpu");parser.add_argument("--resume",action="store_true");args=parser.parse_args()
-    config_path,cfg=load_config(args.config);device=default_device(args.device);started=time.monotonic();records=load_prepared(output_path(config_path,cfg,"prepared_cache"))
+    config_path,cfg=load_config(args.config)
+    if cfg.get("version")=="openvoice-eeg-v3-encodec-clip-mfcc-v1":raise RuntimeError("retired preview exporter refused; use export_open_vocab_v3_encodec_clip_pairs.py")
+    device=default_device(args.device);started=time.monotonic();records=load_prepared(output_path(config_path,cfg,"prepared_cache"))
     if args.stage=="micro":
         gate=require_passed_gate(config_path,cfg,"micro_gate",lineage_artifact_keys=("micro_checkpoint","v2_gate"));dataset=micro_dataset(records,str(cfg["micro_gate"]["subject"]),int(cfg["micro_gate"]["per_label"]));root_key="micro_preview_root";manifest_key="micro_preview_manifest";lineage_keys=("micro_checkpoint","micro_gate")
     else:

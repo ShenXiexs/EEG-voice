@@ -8,6 +8,7 @@ import torch
 from scipy.fft import idct
 
 from src.open_vocab_v3.metrics import (
+    clip_token_global_losses,
     cvae_audio_loss,
     fit_loss,
     overfit_loss,
@@ -18,6 +19,7 @@ from src.open_vocab_v3.metrics import (
 from src.open_vocab_v3.data import channel_shuffled_eeg, time_shuffled_eeg
 from src.open_vocab_v3.denoise import envelope_lag_ms, resample_waveform
 from src.open_vocab_v3.model import AnalyticMFCCToMel, EEGMFCCEncoder, MFCCMelDecoder
+from src.open_vocab_v3.encodec_content import AudioContentEncoder, EEGContentEncoder, SharedMFCCDecoder
 from src.open_vocab_v3.runtime import load_config
 
 
@@ -27,6 +29,8 @@ APP = Path(__file__).resolve().parents[1]
 def test_v3_config_has_a_new_artifact_firewall_and_fixed_content_contract() -> None:
     _, cfg = load_config(APP / "configs" / "open_vocab_v3_mfcc_training_first.yaml")
     assert cfg["paths"]["output_root"].endswith("open_vocab_v3_mfcc_training_first")
+    assert cfg["version"] == "openvoice-eeg-v3-encodec-clip-mfcc-v1"
+    assert cfg["paths"]["prepared_cache"].endswith("prepared_encodec_clip_mfcc_v1.npz")
     assert cfg["audio"]["mfcc_bins"] == 40
     assert cfg["audio"]["canonical_frames"] == 256
     assert cfg["audio"]["max_active_seconds"] == 2.56
@@ -34,21 +38,41 @@ def test_v3_config_has_a_new_artifact_firewall_and_fixed_content_contract() -> N
     assert "locked_unseen_report" in cfg["paths"]
     assert cfg["model"]["audio_latent_dimension"] > 0
     assert cfg["training"]["canonical_voice_dropout"] == 0.0
-    assert cfg["denoise"]["processing_sample_rate"] == 48000
+    assert cfg["denoise"]["processing_sample_rate"] == 16000
+    assert cfg["audio"]["encodec_codebooks"] == 8
+    assert cfg["audio"]["content_tokens"] == 32
     assert "training_review" in cfg["paths"]
 
 
 def test_v3_eeg_path_has_no_label_text_or_speaker_forward_input() -> None:
-    signature = inspect.signature(EEGMFCCEncoder.forward)
+    signature = inspect.signature(EEGContentEncoder.forward)
     assert tuple(signature.parameters) == ("self", "eeg", "channel_xyz", "channel_mask", "time_mask")
-    model = EEGMFCCEncoder(dimension=32, heads=4, layers=1, dropout=0.0)
+    model = EEGContentEncoder(dimension=32, heads=4, layers=1, dropout=0.0)
     eeg = torch.randn(2, 3, 64)
     xyz = torch.randn(2, 3, 3)
     channel_mask = torch.tensor([[True, True, True], [True, True, False]])
     time_mask = torch.ones(2, 64, dtype=torch.bool)
-    mfcc, tokens = model(eeg, xyz, channel_mask, time_mask)
+    tokens = model(eeg, xyz, channel_mask, time_mask)
+    assert tokens.shape == (2, 32, 32)
+    mfcc = SharedMFCCDecoder(dimension=32)(tokens)
     assert mfcc.shape == (2, 40, 256)
-    assert tokens.shape == (2, 16, 40)
+    assert torch.count_nonzero(mfcc[:, 0]) == 0
+
+
+def test_audio_content_encoder_has_independent_codebooks() -> None:
+    model=AudioContentEncoder(codebooks=8,vocabulary=1024,dimension=32,tokens=32,heads=4,layers=1,dropout=0)
+    codes=torch.randint(0,1024,(2,8,192));mask=torch.ones(2,192,dtype=torch.bool)
+    assert len(model.embeddings)==8
+    assert len({id(x.weight) for x in model.embeddings})==8
+    assert model(codes,mask).shape==(2,32,32)
+
+
+def test_clip_masks_token_diagonal_and_global_same_label() -> None:
+    audio=torch.randn(4,32,16);eeg=audio.clone().requires_grad_();scale=torch.tensor(0.,requires_grad=True)
+    token,global_=clip_token_global_losses(eeg,audio,["a","a","b","b"],scale)
+    (token+global_).backward()
+    assert torch.isfinite(token) and torch.isfinite(global_)
+    assert eeg.grad is not None
 
 
 def test_v3_losses_match_the_preregistered_weights_and_backpropagate() -> None:

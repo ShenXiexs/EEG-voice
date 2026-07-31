@@ -21,13 +21,29 @@ def resolve_config_path(config_path: str | Path, value: str | Path) -> Path:
 
 
 def output_path(config_path: str | Path, cfg: dict[str, Any], key: str) -> Path:
-    return resolve_config_path(config_path, cfg["paths"][key])
+    path = resolve_config_path(config_path, cfg["paths"][key])
+    # The exploratory runner must never mix bypassed checkpoints/reports with
+    # the fail-closed primary experiment.  Keep the configuration identical so
+    # the feature contract is identical, but route every v3-output path to a
+    # sibling artifact root when explicitly opted into by the shell runner.
+    if os.environ.get("OPEN_VOCAB_V3_EXPLORATION") == "1":
+        parts = list(path.parts)
+        try:
+            index = parts.index("open_vocab_v3_mfcc_training_first")
+        except ValueError:
+            return path
+        parts[index] = "open_vocab_v3_mfcc_training_first_explore"
+        return Path(*parts).resolve()
+    return path
 
 
 def ensure_output_firewall(config_path: str | Path, cfg: dict[str, Any]) -> None:
     root = output_path(config_path, cfg, "output_root")
-    if root.name != "open_vocab_v3_mfcc_training_first":
-        raise ValueError(f"v3 output root must end in open_vocab_v3_mfcc_training_first, got {root}")
+    expected = ("open_vocab_v3_mfcc_training_first_explore"
+                if os.environ.get("OPEN_VOCAB_V3_EXPLORATION") == "1"
+                else "open_vocab_v3_mfcc_training_first")
+    if root.name != expected:
+        raise ValueError(f"v3 output root must end in {expected}, got {root}")
     protected = {"open_vocab_0722", "open_vocab_0724", "open_vocab_0728", "open_vocab_0730"}
     for key, value in cfg.get("paths", {}).items():
         if key == "source_cache_root" or not isinstance(value, str):
@@ -52,6 +68,15 @@ def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
         raise ValueError("v3 content gate requires exactly 40 MFCC coefficients")
     if int(cfg["model"]["audio_latent_dimension"]) <= 0:
         raise ValueError("v3 conditional variational decoder requires a positive latent dimension")
+    if float(cfg["model"]["audio_residual_limit_log10"]) <= 0:
+        raise ValueError("v3 native-Mel CVAE requires a positive log10 residual limit")
+    if (int(cfg["audio"]["encodec_sample_rate"]), int(cfg["audio"]["encodec_codebooks"]),
+            int(cfg["audio"]["encodec_codebook_size"]), int(cfg["audio"]["encodec_steps"])) != (24000, 8, 1024, 192):
+        raise ValueError("v3 requires the declared 24kHz/6kbps/8x1024/192 EnCodec contract")
+    if int(cfg["audio"]["content_tokens"]) != 32 or int(cfg["audio"]["native_mel_frames"]) != 160:
+        raise ValueError("v3 requires 32 aligned content tokens and 160 native SpeechT5 Mel frames")
+    if str(cfg["vocoder"].get("native_contract")) != "speecht5_native_log_mel_v1":
+        raise ValueError("v3 rejects the legacy power-dB/10 SpeechT5 adapter contract")
     if float(cfg["training"].get("canonical_voice_dropout", 0.0)) != 0.0:
         raise ValueError("canonical voice dropout would pair the wrong voice with target Mel and is forbidden")
     denoiser = str(cfg["denoise"].get("backend", "")).lower()

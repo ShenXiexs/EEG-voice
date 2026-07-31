@@ -68,27 +68,34 @@ fi
 BUDGET_SECONDS="$("$PY" -c 'import sys; print(int(float(sys.argv[1]) * 3600))' "$BUDGET_HOURS")"
 DEADLINE_EPOCH="$(( $(date +%s) + BUDGET_SECONDS ))"
 
-# 1. Fine-tune all pretrained backbones used inside the generator on eligible
-# fit WAVs.  Then rebuild speaker conditions from the adapted ECAPA copy.  The
-# untouched HuBERT/ECAPA copies remain evaluation-only auditors.
-"$PY" scripts/finetune_open_vocab_v3_audio_models.py --config "$CFG" --scope fit --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" "${FRESH_FLAG[@]}"
+# 1. Fine-tune only the generator-path EnCodec, native-SpeechT5 HiFi-GAN, and
+# generator-side ECAPA on eligible fit WAVs.  HuBERT/metric ECAPA remain
+# untouched auditors.  New checkpoint names prevent reuse of the old adapter.
+"$PY" scripts/finetune_open_vocab_v3_encodec_audio_models.py --config "$CFG" --scope fit --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH"
 "$PY" scripts/prepare_open_vocab_v3.py --config "$CFG" --with-speaker --device "$EVAL_DEVICE" --force
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase v0 --device "$EVAL_DEVICE"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t0 --device "$EVAL_DEVICE"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t0b --device "$EVAL_DEVICE"
+"$PY" scripts/build_open_vocab_v3_encodec_cache.py --config "$CFG" --device "$EVAL_DEVICE" --force
 
-# 2. Audio-only content/timbre oracles.  No EEG model has been trained yet.
-"$PY" scripts/train_open_vocab_v3.py --config "$CFG" --phase audio --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" "${FRESH_FLAG[@]}"
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase v1 --device "$EVAL_DEVICE"
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase v2 --device "$EVAL_DEVICE"
+# 2. EnCodec token → content token → shared MFCC, then native-Mel CVAE.
+# No EEG model is trained before all audio-only gates have passed.
+"$PY" scripts/train_open_vocab_v3_encodec_clip.py --config "$CFG" --phase audio_content --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t1 --device "$EVAL_DEVICE"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t1d --device "$EVAL_DEVICE"
+"$PY" scripts/train_open_vocab_v3_encodec_clip.py --config "$CFG" --phase cvae --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t2 --device "$EVAL_DEVICE"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t2v --device "$EVAL_DEVICE"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t3 --device "$EVAL_DEVICE"
 
-# 3. Direct 50-pair EEG->MFCC sanity check.  A failed report exits before fit.
-"$PY" scripts/train_open_vocab_v3.py --config "$CFG" --phase micro --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" "${FRESH_FLAG[@]}"
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase micro --device "$EVAL_DEVICE"
-"$PY" scripts/export_open_vocab_v3_training_preview.py --config "$CFG" --stage micro --device "$EXPORT_DEVICE" --resume
+# 3. 50-pair EEG-token CLIP/shared-MFCC sanity check. Failure stops before fit.
+"$PY" scripts/train_open_vocab_v3_encodec_clip.py --config "$CFG" --phase micro --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase micro --device "$EVAL_DEVICE"
+"$PY" scripts/export_open_vocab_v3_encodec_clip_pairs.py --config "$CFG" --stage micro --device "$EXPORT_DEVICE" --resume
 
 # 4. Only after the overfit gate passes: full fit, then its training gate.
-"$PY" scripts/train_open_vocab_v3.py --config "$CFG" --phase fit --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" "${FRESH_FLAG[@]}"
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase fit --device "$EVAL_DEVICE"
-"$PY" scripts/export_open_vocab_v3_training_preview.py --config "$CFG" --stage fit --device "$EXPORT_DEVICE" --resume
+"$PY" scripts/train_open_vocab_v3_encodec_clip.py --config "$CFG" --phase fit --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase fit --device "$EVAL_DEVICE"
+"$PY" scripts/export_open_vocab_v3_encodec_clip_pairs.py --config "$CFG" --stage fit --device "$EXPORT_DEVICE" --resume
 
 # 5. Hard human listening gate. Held-out roles are not loaded or evaluated
 # until the exact full-fit preview has been approved.
@@ -102,10 +109,10 @@ fi
 # 6. These are reports, not extra optimization.  They are unreachable unless
 # all preceding gates pass. CPU avoids the known PyTorch/MPS counterfactual
 # Transformer buffer assertion observed in v0730 evaluation/export.
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase validation --device "$EVAL_DEVICE"
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase locked --device "$EVAL_DEVICE"
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase locked_unseen --device "$EVAL_DEVICE"
-"$PY" scripts/export_open_vocab_v3_pairs.py --config "$CFG" --device "$EXPORT_DEVICE" --resume
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase validation --device "$EVAL_DEVICE"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase locked --device "$EVAL_DEVICE"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase locked_unseen --device "$EVAL_DEVICE"
+"$PY" scripts/export_open_vocab_v3_encodec_clip_pairs.py --config "$CFG" --stage final --device "$EXPORT_DEVICE" --resume
 
 echo "[v3] complete"
 echo "[v3] audit=$OUTPUT_ROOT/audit/audio_audit.json"
@@ -113,4 +120,4 @@ echo "[v3] gates=$OUTPUT_ROOT/gates"
 echo "[v3] validation=$OUTPUT_ROOT/evaluation/subject_holdout_seen.json"
 echo "[v3] locked=$OUTPUT_ROOT/evaluation/locked_seen_label.json"
 echo "[v3] locked_unseen_exploratory=$OUTPUT_ROOT/evaluation/locked_unseen_pot_exploratory.json"
-echo "[v3] pairs=$OUTPUT_ROOT/pairs/training_fit_eligible/manifest.csv"
+echo "[v3] pairs=$OUTPUT_ROOT/pairs/encodec_clip_mfcc_training_fit_v1/manifest.csv"

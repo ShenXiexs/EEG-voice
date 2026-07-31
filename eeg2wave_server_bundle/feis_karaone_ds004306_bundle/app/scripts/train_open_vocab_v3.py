@@ -281,7 +281,9 @@ def update_run_manifest(
 
 
 def main() -> None:
-    args=parse();config_path,cfg=load_config(args.config);seed_everything(int(cfg["training"]["seed"]));device=default_device(args.device)
+    args=parse();config_path,cfg=load_config(args.config)
+    if cfg.get("version")=="openvoice-eeg-v3-encodec-clip-mfcc-v1":raise RuntimeError("retired direct-EEG→MFCC trainer refused; use train_open_vocab_v3_encodec_clip.py")
+    seed_everything(int(cfg["training"]["seed"]));device=default_device(args.device)
     records=load_prepared(output_path(config_path,cfg,"prepared_cache"))
     if args.phase=="audio":
         require_passed_gate(config_path,cfg,"v0_gate",lineage_artifact_keys=("vocoder_manifest","speaker_adaptation_manifest","audio_adaptation_gate"))

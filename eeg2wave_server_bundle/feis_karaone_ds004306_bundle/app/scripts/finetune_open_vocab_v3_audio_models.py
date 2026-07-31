@@ -133,6 +133,7 @@ class AudioDomainDataset(Dataset[dict[str, Any]]):
         prepared, _ = light_prepare_waveform(waveform, rate, self.preparation)
         return {
             "mel": torch.from_numpy(np.asarray(self.records.arrays["mel_raw"][index], dtype=np.float32)),
+            "native_mel": torch.from_numpy(np.asarray(self.records.arrays["speech_t5_mel"][index], dtype=np.float32)),
             "waveform": torch.from_numpy(np.asarray(prepared.waveform, dtype=np.float32)),
             "relative_length": float(prepared.valid_samples / max(len(prepared.waveform), 1)),
             "sample_key": key,
@@ -160,6 +161,7 @@ class AudioDomainDataset(Dataset[dict[str, Any]]):
 def collate(items: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "mel": torch.stack([item["mel"] for item in items]),
+        "native_mel": torch.stack([item["native_mel"] for item in items]),
         "waveform": torch.stack([item["waveform"] for item in items]),
         "relative_length": torch.tensor([item["relative_length"] for item in items], dtype=torch.float32),
         "sample_key": [str(item["sample_key"]) for item in items],
@@ -436,6 +438,11 @@ def _fit_speaker(
 def main() -> None:
     args = parse()
     config_path, cfg = load_config(args.config)
+    if str(cfg.get("version")) == "openvoice-eeg-v3-encodec-clip-mfcc-v1":
+        raise RuntimeError(
+            "retired learned-Mel-adapter trainer refused for the EnCodec-CLIP v3 schema; "
+            "use finetune_open_vocab_v3_encodec_audio_models.py"
+        )
     seed_everything(int(cfg["training"]["seed"]))
     if args.scope == "fit" and str(cfg["audio_adaptation"]["primary_scope"]) != "fit":
         raise ValueError("primary v3 audio adaptation must use fit scope")

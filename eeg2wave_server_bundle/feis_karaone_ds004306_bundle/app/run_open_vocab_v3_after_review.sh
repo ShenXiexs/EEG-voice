@@ -9,8 +9,8 @@ EXPORT_DEVICE="${EXPORT_DEVICE:-cpu}"
 cd "$APP_DIR"
 
 "$PY" scripts/approve_open_vocab_v3_training_preview.py --config "$CFG" --check
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase validation --device "$EVAL_DEVICE"
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase locked --device "$EVAL_DEVICE"
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase locked_unseen --device "$EVAL_DEVICE"
-"$PY" scripts/export_open_vocab_v3_pairs.py --config "$CFG" --device "$EXPORT_DEVICE" --resume
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase validation --device "$EVAL_DEVICE"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase locked --device "$EVAL_DEVICE"
+"$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase locked_unseen --device "$EVAL_DEVICE"
+"$PY" scripts/export_open_vocab_v3_encodec_clip_pairs.py --config "$CFG" --stage final --device "$EXPORT_DEVICE" --resume
 echo "[v3] held-out evaluation and final training-pair export complete"

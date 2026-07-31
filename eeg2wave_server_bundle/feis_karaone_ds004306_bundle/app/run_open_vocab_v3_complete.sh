@@ -9,7 +9,7 @@ CFG="${1:-$APP_DIR/configs/open_vocab_v3_mfcc_training_first.yaml}"
 REVIEWER="${REVIEWER:-samxie}"
 OUTPUT_ROOT="$APP_DIR/../artifacts/open_vocab_v3_mfcc_training_first"
 PREVIEW_ROOT="$OUTPUT_ROOT/pairs/full_fit_preview"
-FINAL_PAIR_ROOT="$OUTPUT_ROOT/pairs/training_fit_eligible"
+FINAL_PAIR_ROOT="$OUTPUT_ROOT/pairs/encodec_clip_mfcc_training_fit_v1"
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
   PY="$PYTHON_BIN"

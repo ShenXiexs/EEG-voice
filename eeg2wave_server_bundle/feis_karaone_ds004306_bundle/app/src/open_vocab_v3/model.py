@@ -233,6 +233,40 @@ class MFCCMelDecoder(nn.Module):
         return self.generate(mfcc, voice, cepstral_mean, cepstral_std, stochastic=False)["mel"]
 
 
+class NativeSpeechT5MFCCMelCVAE(MFCCMelDecoder):
+    """MFCC→official SpeechT5 log10-Mel residual CVAE.
+
+    The analytic inverse-DCT is expressed in dB, so ``/10`` converts it to
+    the log10 power domain returned by ``SpeechT5FeatureExtractor``.  Unlike
+    the retired decoder, this model never clamps the output to ``[-80, 0]``.
+    """
+
+    def __init__(self, **kwargs):
+        residual_limit = float(kwargs.pop("residual_limit_log10", 3.0))
+        super().__init__(residual_limit_db=residual_limit, **kwargs)
+        self.residual_limit_log10 = residual_limit
+
+    def distributions(self, mfcc, voice, cepstral_mean, cepstral_std, target_mel=None):
+        values = super().distributions(mfcc, voice, cepstral_mean, cepstral_std, None)
+        values["analytic_mel"] = values["analytic_mel"] / 10.0
+        if target_mel is not None:
+            if target_mel.shape != values["analytic_mel"].shape:
+                raise ValueError(f"target Mel must have shape {tuple(values['analytic_mel'].shape)}")
+            audio_hidden = self.posterior_audio(torch.cat((target_mel, values["analytic_mel"]), dim=1))
+            posterior_mean, posterior_logvar = self._stats(
+                self.posterior(torch.cat((values["content_hidden"].mean(-1), values["voice_hidden"], audio_hidden), dim=-1))
+            )
+            values.update({"posterior_mean": posterior_mean, "posterior_logvar": posterior_logvar})
+        return values
+
+    def decode(self, analytic, content, voice_hidden, latent):
+        hidden = content + self.latent(latent).unsqueeze(-1)
+        scale, bias = self.film(voice_hidden).chunk(2, dim=-1)
+        hidden = hidden * (1.0 + 0.1 * torch.tanh(scale).unsqueeze(-1)) + 0.1 * bias.unsqueeze(-1)
+        residual = self.residual_limit_log10 * torch.tanh(self.decoder(hidden))
+        return (analytic + residual).clamp(-10.0, 4.0)
+
+
 class EEGMFCCEncoder(nn.Module):
     """Spatial-temporal EEG encoder with direct canonical MFCC output.
 

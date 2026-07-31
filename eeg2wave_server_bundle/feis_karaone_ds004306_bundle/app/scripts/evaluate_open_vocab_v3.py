@@ -358,7 +358,9 @@ def save_gate(path: Path, report: dict[str, Any], no_fail: bool) -> None:
 
 
 def main() -> None:
-    args=parse();config_path,cfg=load_config(args.config);device=default_device(args.device);records=load_prepared(output_path(config_path,cfg,"prepared_cache"))
+    args=parse();config_path,cfg=load_config(args.config)
+    if cfg.get("version")=="openvoice-eeg-v3-encodec-clip-mfcc-v1":raise RuntimeError("retired V0/V1/V2 evaluator refused; use evaluate_open_vocab_v3_encodec_clip.py")
+    device=default_device(args.device);records=load_prepared(output_path(config_path,cfg,"prepared_cache"))
     for phase in (args.phase,):
         if phase=="v0":
             adaptation=read_json(output_path(config_path,cfg,"audio_adaptation_gate"))

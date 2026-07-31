@@ -23,7 +23,7 @@ from src.open_vocab_0724.audio_features import (
 
 
 SOURCE_SPLITS = ("train", "validation", "locked_test", "diagnostic")
-PREPARATION_SCHEMA = "openvoice-v3-mfcc-preparation-v4-cvae-denoise-cmvn-256"
+PREPARATION_SCHEMA = "openvoice-v3-encodec-clip-mfcc-preparation-v1"
 PAIR_ROLES = (
     "fit",
     "subject_holdout_seen",
@@ -206,10 +206,8 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
     audio_root = (config_path.parent / cfg["data"]["audio_root"]).resolve()
     manifest = (config_path.parent / cfg["data"]["unified_manifest"]).resolve()
     arrays = merge_source(source_root)
-    # Keep the immutable power-dB Mel from the v0728 source cache for V0.
-    # ``mel`` below is replaced by the separate v3 canonical active target.
-    arrays["vocoder_mel"] = np.asarray(arrays["mel"], dtype=np.float32).copy()
-    arrays["vocoder_activity"] = np.asarray(arrays["activity"], dtype=bool).copy()
+    # Legacy v0728 Mel is retained only as lineage, never routed to SpeechT5.
+    arrays["legacy_v0728_mel"] = np.asarray(arrays["mel"], dtype=np.float32).copy()
     for key in ("sample_keys", "audio_keys", "labels", "subjects", "source_split"):
         arrays[key] = arrays[key].astype(str)
     roles = assign_roles(
@@ -234,7 +232,7 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         max_db=float(cfg["audio"]["mel_db_max"]),
     )
     raw_mfcc, normalized_mfcc, canonical_mfcc, mfcc_mean, mfcc_std = [], [], [], [], []
-    raw_mel, canonical_mel = [], []
+    raw_mel, canonical_mel, speech_t5_mel, speech_t5_mask = [], [], [], []
     frame_mask, activity_mask, valid_samples, active_seconds, fit_eligible = [], [], [], [], []
     audit: list[dict[str, Any]] = []
     manual_review = set(map(str, cfg["audio"].get("manual_review_sample_keys", ())))
@@ -260,6 +258,16 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         mfcc_std.append(utterance_std)
         raw_mel.append(acoustic.log_mel_energy)
         canonical_mel.append(_canonical_mel(acoustic.log_mel_energy, acoustic.activity_mask, acoustic.frame_valid_mask))
+        from .native_mel import native_speecht5_mel
+        native = native_speecht5_mel(
+            torch.from_numpy(prepared.waveform[: max(1, prepared.valid_samples)]).unsqueeze(0), cfg,
+        ).squeeze(0).cpu().numpy().astype(np.float32)
+        maximum=int(cfg["audio"]["native_mel_frames"])
+        if native.shape[-1] > maximum:
+            raise RuntimeError(f"official SpeechT5 Mel exceeds {maximum} frames for eligible-length trial {key}")
+        native_frames=native.shape[-1];native_padded=np.full((native.shape[0],maximum),float(native.min()),dtype=np.float32);native_padded[:,:native_frames]=native
+        speech_t5_mel.append(native_padded)
+        one_mask=np.zeros(maximum,dtype=bool);one_mask[:native_frames]=True;speech_t5_mask.append(one_mask)
         frame_mask.append(acoustic.frame_valid_mask)
         activity_mask.append(acoustic.activity_mask)
         valid_frames = np.asarray(acoustic.frame_valid_mask, dtype=bool)
@@ -324,6 +332,8 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
             "mfcc_std": np.stack(mfcc_std).astype(np.float32),
             "mel_raw": np.stack(raw_mel).astype(np.float32),
             "mel": np.stack(canonical_mel).astype(np.float32),
+            "speech_t5_mel": np.stack(speech_t5_mel).astype(np.float32),
+            "speech_t5_mel_mask": np.stack(speech_t5_mask).astype(bool),
             "mfcc_mask": np.stack(frame_mask).astype(bool),
             "activity_v3": np.stack(activity_mask).astype(bool),
             "audio_valid_samples_v3": np.asarray(valid_samples, dtype=np.int32),
@@ -342,7 +352,7 @@ def save_prepared(path: Path, records: PreparedRecords) -> None:
 def load_prepared(path: Path) -> PreparedRecords:
     raw = np.load(path, allow_pickle=False)
     required = {
-        "eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask", "mel",
+        "eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask", "mel", "speech_t5_mel", "speech_t5_mel_mask",
         "mfcc", "mfcc_raw", "mfcc_cmvn", "mfcc_mean", "mfcc_std", "mfcc_mask",
         "activity_v3", "fit_eligible", "sample_keys",
         "audio_keys", "labels", "subjects", "roles", "v3_preparation_schema",
@@ -381,6 +391,7 @@ class V3Dataset(Dataset[dict[str, Any]]):
             "channel_mask": value["channel_mask"][index], "time_mask": value["time_mask"][index],
             "hubert": value["hubert"][index], "hubert_mask": value["hubert_mask"][index],
             "mfcc": value["mfcc"][index], "mel": value["mel"][index],
+            "speech_t5_mel": value["speech_t5_mel"][index], "speech_t5_mel_mask": value["speech_t5_mel_mask"][index],
             "mfcc_mask": value["mfcc_mask"][index], "activity": value["activity_v3"][index],
             "sample_key": str(value["sample_keys"][index]), "audio_key": str(value["audio_keys"][index]),
             "label": str(value["labels"][index]), "subject": str(value["subjects"][index]),
@@ -401,13 +412,13 @@ class V3Dataset(Dataset[dict[str, Any]]):
 def collate(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
     tensors = (
         "eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask",
-        "mfcc", "mel", "mfcc_mask", "activity", "speaker_reference", "speaker_target", "speaker_audit_reference",
+        "mfcc", "mel", "speech_t5_mel", "speech_t5_mel_mask", "mfcc_mask", "activity", "speaker_reference", "speaker_target", "speaker_audit_reference",
         "canonical_voice", "target_mfcc_mean", "target_mfcc_std",
         "speaker_reference_mfcc_mean", "speaker_reference_mfcc_std",
         "canonical_mfcc_mean", "canonical_mfcc_std",
     )
     result: dict[str, Any] = {key: torch.as_tensor(np.stack([item[key] for item in items])) for key in tensors}
-    for key in ("channel_mask", "time_mask", "hubert_mask", "mfcc_mask", "activity"):
+    for key in ("channel_mask", "time_mask", "hubert_mask", "speech_t5_mel_mask", "mfcc_mask", "activity"):
         result[key] = result[key].bool()
     for key in ("sample_key", "audio_key", "label", "subject", "role"):
         result[key] = [str(item[key]) for item in items]

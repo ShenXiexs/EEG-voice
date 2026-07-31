@@ -73,7 +73,9 @@ def heatmap(path: Path,target_mfcc: np.ndarray,predicted_mfcc: np.ndarray,target
 
 @torch.no_grad()
 def main() -> None:
-    args=parse();config_path,cfg=load_config(args.config);device=default_device(args.device);started=time.monotonic()
+    args=parse();config_path,cfg=load_config(args.config)
+    if cfg.get("version")=="openvoice-eeg-v3-encodec-clip-mfcc-v1":raise RuntimeError("retired pair exporter refused; use export_open_vocab_v3_encodec_clip_pairs.py")
+    device=default_device(args.device);started=time.monotonic()
     validation_path=output_path(config_path,cfg,"validation_report")
     fit_gate_path=output_path(config_path,cfg,"fit_gate");fit_gate=require_passed_gate(config_path,cfg,"fit_gate",lineage_artifact_keys=("fit_checkpoint","micro_gate"))
     expected_report_lineage=capture_lineage(config_path,cfg,artifact_keys=("fit_checkpoint","fit_gate","training_review"))

@@ -22,10 +22,16 @@ def cvae_audio_loss(
     free_bits: float,
     prior_weight: float,
     analytic_consistency_weight: float,
+    mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Conditional VAE objective with an explicitly usable audio-free prior."""
-    posterior_reconstruction = F.smooth_l1_loss(posterior_mel, target_mel)
-    prior_reconstruction = F.smooth_l1_loss(prior_mel, target_mel)
+    def masked_smooth(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        value=F.smooth_l1_loss(left,right,reduction="none")
+        if mask is None:return value.mean()
+        weight=mask.to(value.dtype).unsqueeze(1).expand_as(value)
+        return (value*weight).sum()/weight.sum().clamp_min(1.0)
+    posterior_reconstruction = masked_smooth(posterior_mel, target_mel)
+    prior_reconstruction = masked_smooth(prior_mel, target_mel)
     variance_ratio = torch.exp(posterior_logvar - prior_logvar)
     mean_term = (posterior_mean - prior_mean).square() * torch.exp(-prior_logvar)
     kl_per_dimension = 0.5 * (
@@ -172,6 +178,36 @@ def paired_win_rate(correct: np.ndarray, control: np.ndarray, target: np.ndarray
     correct_error = mfcc_distance(correct, target)
     control_error = mfcc_distance(control, target)
     return float(np.mean(correct_error < control_error))
+
+
+def clip_token_global_losses(eeg_tokens: torch.Tensor, audio_tokens: torch.Tensor, labels: list[str], scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """OpenAI-CLIP-style alignment with the preregistered positive masks.
+
+    Token alignment is strict trial diagonal.  Global alignment may use the
+    same-label multi-positive relation, but it is never used for paired R@1.
+    """
+    if eeg_tokens.shape != audio_tokens.shape:
+        raise ValueError("EEG and audio content token tensors must have equal shape")
+    eeg, audio = F.normalize(eeg_tokens, dim=-1), F.normalize(audio_tokens, dim=-1)
+    multiplier = scale.clamp(max=np.log(100.0)).exp()
+    token_logits = multiplier * torch.einsum("itd,jtd->ij", eeg, audio) / eeg.shape[1]
+    diagonal = torch.arange(len(eeg), device=eeg.device)
+    token = 0.5 * (F.cross_entropy(token_logits, diagonal) + F.cross_entropy(token_logits.T, diagonal))
+    global_logits = multiplier * F.normalize(eeg.mean(1), dim=-1) @ F.normalize(audio.mean(1), dim=-1).T
+    canonical = [str(value).strip().strip("/").lower() for value in labels]
+    positive = torch.tensor([[a == b for b in canonical] for a in canonical], dtype=torch.bool, device=eeg.device)
+    global_ = 0.5 * (_multi_positive(global_logits, positive) + _multi_positive(global_logits.T, positive.T))
+    return token, global_
+
+
+def audio_content_loss(prediction: torch.Tensor, target: torch.Tensor, tokens: torch.Tensor, text_target: torch.Tensor, speaker_logits: torch.Tensor, speaker_target: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+    l1, delta, cosine = mfcc_l1(prediction,target), delta_l1(prediction,target), temporal_cosine_loss(prediction,target)
+    # deterministic text anchor: mean token direction is trained weakly, but
+    # text is never an input to the model or used at inference.
+    text = F.mse_loss(F.normalize(tokens.mean(1),dim=-1),F.normalize(text_target,dim=-1))
+    adversarial = F.cross_entropy(speaker_logits, speaker_target)
+    total=.60*l1+.20*delta+.10*cosine+.05*text+.05*adversarial
+    return total,{'mfcc_l1':float(l1.detach()),'delta_l1':float(delta.detach()),'temporal_cosine':float(cosine.detach()),'text':float(text.detach()),'speaker_adversarial':float(adversarial.detach())}
 
 
 def paired_r_at_1_above_chance(
