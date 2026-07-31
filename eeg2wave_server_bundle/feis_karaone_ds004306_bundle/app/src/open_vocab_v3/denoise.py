@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 from scipy.signal import correlate, resample_poly
+from scipy.signal import istft, stft
 
 from src.open_vocab_0724.audio_features import ActiveSpeechConfig, detect_active_speech
 
@@ -70,10 +71,38 @@ class DeepFilterNetEnhancer:
         self.cfg = cfg
         self.model_identity: dict[str, Any] = {}
         self.processing_rate = int(cfg["denoise"]["processing_sample_rate"])
-        if self.processing_rate != 48_000:
+        self.backend = str(cfg["denoise"].get("backend", "DeterministicSpectralGateV1"))
+        if self.backend.lower() == "deepfilternet3" and self.processing_rate != 48_000:
             raise ValueError("official DeepFilterNet models require a 48 kHz processing rate")
 
+    def _deterministic_spectral_gate(self, waveform: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Conservative, non-pretrained denoiser for explicitly selected WAVs."""
+        value = np.asarray(waveform, dtype=np.float32).reshape(-1)
+        nperseg = min(512, max(64, 2 ** int(np.floor(np.log2(max(len(value) // 8, 64))))))
+        noverlap = int(0.75 * nperseg)
+        _, _, spectrum = stft(value, fs=sample_rate, nperseg=nperseg, noverlap=noverlap, boundary="zeros")
+        magnitude = np.abs(spectrum)
+        frame_energy = np.mean(magnitude, axis=0)
+        cutoff = float(np.quantile(frame_energy, 0.20))
+        noise_frames = magnitude[:, frame_energy <= cutoff]
+        noise = np.median(noise_frames, axis=1, keepdims=True) if noise_frames.size else np.median(magnitude, axis=1, keepdims=True)
+        residual = np.maximum(magnitude - 1.25 * noise, 0.0)
+        mask = np.clip(residual / np.maximum(magnitude, 1.0e-8), 0.15, 1.0)
+        _, enhanced = istft(spectrum * mask, fs=sample_rate, nperseg=nperseg, noverlap=noverlap, input_onesided=True)
+        enhanced = np.asarray(enhanced, dtype=np.float32)
+        if len(enhanced) < len(value):
+            enhanced = np.pad(enhanced, (0, len(value) - len(enhanced)))
+        self.model_identity = {
+            "requested_model": self.backend,
+            "pretrained": False,
+            "algorithm": "STFT soft spectral subtraction, bottom-20% noise estimate",
+        }
+        return enhanced[: len(value)]
+
     def enhance(self, waveform: np.ndarray, sample_rate: int) -> np.ndarray:
+        if self.backend.lower() != "deepfilternet3":
+            value = np.asarray(waveform, dtype=np.float32).reshape(-1)
+            return self._deterministic_spectral_gate(value - float(value.mean()), int(sample_rate))
         try:
             from df import enhance, init_df
         except ImportError as error:
@@ -83,7 +112,7 @@ class DeepFilterNetEnhancer:
         value = np.asarray(waveform, dtype=np.float32).reshape(-1)
         value = value - float(value.mean())
         at_48k = resample_waveform(value, int(sample_rate), self.processing_rate)
-        model_name = str(self.cfg["denoise"].get("backend", "DeepFilterNet3"))
+        model_name = self.backend
         model_base_dir = None if model_name.lower() == "deepfilternet3" else model_name
         initialized = init_df(
             model_base_dir=model_base_dir,

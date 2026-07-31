@@ -284,10 +284,10 @@ def main() -> None:
     args=parse();config_path,cfg=load_config(args.config);seed_everything(int(cfg["training"]["seed"]));device=default_device(args.device)
     records=load_prepared(output_path(config_path,cfg,"prepared_cache"))
     if args.phase=="audio":
-        require_passed_gate(config_path,cfg,"v0_gate",lineage_artifact_keys=("vocoder_manifest",))
+        require_passed_gate(config_path,cfg,"v0_gate",lineage_artifact_keys=("vocoder_manifest","speaker_adaptation_manifest","audio_adaptation_gate"))
         result=train_audio(config_path,cfg,records,device,args)
     elif args.phase=="micro":
-        require_passed_gate(config_path,cfg,"v0_gate",lineage_artifact_keys=("vocoder_manifest",))
+        require_passed_gate(config_path,cfg,"v0_gate",lineage_artifact_keys=("vocoder_manifest","speaker_adaptation_manifest","audio_adaptation_gate"))
         require_passed_gate(config_path,cfg,"v1_gate",lineage_artifact_keys=("audio_checkpoint","v0_gate"))
         require_passed_gate(config_path,cfg,"v2_gate",lineage_artifact_keys=("audio_checkpoint","v1_gate"))
         result=train_micro(config_path,cfg,records,device,args)

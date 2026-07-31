@@ -60,6 +60,18 @@ def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, reco
             "sha256": sha256_file(speaker_manifest),
             "bytes": speaker_manifest.stat().st_size,
         }
+        # Once speaker conditioning is attached, this is the final prepared
+        # cache and must be cryptographically bound to both fine-tuned audio
+        # backbones and their fail-closed adaptation gate.
+        for key in ("vocoder_manifest", "speaker_adaptation_manifest", "audio_adaptation_gate"):
+            artifact = output_path(config_path, cfg, key)
+            if not artifact.is_file():
+                raise RuntimeError(f"v3 adapted audio artifact is missing: {artifact}")
+            supporting_artifacts[key] = {
+                "path": str(artifact),
+                "sha256": sha256_file(artifact),
+                "bytes": artifact.stat().st_size,
+            }
     write_json(
         path,
         {

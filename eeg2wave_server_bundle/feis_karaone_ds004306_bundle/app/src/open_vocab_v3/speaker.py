@@ -14,9 +14,16 @@ from .data import PreparedRecords, _accepted_denoise_paths, _read_waveform, ligh
 
 
 class ECAPAEncoder:
-    """Thin, explicit wrapper around a pinned SpeechBrain ECAPA checkpoint."""
+    """SpeechBrain ECAPA wrapper with an optional KaraOne-adapted backbone."""
 
-    def __init__(self, *, source: str, savedir: Path, device: torch.device):
+    def __init__(
+        self,
+        *,
+        source: str,
+        savedir: Path,
+        device: torch.device,
+        adapted_checkpoint: Path | None = None,
+    ):
         try:
             from speechbrain.inference.speaker import EncoderClassifier
         except ImportError as error:  # pragma: no cover - environment specific
@@ -27,6 +34,25 @@ class ECAPAEncoder:
         self.model = EncoderClassifier.from_hparams(
             source=source, savedir=str(savedir), run_opts={"device": str(device)}
         )
+        self.adapted_checkpoint = adapted_checkpoint
+        if adapted_checkpoint is not None:
+            if not adapted_checkpoint.is_file():
+                raise FileNotFoundError(
+                    f"KaraOne ECAPA adaptation is missing: {adapted_checkpoint}. "
+                    "Run scripts/finetune_open_vocab_v3_audio_models.py first."
+                )
+            payload = torch.load(adapted_checkpoint, map_location="cpu", weights_only=False)
+            if str(payload.get("source")) != str(source):
+                raise ValueError("ECAPA adaptation source does not match the configured pretrained model")
+            states = payload.get("module_state_dicts")
+            if not isinstance(states, dict) or "embedding_model" not in states:
+                raise ValueError("invalid KaraOne ECAPA adaptation checkpoint")
+            for name, state in states.items():
+                if not hasattr(self.model.mods, name):
+                    raise ValueError(f"ECAPA adaptation references missing module {name}")
+                getattr(self.model.mods, name).load_state_dict(state, strict=True)
+        for module in self.model.mods.values():
+            module.eval()
 
     @torch.no_grad()
     def encode(self, waveform: np.ndarray) -> np.ndarray:
@@ -56,7 +82,11 @@ def attach_speaker_embeddings(
     """
     source = str(cfg["speaker"]["model_id"])
     cache_dir = (config_path.parent / cfg["paths"]["speaker_model_root"]).resolve()
-    encoder = ECAPAEncoder(source=source, savedir=cache_dir, device=device)
+    adapted_checkpoint = (config_path.parent / cfg["paths"]["speaker_adapted_checkpoint"]).resolve()
+    encoder = ECAPAEncoder(
+        source=source, savedir=cache_dir, device=device, adapted_checkpoint=adapted_checkpoint
+    )
+    audit_encoder = ECAPAEncoder(source=source, savedir=cache_dir, device=device)
     audio_root = (config_path.parent / cfg["data"]["audio_root"]).resolve()
     manifest = (config_path.parent / cfg["data"]["unified_manifest"]).resolve()
     paths = _audio_paths(manifest)
@@ -69,17 +99,22 @@ def attach_speaker_embeddings(
     keys = records.arrays["sample_keys"].astype(str)
     subjects = records.arrays["subjects"].astype(str)
     embeddings: list[np.ndarray] = []
+    audit_embeddings: list[np.ndarray] = []
     for key in tqdm(keys.tolist(), desc="[v3 prepare] ECAPA audio references", unit="trial", dynamic_ncols=True):
         waveform, rate = _read_waveform(denoised_paths.get(key, audio_root / paths[key]))
         prepared, _ = light_prepare_waveform(waveform, rate, prep_cfg)
-        embeddings.append(encoder.encode(prepared.waveform[: max(1, prepared.valid_samples)]))
+        active_wave = prepared.waveform[: max(1, prepared.valid_samples)]
+        embeddings.append(encoder.encode(active_wave))
+        audit_embeddings.append(audit_encoder.encode(active_wave))
     values = np.stack(embeddings).astype(np.float32)
+    audit_values = np.stack(audit_embeddings).astype(np.float32)
     expected_dimension = int(cfg["speaker"]["embedding_dimension"])
     if values.shape[1] != expected_dimension:
         raise ValueError(
             f"configured ECAPA dimension is {expected_dimension}, but {source} returned {values.shape[1]}"
         )
     reference = np.zeros_like(values)
+    audit_reference = np.zeros_like(audit_values)
     reference_mfcc_mean = np.zeros_like(records.arrays["mfcc_mean"], dtype=np.float32)
     reference_mfcc_std = np.zeros_like(records.arrays["mfcc_std"], dtype=np.float32)
     reference_keys: list[str] = []
@@ -98,6 +133,8 @@ def attach_speaker_embeddings(
         selected = sorted(candidates, key=lambda item: keys[item])[: int(cfg["speaker"]["reference_trials"])]
         vector = values[selected].mean(0)
         reference[index] = vector / max(float(np.linalg.norm(vector)), 1.0e-8)
+        audit_vector = audit_values[selected].mean(0)
+        audit_reference[index] = audit_vector / max(float(np.linalg.norm(audit_vector)), 1.0e-8)
         reference_mfcc_mean[index] = records.arrays["mfcc_mean"][selected].mean(0)
         reference_mfcc_std[index] = records.arrays["mfcc_std"][selected].mean(0)
         reference_keys.append("|".join(keys[selected].tolist()))
@@ -117,6 +154,8 @@ def attach_speaker_embeddings(
     medoid_trials = (subjects == medoid_subject) & fit
     records.arrays["speaker_target_embedding"] = values
     records.arrays["speaker_reference_embedding"] = reference
+    records.arrays["speaker_audit_target_embedding"] = audit_values
+    records.arrays["speaker_audit_reference_embedding"] = audit_reference
     records.arrays["speaker_reference_mfcc_mean"] = reference_mfcc_mean
     records.arrays["speaker_reference_mfcc_std"] = reference_mfcc_std
     records.arrays["speaker_reference_keys"] = np.asarray(reference_keys)
@@ -125,6 +164,9 @@ def attach_speaker_embeddings(
     records.arrays["canonical_mfcc_std"] = records.arrays["mfcc_std"][medoid_trials].mean(0).astype(np.float32)
     return {
         "backend": "speechbrain_ecapa", "model_id": source, "model_cache": str(cache_dir),
+        "conditioning_checkpoint": str(adapted_checkpoint),
+        "conditioning_encoder": "KaraOne-fit-finetuned ECAPA backbone",
+        "audit_encoder": "untouched external ECAPA checkpoint",
         "embedding_dimension": int(values.shape[1]), "reference_trials": int(cfg["speaker"]["reference_trials"]),
         "canonical_voice_policy": "fit_subject_centroid_medoid",
         "canonical_voice_subject": medoid_subject,

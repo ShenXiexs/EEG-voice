@@ -21,7 +21,12 @@ LOG_ROOT="$OUTPUT_ROOT/logs"
 TRAIN_DEVICE="${TRAIN_DEVICE:-auto}"
 EVAL_DEVICE="${EVAL_DEVICE:-cpu}"
 EXPORT_DEVICE="${EXPORT_DEVICE:-cpu}"
-BUDGET_HOURS="${BUDGET_HOURS:-9.5}"
+if [[ -n "${BUDGET_HOURS+x}" ]]; then
+  BUDGET_HOURS_SOURCE="environment"
+else
+  BUDGET_HOURS=20
+  BUDGET_HOURS_SOURCE="v3 default"
+fi
 FRESH="${FRESH:-1}"
 mkdir -p "$LOG_ROOT"
 RUN_LOG="$LOG_ROOT/run_all_v3_$(date +%Y%m%d_%H%M%S).log"
@@ -36,13 +41,13 @@ echo "[v3] python=$PY"
 echo "[v3] config=$CFG"
 echo "[v3] log=$RUN_LOG"
 echo "[v3] train_device=$TRAIN_DEVICE evaluation_device=$EVAL_DEVICE export_device=$EXPORT_DEVICE"
-echo "[v3] total_training_budget_hours=$BUDGET_HOURS"
+echo "[v3] total_training_budget_hours=$BUDGET_HOURS source=$BUDGET_HOURS_SOURCE"
 
-if ! "$PY" -c 'import speechbrain, librosa; import df' >/dev/null 2>&1; then
+if ! "$PY" -c 'import speechbrain, librosa' >/dev/null 2>&1; then
   echo "[v3] missing v3 audio/CVAE/denoise dependencies. Run: ./bootstrap_open_vocab_v3.sh"
   exit 1
 fi
-"$PY" -c 'import importlib.metadata, librosa, numpy, scipy, speechbrain, torch, transformers; print({"speechbrain": speechbrain.__version__, "deepfilternet": importlib.metadata.version("deepfilternet"), "librosa": librosa.__version__, "torch": torch.__version__, "mps": torch.backends.mps.is_available(), "cuda": torch.cuda.is_available(), "transformers": transformers.__version__})'
+"$PY" -c 'import librosa, numpy, scipy, speechbrain, torch, transformers; print({"speechbrain": speechbrain.__version__, "librosa": librosa.__version__, "torch": torch.__version__, "mps": torch.backends.mps.is_available(), "cuda": torch.cuda.is_available(), "transformers": transformers.__version__})'
 
 FRESH_FLAG=()
 PREPARE_FLAG=()
@@ -51,35 +56,41 @@ if [[ "$FRESH" == "1" ]]; then
   PREPARE_FLAG=(--force)
 fi
 
-# 0. Raw audit -> explicit selective denoising -> feature preparation. Source
-# WAVs remain immutable; rejected enhancement never enters the prepared cache.
+# 0. Raw audit -> explicit selective denoising -> audio-only preparation.
+# Source WAVs remain immutable; rejected enhancement never enters the cache.
 "$PY" scripts/audit_open_vocab_v3_audio.py --config "$CFG"
 "$PY" scripts/denoise_open_vocab_v3.py --config "$CFG" --device "$EVAL_DEVICE"
-"$PY" scripts/prepare_open_vocab_v3.py --config "$CFG" --with-speaker --device "$EVAL_DEVICE" "${PREPARE_FLAG[@]}"
+"$PY" scripts/prepare_open_vocab_v3.py --config "$CFG" --device "$EVAL_DEVICE" "${PREPARE_FLAG[@]}"
 "$PY" scripts/download_open_vocab_v3_models.py --config "$CFG"
-"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase v0 --device "$EVAL_DEVICE"
 
-# One absolute deadline begins after audit/model preparation/V0. Audio-oracle,
-# 50-pair, and full-fit optimization therefore share the full 9.5h budget.
-BUDGET_SECONDS="$($PY -c "print(int(float('$BUDGET_HOURS') * 3600))")"
+# One absolute deadline covers external audio-model fine-tuning, the CVAE,
+# 50-pair EEG overfit, and full-fit EEG optimization.
+BUDGET_SECONDS="$("$PY" -c 'import sys; print(int(float(sys.argv[1]) * 3600))' "$BUDGET_HOURS")"
 DEADLINE_EPOCH="$(( $(date +%s) + BUDGET_SECONDS ))"
 
-# 1. Audio-only content/timbre oracles.  No EEG model has been trained yet.
+# 1. Fine-tune all pretrained backbones used inside the generator on eligible
+# fit WAVs.  Then rebuild speaker conditions from the adapted ECAPA copy.  The
+# untouched HuBERT/ECAPA copies remain evaluation-only auditors.
+"$PY" scripts/finetune_open_vocab_v3_audio_models.py --config "$CFG" --scope fit --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" "${FRESH_FLAG[@]}"
+"$PY" scripts/prepare_open_vocab_v3.py --config "$CFG" --with-speaker --device "$EVAL_DEVICE" --force
+"$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase v0 --device "$EVAL_DEVICE"
+
+# 2. Audio-only content/timbre oracles.  No EEG model has been trained yet.
 "$PY" scripts/train_open_vocab_v3.py --config "$CFG" --phase audio --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" "${FRESH_FLAG[@]}"
 "$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase v1 --device "$EVAL_DEVICE"
 "$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase v2 --device "$EVAL_DEVICE"
 
-# 2. Direct 50-pair EEG->MFCC sanity check.  A failed report exits before fit.
+# 3. Direct 50-pair EEG->MFCC sanity check.  A failed report exits before fit.
 "$PY" scripts/train_open_vocab_v3.py --config "$CFG" --phase micro --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" "${FRESH_FLAG[@]}"
 "$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase micro --device "$EVAL_DEVICE"
 "$PY" scripts/export_open_vocab_v3_training_preview.py --config "$CFG" --stage micro --device "$EXPORT_DEVICE" --resume
 
-# 3. Only after the overfit gate passes: full fit, then its training gate.
+# 4. Only after the overfit gate passes: full fit, then its training gate.
 "$PY" scripts/train_open_vocab_v3.py --config "$CFG" --phase fit --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" "${FRESH_FLAG[@]}"
 "$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase fit --device "$EVAL_DEVICE"
 "$PY" scripts/export_open_vocab_v3_training_preview.py --config "$CFG" --stage fit --device "$EXPORT_DEVICE" --resume
 
-# 4. Hard human listening gate. Held-out roles are not loaded or evaluated
+# 5. Hard human listening gate. Held-out roles are not loaded or evaluated
 # until the exact full-fit preview has been approved.
 if ! "$PY" scripts/approve_open_vocab_v3_training_preview.py --config "$CFG" --check; then
   echo "[v3] stopped before validation/test: listen to $OUTPUT_ROOT/pairs/full_fit_preview"
@@ -88,7 +99,7 @@ if ! "$PY" scripts/approve_open_vocab_v3_training_preview.py --config "$CFG" --c
   exit 3
 fi
 
-# 5. These are reports, not extra optimization.  They are unreachable unless
+# 6. These are reports, not extra optimization.  They are unreachable unless
 # all preceding gates pass. CPU avoids the known PyTorch/MPS counterfactual
 # Transformer buffer assertion observed in v0730 evaluation/export.
 "$PY" scripts/evaluate_open_vocab_v3.py --config "$CFG" --phase validation --device "$EVAL_DEVICE"

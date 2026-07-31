@@ -387,6 +387,7 @@ class V3Dataset(Dataset[dict[str, Any]]):
             "role": str(self.records.roles[index]),
             "speaker_reference": value["speaker_reference_embedding"][index] if "speaker_reference_embedding" in value else np.zeros(192, dtype=np.float32),
             "speaker_target": value["speaker_target_embedding"][index] if "speaker_target_embedding" in value else np.zeros(192, dtype=np.float32),
+            "speaker_audit_reference": value["speaker_audit_reference_embedding"][index] if "speaker_audit_reference_embedding" in value else np.zeros(192, dtype=np.float32),
             "canonical_voice": value["canonical_voice"] if "canonical_voice" in value else np.zeros(192, dtype=np.float32),
             "target_mfcc_mean": value["mfcc_mean"][index],
             "target_mfcc_std": value["mfcc_std"][index],
@@ -400,7 +401,7 @@ class V3Dataset(Dataset[dict[str, Any]]):
 def collate(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
     tensors = (
         "eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask",
-        "mfcc", "mel", "mfcc_mask", "activity", "speaker_reference", "speaker_target",
+        "mfcc", "mel", "mfcc_mask", "activity", "speaker_reference", "speaker_target", "speaker_audit_reference",
         "canonical_voice", "target_mfcc_mean", "target_mfcc_std",
         "speaker_reference_mfcc_mean", "speaker_reference_mfcc_std",
         "canonical_mfcc_mean", "canonical_mfcc_std",

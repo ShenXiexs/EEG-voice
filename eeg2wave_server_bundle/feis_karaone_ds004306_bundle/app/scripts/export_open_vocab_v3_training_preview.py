@@ -42,7 +42,7 @@ def main()->None:
         gate=require_passed_gate(config_path,cfg,"micro_gate",lineage_artifact_keys=("micro_checkpoint","v2_gate"));dataset=micro_dataset(records,str(cfg["micro_gate"]["subject"]),int(cfg["micro_gate"]["per_label"]));root_key="micro_preview_root";manifest_key="micro_preview_manifest";lineage_keys=("micro_checkpoint","micro_gate")
     else:
         gate=require_passed_gate(config_path,cfg,"fit_gate",lineage_artifact_keys=("fit_checkpoint","micro_gate"));dataset=selected_fit(records,int(cfg["evaluation"]["training_preview_per_label"]));root_key="fit_preview_root";manifest_key="fit_preview_manifest";lineage_keys=("fit_checkpoint","fit_gate")
-    eeg,_=load_eeg(config_path,cfg,device,stage=args.stage);audio,_=load_audio(config_path,cfg,device);vocoder=SpeechT5PowerDbHiFiGan(output_path(config_path,cfg,"vocoder_root"),device=device)
+    eeg,_=load_eeg(config_path,cfg,device,stage=args.stage);audio,_=load_audio(config_path,cfg,device);vocoder=SpeechT5PowerDbHiFiGan(output_path(config_path,cfg,"vocoder_adapted_root"),device=device)
     destination=output_path(config_path,cfg,root_key);destination.mkdir(parents=True,exist_ok=True);paths=manifest_paths(output_path(config_path,cfg,"unified_manifest"));audio_root=output_path(config_path,cfg,"audio_root");denoised=_accepted_denoise_paths(config_path,cfg)
     gate_keys=list(map(str,gate.get("sample_keys",[])));ranks=list(gate.get("correct",{}).get("paired_rank_per_trial",[]));rank_by_key={key:int(rank) for key,rank in zip(gate_keys,ranks)}
     rows=[];samples=int(cfg["evaluation"]["variational_samples"])

@@ -82,7 +82,7 @@ def main() -> None:
         if not report_path.is_file() or read_json(report_path).get("lineage")!=expected_report_lineage:
             raise RuntimeError(f"refusing pair export: missing or stale report {report_path}")
     records=load_prepared(output_path(config_path,cfg,"prepared_cache"));dataset=V3Dataset(records,("fit",),eligible_only=True)
-    eeg,_=load_eeg(config_path,cfg,device,stage="fit");audio,_=load_audio(config_path,cfg,device);vocoder=SpeechT5PowerDbHiFiGan(output_path(config_path,cfg,"vocoder_root"),device=device)
+    eeg,_=load_eeg(config_path,cfg,device,stage="fit");audio,_=load_audio(config_path,cfg,device);vocoder=SpeechT5PowerDbHiFiGan(output_path(config_path,cfg,"vocoder_adapted_root"),device=device)
     destination=output_path(config_path,cfg,"pair_root");destination.mkdir(parents=True,exist_ok=True)
     paths=manifest_paths(output_path(config_path,cfg,"unified_manifest"));audio_root=output_path(config_path,cfg,"audio_root");denoised=_accepted_denoise_paths(config_path,cfg)
     fit_keys=list(map(str,fit_gate.get("sample_keys",[])));fit_ranks=list(fit_gate.get("correct",{}).get("paired_rank_per_trial",[]))

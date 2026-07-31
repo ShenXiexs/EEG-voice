@@ -23,9 +23,14 @@ paths:
   denoise_root: ../../artifacts/open_vocab_v3_mfcc_training_first/denoise/wav
   denoise_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/denoise/manifest.json
   speaker_model_root: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speechbrain_ecapa
+  speaker_adapted_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speechbrain_ecapa_karaone_fit/adapted_backbone.pt
+  speaker_adaptation_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speechbrain_ecapa_karaone_fit/adaptation_manifest.json
   speaker_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speechbrain_ecapa_manifest.json
   vocoder_root: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speecht5_hifigan
+  vocoder_base_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speecht5_hifigan_base_manifest.json
+  vocoder_adapted_root: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speecht5_hifigan_karaone_fit
   vocoder_manifest: ../../artifacts/open_vocab_v3_mfcc_training_first/models/speecht5_hifigan_manifest.json
+  audio_adaptation_gate: ../../artifacts/open_vocab_v3_mfcc_training_first/gates/A0_audio_domain_adaptation.json
   hubert_root: ../../../feis_subject_aware_bundle/models/hubert-base-ls960
   audio_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/audio_oracle/checkpoints/best.pt
   micro_checkpoint: ../../artifacts/open_vocab_v3_mfcc_training_first/eeg_mfcc/micro_50/checkpoints/best.pt
@@ -74,8 +79,11 @@ audio:
 
 denoise:
   enabled: true
-  backend: DeepFilterNet3
-  processing_sample_rate: 48000
+  # Default branch has no external pretrained parameters. DeepFilterNet may
+  # still be selected manually, but then it is an optional preprocessing-only
+  # audit branch and is never part of the EEG generator.
+  backend: DeterministicSpectralGateV1
+  processing_sample_rate: 16000
   compensate_delay: true
   post_filter: false
   attenuation_limit_db: 18.0
@@ -110,6 +118,24 @@ speaker:
   embedding_dimension: 192
   reference_trials: 3
 
+audio_adaptation:
+  # Scientific/primary path.  The separate transductive runner can use all
+  # eligible WAVs, but its checkpoint is never consumed by held-out reports.
+  primary_scope: fit
+  vocoder_epochs: 6
+  vocoder_batch_size: 2
+  vocoder_lr: 0.00001
+  speaker_epochs: 6
+  speaker_batch_size: 4
+  speaker_lr: 0.00001
+  min_relative_loss_improvement: 0.01
+  min_changed_parameter_fraction: 0.50
+  input_mel_hop_samples: 160
+  waveform_l1_weight: 0.10
+  envelope_weight: 0.10
+  stft_fft_sizes: [512, 1024, 2048]
+  stft_hop_sizes: [128, 256, 512]
+
 teachers:
   hubert_layer: 9
 
@@ -142,7 +168,7 @@ training:
   cvae_free_bits: 0.05
   cvae_prior_reconstruction_weight: 0.35
   cvae_analytic_consistency_weight: 0.05
-  wall_hours: 9.5
+  wall_hours: 20.0
 
 micro_gate:
   subject: "karaone:MM05"

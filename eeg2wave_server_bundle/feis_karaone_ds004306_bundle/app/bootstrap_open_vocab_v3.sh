@@ -13,6 +13,12 @@ fi
 
 cd "$APP_DIR"
 echo "[v3 bootstrap] python=$PY"
-"$PY" -m pip install -r requirements_v3.txt
-"$PY" -c 'import importlib.metadata, librosa, speechbrain, torch, transformers; import df; print({"speechbrain": speechbrain.__version__, "deepfilternet": importlib.metadata.version("deepfilternet"), "librosa": librosa.__version__, "torch": torch.__version__, "transformers": transformers.__version__})'
+# The workstation's configured Tsinghua mirror does not currently expose
+# SpeechBrain 1.0.3.  Pin the v3 extras to official PyPI while retaining that
+# mirror as a fallback for ordinary wheels.
+"$PY" -m pip install --prefer-binary \
+  --index-url https://pypi.org/simple \
+  --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  -r requirements_v3.txt
+"$PY" -c 'import librosa, speechbrain, torch, transformers; print({"speechbrain": speechbrain.__version__, "librosa": librosa.__version__, "torch": torch.__version__, "transformers": transformers.__version__})'
 echo "[v3 bootstrap] complete"

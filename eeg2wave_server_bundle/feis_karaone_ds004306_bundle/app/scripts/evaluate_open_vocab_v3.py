@@ -143,7 +143,10 @@ def bootstrap_scalar_gain(correct: np.ndarray, control: np.ndarray, *, samples: 
 
 
 def _vocoder(config_path: Path, cfg: dict[str, Any], device: torch.device) -> SpeechT5PowerDbHiFiGan:
-    return SpeechT5PowerDbHiFiGan(output_path(config_path, cfg, "vocoder_root"), device=device)
+    gate_path = output_path(config_path, cfg, "audio_adaptation_gate")
+    if not gate_path.is_file() or not read_json(gate_path).get("passed", False):
+        raise RuntimeError("v3 requires a passed KaraOne audio-domain adaptation gate before synthesis")
+    return SpeechT5PowerDbHiFiGan(output_path(config_path, cfg, "vocoder_adapted_root"), device=device)
 
 
 def gate_v0(config_path: Path, cfg: dict[str, Any], records: Any, device: torch.device, limit: int) -> dict[str, Any]:
@@ -176,7 +179,7 @@ def gate_v0(config_path: Path, cfg: dict[str, Any], records: Any, device: torch.
                 "minimum": float(mel_values.min()), "maximum": float(mel_values.max()),
                 "p01": float(np.quantile(mel_values, .01)), "p99": float(np.quantile(mel_values, .99)),
             },
-            "speecht5_input_transform": "power_dB / 10, transpose [B,80,T] -> [B,T,80]",
+            "speecht5_input_transform": "learned KaraOne 10-ms power-dB Mel adapter -> 16-ms SpeechT5 Mel",
             "output_sample_rate": int(cfg["vocoder"]["sample_rate"]),
             "vocoder_manifest": str(manifest),
             "vocoder_manifest_sha256": sha256_file(manifest) if manifest.is_file() else None,
@@ -223,6 +226,8 @@ def gate_v2(config_path: Path, cfg: dict[str, Any], records: Any, device: torch.
         raise RuntimeError("V2 requires a prepared cache with --with-speaker")
     dataset=selected_dataset(records,("fit",),eligible=True,max_per_label=limit or int(cfg["evaluation"]["oracle_per_label"]))
     decoder,_=load_audio(config_path,cfg,device);backend=_vocoder(config_path,cfg,device)
+    # V2 is scored by the untouched external ECAPA auditor.  The adapted
+    # ECAPA copy is used only as the decoder's voice condition.
     encoder=ECAPAEncoder(source=str(cfg["speaker"]["model_id"]),savedir=output_path(config_path,cfg,"speaker_model_root"),device=device)
     teacher=HubertMetric(output_path(config_path,cfg,"hubert_root"),layer=int(cfg["teachers"]["hubert_layer"]),device=device)
     generated_target=[];generated_canonical=[];references=[];rates=[];labels=[];target_embeddings=[];denoised=_accepted_denoise_paths(config_path,cfg)
@@ -230,11 +235,11 @@ def gate_v2(config_path: Path, cfg: dict[str, Any], records: Any, device: torch.
         mel_target=decoder(batch["mfcc"].float(),batch["speaker_reference"].float(),batch["speaker_reference_mfcc_mean"].float(),batch["speaker_reference_mfcc_std"].float()); mel_canonical=decoder(batch["mfcc"].float(),batch["canonical_voice"].float(),batch["canonical_mfcc_mean"].float(),batch["canonical_mfcc_std"].float())
         generated_target.append(pcm16(backend.synthesize(mel_target)[0]));generated_canonical.append(pcm16(backend.synthesize(mel_canonical)[0]))
         key=batch["sample_key"][0];raw_path=output_path(config_path,cfg,"audio_root") / audio_paths(output_path(config_path,cfg,"unified_manifest"))[key];reference,rate=cleaned_reference(denoised.get(key,raw_path),cfg)
-        references.append(reference);rates.append(rate);labels.append(batch["label"][0]);target_embeddings.append(batch["speaker_reference"][0].cpu().numpy())
+        references.append(reference);rates.append(rate);labels.append(batch["label"][0]);target_embeddings.append(batch["speaker_audit_reference"][0].cpu().numpy())
     target_embeddings=np.stack(target_embeddings); predicted=np.stack([encoder.encode(wave) for wave in generated_target]); canonical=np.stack([encoder.encode(wave) for wave in generated_canonical])
     score=np.sum(predicted*target_embeddings,axis=1); swapped=np.sum(canonical*target_embeddings,axis=1)
     fit_selector=(records.roles == "fit") & records.arrays["fit_eligible"].astype(bool)
-    distribution=speaker_distribution(records.arrays["speaker_target_embedding"][fit_selector],records.arrays["subjects"][fit_selector].astype(str).tolist(),records.arrays["labels"][fit_selector].astype(str).tolist(),seed=int(cfg["training"]["seed"]))
+    distribution=speaker_distribution(records.arrays["speaker_audit_target_embedding"][fit_selector],records.arrays["subjects"][fit_selector].astype(str).tolist(),records.arrays["labels"][fit_selector].astype(str).tolist(),seed=int(cfg["training"]["seed"]))
     p90=float(distribution["different_speaker_same_label"]["p90"])
     content_target=hubert_retrieval(generated_target,references,rates,labels,teacher)
     content_canonical=hubert_retrieval(generated_canonical,references,rates,labels,teacher)
@@ -356,11 +361,14 @@ def main() -> None:
     args=parse();config_path,cfg=load_config(args.config);device=default_device(args.device);records=load_prepared(output_path(config_path,cfg,"prepared_cache"))
     for phase in (args.phase,):
         if phase=="v0":
+            adaptation=read_json(output_path(config_path,cfg,"audio_adaptation_gate"))
+            if not adaptation.get("passed",False) or adaptation.get("scope")!="fit" or not adaptation.get("heldout_eeg_claims_allowed",False):
+                raise RuntimeError("v3 primary V0 requires passed fit-only audio adaptation")
             report=gate_v0(config_path,cfg,records,device,args.limit_per_label)
-            report["lineage"]=capture_lineage(config_path,cfg,artifact_keys=("vocoder_manifest",))
+            report["lineage"]=capture_lineage(config_path,cfg,artifact_keys=("vocoder_manifest","speaker_adaptation_manifest","audio_adaptation_gate"))
             save_gate(output_path(config_path,cfg,"v0_gate"),report,args.no_fail)
         elif phase=="v1":
-            require_passed_gate(config_path,cfg,"v0_gate",lineage_artifact_keys=("vocoder_manifest",))
+            require_passed_gate(config_path,cfg,"v0_gate",lineage_artifact_keys=("vocoder_manifest","speaker_adaptation_manifest","audio_adaptation_gate"))
             report=gate_v1(config_path,cfg,records,device,args.limit_per_label)
             report["lineage"]=capture_lineage(config_path,cfg,artifact_keys=("audio_checkpoint","v0_gate"))
             save_gate(output_path(config_path,cfg,"v1_gate"),report,args.no_fail)

@@ -54,8 +54,11 @@ def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
         raise ValueError("v3 conditional variational decoder requires a positive latent dimension")
     if float(cfg["training"].get("canonical_voice_dropout", 0.0)) != 0.0:
         raise ValueError("canonical voice dropout would pair the wrong voice with target Mel and is forbidden")
-    if int(cfg["denoise"]["processing_sample_rate"]) != 48_000:
+    denoiser = str(cfg["denoise"].get("backend", "")).lower()
+    if denoiser == "deepfilternet3" and int(cfg["denoise"]["processing_sample_rate"]) != 48_000:
         raise ValueError("DeepFilterNet v3 must run at its native 48 kHz processing rate")
+    if denoiser != "deepfilternet3" and int(cfg["denoise"]["processing_sample_rate"]) != int(cfg["audio"]["sample_rate"]):
+        raise ValueError("deterministic v3 denoising must preserve the native model sample rate")
     ensure_output_firewall(config_path, cfg)
     return config_path, cfg
 

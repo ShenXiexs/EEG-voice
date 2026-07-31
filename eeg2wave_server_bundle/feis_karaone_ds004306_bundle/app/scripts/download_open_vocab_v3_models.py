@@ -24,7 +24,7 @@ def main() -> None:
         from transformers import SpeechT5HifiGan
         root.parent.mkdir(parents=True, exist_ok=True)
         SpeechT5HifiGan.from_pretrained(cfg["vocoder"]["repo_id"]).save_pretrained(root)
-    write_json(output_path(config_path, cfg, "vocoder_manifest"), model_manifest(root))
+    write_json(output_path(config_path, cfg, "vocoder_base_manifest"), model_manifest(root, adapted=False))
     print(root, flush=True)
 
 

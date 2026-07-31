@@ -1,0 +1,4 @@
+[console_scripts]
+deep-filter-py=df.enhance:run
+deepFilter=df.enhance:run
+
