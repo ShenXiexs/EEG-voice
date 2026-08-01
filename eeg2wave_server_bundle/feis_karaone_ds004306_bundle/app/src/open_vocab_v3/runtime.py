@@ -11,7 +11,20 @@ import numpy as np
 import torch
 import yaml
 
-from . import VERSION
+from . import LEGACY_VERSION, VERSION
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge a short repair config over the immutable v3 baseline config."""
+    result = dict(base)
+    for key, value in override.items():
+        if key == "inherits":
+            continue
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 def resolve_config_path(config_path: str | Path, value: str | Path) -> Path:
@@ -20,8 +33,42 @@ def resolve_config_path(config_path: str | Path, value: str | Path) -> Path:
     return candidate.resolve() if candidate.is_absolute() else (base / candidate).resolve()
 
 
+def content_schema(cfg: dict[str, Any]) -> str:
+    return str(cfg.get("experiment", {}).get("schema", "openvoice-v3-encodec-clip-mfcc-v1"))
+
+
+def checkpoint_schema(cfg: dict[str, Any], component: str) -> str:
+    repair = content_schema(cfg) == "openvoice-v3-content-repair-v2"
+    if repair:
+        values = {
+            "audio": "openvoice-v3-audio-content-v2-repair",
+            "cvae": "openvoice-v3-native-mel-cvae-v2-repair",
+            "micro": "openvoice-v3-eeg-encodec-clip-micro-v2-repair",
+            "fit": "openvoice-v3-eeg-encodec-clip-fit-v2-repair",
+        }
+    else:
+        values = {
+            "audio": "openvoice-v3-audio-content-v1",
+            "cvae": "openvoice-v3-native-mel-cvae-v1",
+            "micro": "openvoice-v3-eeg-encodec-clip-micro-v1",
+            "fit": "openvoice-v3-eeg-encodec-clip-fit-v1",
+        }
+    return values[component]
+
+
 def output_path(config_path: str | Path, cfg: dict[str, Any], key: str) -> Path:
     path = resolve_config_path(config_path, cfg["paths"][key])
+    root_name = str(cfg.get("experiment", {}).get("artifact_root_name", "open_vocab_v3_mfcc_training_first"))
+    # A content-repair config inherits the legacy path map but each writable
+    # artifact must be redirected to its own namespace before any cache/model
+    # lookup.  Immutable source caches never carry the old artifact root name.
+    parts = list(path.parts)
+    if root_name != "open_vocab_v3_mfcc_training_first":
+        try:
+            parts[parts.index("open_vocab_v3_mfcc_training_first")] = root_name
+            path = Path(*parts)
+        except ValueError:
+            pass
     # The exploratory runner must never mix bypassed checkpoints/reports with
     # the fail-closed primary experiment.  Keep the configuration identical so
     # the feature contract is identical, but route every v3-output path to a
@@ -29,19 +76,18 @@ def output_path(config_path: str | Path, cfg: dict[str, Any], key: str) -> Path:
     if os.environ.get("OPEN_VOCAB_V3_EXPLORATION") == "1":
         parts = list(path.parts)
         try:
-            index = parts.index("open_vocab_v3_mfcc_training_first")
+            index = parts.index(root_name)
         except ValueError:
             return path
-        parts[index] = "open_vocab_v3_mfcc_training_first_explore"
+        parts[index] = f"{root_name}_explore"
         return Path(*parts).resolve()
     return path
 
 
 def ensure_output_firewall(config_path: str | Path, cfg: dict[str, Any]) -> None:
     root = output_path(config_path, cfg, "output_root")
-    expected = ("open_vocab_v3_mfcc_training_first_explore"
-                if os.environ.get("OPEN_VOCAB_V3_EXPLORATION") == "1"
-                else "open_vocab_v3_mfcc_training_first")
+    configured = str(cfg.get("experiment", {}).get("artifact_root_name", "open_vocab_v3_mfcc_training_first"))
+    expected = f"{configured}_explore" if os.environ.get("OPEN_VOCAB_V3_EXPLORATION") == "1" else configured
     if root.name != expected:
         raise ValueError(f"v3 output root must end in {expected}, got {root}")
     protected = {"open_vocab_0722", "open_vocab_0724", "open_vocab_0728", "open_vocab_0730"}
@@ -56,7 +102,16 @@ def ensure_output_firewall(config_path: str | Path, cfg: dict[str, Any]) -> None
 def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
     config_path = Path(path).resolve()
     cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    if cfg.get("version") != VERSION:
+    if not isinstance(cfg, dict):
+        raise ValueError(f"invalid YAML mapping: {config_path}")
+    inherited = cfg.get("inherits")
+    if inherited:
+        base_path = resolve_config_path(config_path, str(inherited))
+        base = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+        if not isinstance(base, dict):
+            raise ValueError(f"invalid inherited YAML mapping: {base_path}")
+        cfg = _deep_merge(base, cfg)
+    if cfg.get("version") not in {VERSION, LEGACY_VERSION}:
         raise ValueError(f"unsupported v3 config: {cfg.get('version')!r}")
     if tuple(cfg["split"]["subject_holdout"]) != ("karaone:MM19", "karaone:MM20"):
         raise ValueError("v3 preregisters MM19/MM20 as the subject holdout")

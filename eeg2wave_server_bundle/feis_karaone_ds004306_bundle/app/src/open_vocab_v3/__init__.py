@@ -5,4 +5,5 @@ consume their immutable source cache, but its checkpoints and artifacts have a
 separate schema and output firewall.
 """
 
-VERSION = "openvoice-eeg-v3-encodec-clip-mfcc-v1"
+VERSION = "openvoice-eeg-v3-content-repair-v2"
+LEGACY_VERSION = "openvoice-eeg-v3-encodec-clip-mfcc-v1"

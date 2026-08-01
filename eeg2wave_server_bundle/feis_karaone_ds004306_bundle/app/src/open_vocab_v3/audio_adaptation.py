@@ -183,6 +183,17 @@ def envelope_loss(prediction: torch.Tensor, target: torch.Tensor, frames: int = 
     return F.l1_loss(pred, truth)
 
 
+def si_sdr_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Scale-invariant SDR loss for [B,T] or [B,C,T] generator output."""
+    estimate = _wave_batch(prediction, name="prediction")
+    reference = _wave_batch(target, name="target")[..., :estimate.shape[-1]]
+    estimate = estimate - estimate.mean(-1, keepdim=True)
+    reference = reference - reference.mean(-1, keepdim=True)
+    projection = (estimate * reference).sum(-1, keepdim=True) * reference / reference.square().sum(-1, keepdim=True).clamp_min(1.0e-8)
+    residual = estimate - projection
+    return -10.0 * torch.log10((projection.square().sum(-1) / residual.square().sum(-1).clamp_min(1.0e-8)).clamp_min(1.0e-8)).mean()
+
+
 def file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:

@@ -240,14 +240,133 @@ def clip_token_global_losses(eeg_tokens: torch.Tensor, audio_tokens: torch.Tenso
     return token, global_
 
 
-def audio_content_loss(prediction: torch.Tensor, target: torch.Tensor, tokens: torch.Tensor, text_target: torch.Tensor, speaker_logits: torch.Tensor, speaker_target: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
-    l1, delta, cosine = mfcc_l1(prediction,target), delta_l1(prediction,target), temporal_cosine_loss(prediction,target)
-    # deterministic text anchor: mean token direction is trained weakly, but
-    # text is never an input to the model or used at inference.
-    text = F.mse_loss(F.normalize(tokens.mean(1),dim=-1),F.normalize(text_target,dim=-1))
+def _resize_teacher(hubert: torch.Tensor, mask: torch.Tensor, steps: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if hubert.ndim != 3 or mask.shape != hubert.shape[:2]:
+        raise ValueError("HuBERT teacher must be [B,T,D] with [B,T] mask")
+    value = F.interpolate(hubert.transpose(1, 2), size=steps, mode="linear", align_corners=False).transpose(1, 2)
+    valid = F.interpolate(mask.float().unsqueeze(1), size=steps, mode="nearest").squeeze(1).bool()
+    return value, valid
+
+
+def _vicreg(tokens: torch.Tensor, *, floor: float = 0.5) -> tuple[torch.Tensor, torch.Tensor]:
+    value = tokens.reshape(-1, tokens.shape[-1]) - tokens.reshape(-1, tokens.shape[-1]).mean(0, keepdim=True)
+    variance = F.relu(float(floor) - torch.sqrt(value.var(0, unbiased=False) + 1.0e-4)).mean()
+    covariance = value.T @ value / max(value.shape[0] - 1, 1)
+    covariance = covariance - torch.diag_embed(torch.diagonal(covariance))
+    return variance, covariance.square().mean()
+
+
+def _mfcc_diversity(prediction: torch.Tensor, target: torch.Tensor, labels: list[str]) -> torch.Tensor:
+    penalties=[]
+    for label in sorted(set(labels)):
+        indices=[i for i,item in enumerate(labels) if item==label]
+        if len(indices)<2: continue
+        pred=prediction[indices].flatten(1);truth=target[indices].flatten(1)
+        distance_pred=torch.cdist(pred,pred,p=1)/pred.shape[-1];distance_truth=torch.cdist(truth,truth,p=1)/truth.shape[-1]
+        upper=torch.triu(torch.ones_like(distance_pred,dtype=torch.bool),diagonal=1)
+        penalties.append(F.relu(.5*distance_truth[upper]-distance_pred[upper]).mean())
+    return torch.stack(penalties).mean() if penalties else prediction.new_zeros(())
+
+
+def _same_label_global_contrastive(tokens: torch.Tensor, labels: list[str]) -> torch.Tensor:
+    """Supervised global contrastive term without feeding labels forward.
+
+    Labels define only the loss-positive mask.  Each audio token sequence is
+    still computed solely from EnCodec IDs; this makes the weak content
+    supervision auditable and prevents a label/template input shortcut.
+    """
+    if len(labels) != len(tokens):
+        raise ValueError("labels and content-token batch sizes differ")
+    global_tokens = F.normalize(tokens.mean(1), dim=-1)
+    logits = global_tokens @ global_tokens.T / 0.10
+    canonical = [str(item).strip().strip("/").lower() for item in labels]
+    positive = torch.tensor([[a == b for b in canonical] for a in canonical],
+                            dtype=torch.bool, device=tokens.device)
+    return _multi_positive(logits, positive)
+
+
+def _temporal_teacher_consistency(tokens: torch.Tensor, projected_teacher: torch.Tensor,
+                                  mask: torch.Tensor) -> torch.Tensor:
+    """Match relative token dynamics to frozen HuBERT, not their amplitude."""
+    if tokens.shape[1] < 2:
+        return tokens.new_zeros(())
+    token_delta = F.normalize(tokens[:, 1:] - tokens[:, :-1], dim=-1)
+    teacher_delta = F.normalize(projected_teacher[:, 1:] - projected_teacher[:, :-1], dim=-1)
+    valid = (mask[:, 1:] & mask[:, :-1]).to(tokens.dtype)
+    value = 1.0 - (token_delta * teacher_delta).sum(-1)
+    return (value * valid).sum() / valid.sum().clamp_min(1.0)
+
+
+def audio_content_encoder_loss(tokens: torch.Tensor, hubert: torch.Tensor,
+                               hubert_mask: torch.Tensor,
+                               teacher_projection: torch.nn.Module,
+                               label_logits: torch.Tensor, label_target: torch.Tensor,
+                               speaker_logits: torch.Tensor, speaker_target: torch.Tensor,
+                               labels: list[str], weights: dict[str, float]) -> tuple[torch.Tensor, dict[str, float]]:
+    """Stage 1: optimize EnCodec content tokens without an MFCC decoder.
+
+    Keeping the shared decoder out of this phase matters: otherwise its MFCC
+    reconstruction gradient can make the token space discard HuBERT dynamics
+    and collapse into a per-label acoustic mean before the content probe is
+    ever checked.
+    """
+    teacher, valid = _resize_teacher(hubert, hubert_mask, tokens.shape[1])
+    projected = teacher_projection(teacher)
+    alignment = 1.0 - (F.normalize(tokens, dim=-1) * F.normalize(projected, dim=-1)).sum(-1)
+    teacher_loss = (alignment * valid.to(alignment.dtype)).sum() / valid.sum().clamp_min(1)
+    label = F.cross_entropy(label_logits, label_target)
     adversarial = F.cross_entropy(speaker_logits, speaker_target)
-    total=.60*l1+.20*delta+.10*cosine+.05*text+.05*adversarial
-    return total,{'mfcc_l1':float(l1.detach()),'delta_l1':float(delta.detach()),'temporal_cosine':float(cosine.detach()),'text':float(text.detach()),'speaker_adversarial':float(adversarial.detach())}
+    variance, covariance = _vicreg(tokens)
+    global_contrastive = _same_label_global_contrastive(tokens, labels)
+    temporal_teacher = _temporal_teacher_consistency(tokens, projected, valid)
+    total = (
+        float(weights["hubert"]) * teacher_loss
+        + float(weights["label"]) * label
+        + 0.05 * adversarial
+        + float(weights["variance"]) * variance
+        + float(weights["covariance"]) * covariance
+        + float(weights.get("global_clip", 0.0)) * global_contrastive
+        + float(weights.get("token_consistency", 0.0)) * temporal_teacher
+    )
+    return total, {
+        "hubert_teacher": float(teacher_loss.detach()), "label": float(label.detach()),
+        "speaker_adversarial": float(adversarial.detach()), "variance": float(variance.detach()),
+        "covariance": float(covariance.detach()), "global_contrastive": float(global_contrastive.detach()),
+        "token_teacher_consistency": float(temporal_teacher.detach()),
+    }
+
+
+def shared_mfcc_decoder_loss(prediction: torch.Tensor, target: torch.Tensor,
+                             labels: list[str], weights: dict[str, float]) -> tuple[torch.Tensor, dict[str, float]]:
+    """Stage 2: recover MFCC while the audited audio token encoder is frozen."""
+    l1 = mfcc_l1(prediction, target)
+    delta = delta_l1(prediction, target)
+    cosine = temporal_cosine_loss(prediction, target)
+    # VICReg over coefficient trajectories keeps the decoder from emitting a
+    # single rich but identical MFCC template for all trials in a label.
+    variance, covariance = _vicreg(prediction.transpose(1, 2))
+    diversity = _mfcc_diversity(prediction, target, labels)
+    total = (.60 * l1 + .25 * delta + .15 * cosine
+             + float(weights["variance"]) * variance
+             + float(weights["covariance"]) * covariance
+             + float(weights["diversity"]) * diversity)
+    return total, {
+        "mfcc_l1": float(l1.detach()), "delta_l1": float(delta.detach()),
+        "temporal_cosine": float(cosine.detach()), "variance": float(variance.detach()),
+        "covariance": float(covariance.detach()), "diversity": float(diversity.detach()),
+    }
+
+
+def audio_content_repair_loss(prediction: torch.Tensor, target: torch.Tensor, tokens: torch.Tensor, hubert: torch.Tensor, hubert_mask: torch.Tensor, teacher_projection: torch.nn.Module, label_logits: torch.Tensor, label_target: torch.Tensor, speaker_logits: torch.Tensor, speaker_target: torch.Tensor, labels: list[str], weights: dict[str, float]) -> tuple[torch.Tensor, dict[str, float]]:
+    """Audio-only content objective with frozen HuBERT targets and anti-collapse terms."""
+    l1,delta,cosine=mfcc_l1(prediction,target),delta_l1(prediction,target),temporal_cosine_loss(prediction,target)
+    teacher,valid=_resize_teacher(hubert,hubert_mask,tokens.shape[1]);projected=teacher_projection(teacher)
+    alignment=1.0-(F.normalize(tokens,dim=-1)*F.normalize(projected,dim=-1)).sum(-1);teacher_loss=(alignment*valid.to(alignment.dtype)).sum()/valid.sum().clamp_min(1)
+    label=F.cross_entropy(label_logits,label_target);adversarial=F.cross_entropy(speaker_logits,speaker_target);variance,covariance=_vicreg(tokens);diversity=_mfcc_diversity(prediction,target,labels)
+    global_contrastive=_same_label_global_contrastive(tokens,labels)
+    temporal_teacher=_temporal_teacher_consistency(tokens,projected,valid)
+    total=.50*l1+.20*delta+.05*cosine+float(weights['hubert'])*teacher_loss+float(weights['label'])*label+.05*adversarial+float(weights['variance'])*variance+float(weights['covariance'])*covariance+float(weights['diversity'])*diversity+float(weights.get('global_clip',0.0))*global_contrastive+float(weights.get('token_consistency',0.0))*temporal_teacher
+    return total,{'mfcc_l1':float(l1.detach()),'delta_l1':float(delta.detach()),'temporal_cosine':float(cosine.detach()),'hubert_teacher':float(teacher_loss.detach()),'label':float(label.detach()),'speaker_adversarial':float(adversarial.detach()),'variance':float(variance.detach()),'covariance':float(covariance.detach()),'diversity':float(diversity.detach()),'global_contrastive':float(global_contrastive.detach()),'token_teacher_consistency':float(temporal_teacher.detach())}
 
 
 def paired_r_at_1_above_chance(

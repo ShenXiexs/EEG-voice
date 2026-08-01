@@ -16,13 +16,12 @@ if str(APP) not in sys.path:
 from scripts.train_open_vocab_v3_encodec_clip import (TokenDataset, attach_codes,
     micro_subset, token_collate)
 from src.open_vocab_v3.data import V3Dataset, load_prepared
-from src.open_vocab_v3.encodec_content import SCHEMA
 from src.open_vocab_v3.full_evaluation import (ReferenceAudio, eeg_metrics,
     gate_t0, gate_t0b, gate_t1, gate_t1d, gate_t2_family, hubert_metrics,
     mfcc_prior_wavs, selected)
 from src.open_vocab_v3.hubert import HubertMetric
 from src.open_vocab_v3.metrics import paired_r_at_1_above_chance, same_label_template
-from src.open_vocab_v3.runtime import (capture_lineage, default_device, load_config,
+from src.open_vocab_v3.runtime import (capture_lineage, content_schema, default_device, load_config,
     move_batch, output_path, read_json, require_passed_gate, seed_everything,
     sha256_file, write_json)
 
@@ -44,7 +43,7 @@ def token_batches(dataset, cfg, device):
 
 def save_gate(cp, cfg, key, payload, no_fail, artifacts=(), explore=False):
     payload.update({
-        "schema_version": SCHEMA,
+        "schema_version": content_schema(cfg),
         "config_sha256": sha256_file(cp),
         "lineage": capture_lineage(cp, cfg, artifact_keys=tuple(artifacts)),
         "exploratory_gate_bypass": bool(explore),
@@ -98,7 +97,7 @@ def heldout(cp, cfg, records, device, phase, explore=False):
     metric["checkpoint_sha256"] = sha256_file(output_path(cp, cfg, "fit_checkpoint"))
     report_lineage_keys = ("fit_checkpoint", "fit_gate") if explore else ("fit_checkpoint", "fit_gate", "training_review")
     report = {
-        "schema_version": SCHEMA,
+        "schema_version": content_schema(cfg),
         "phase": phase,
         "n": len(labels),
         "eligible_only": True,
@@ -125,6 +124,9 @@ def main():
     records = load_prepared(output_path(cp, cfg, "prepared_cache"))
     device = default_device(args.device)
     if args.phase == "t0":
+        # Manual invocation must not be able to skip the adaptation lineage
+        # gate that proves encoder/decoder/codebooks all actually moved.
+        require_if_primary(args.explore, cp, cfg, "audio_adaptation_gate")
         save_gate(cp, cfg, "t0_gate", gate_t0(cp, cfg, records, device), args.no_fail, explore=args.explore)
         return
     if args.phase == "t0b":

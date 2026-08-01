@@ -21,8 +21,9 @@ from src.open_vocab_v3.data import channel_shuffled_eeg, time_shuffled_eeg
 from src.open_vocab_v3.denoise import envelope_lag_ms, resample_waveform
 from src.open_vocab_v3.model import AnalyticMFCCToMel, EEGMFCCEncoder, MFCCMelDecoder
 from src.open_vocab_v3.encodec_content import AudioContentEncoder, EEGContentEncoder, SharedMFCCDecoder
-from src.open_vocab_v3.runtime import load_config
+from src.open_vocab_v3.runtime import checkpoint_schema, content_schema, load_config, output_path
 from src.open_vocab_v3.audio_adaptation import envelope_loss, multi_resolution_stft_loss
+from src.open_vocab_v3.metrics import audio_content_repair_loss
 from scripts.train_open_vocab_v3_encodec_clip import TokenDataset, loader
 
 
@@ -124,6 +125,33 @@ def test_v3_config_has_a_new_artifact_firewall_and_fixed_content_contract() -> N
     assert cfg["audio"]["content_tokens"] == 32
     assert cfg["audio"]["native_mel_frames"] == 161
     assert "training_review" in cfg["paths"]
+
+
+def test_content_repair_config_has_new_schema_and_cannot_reuse_v3_artifacts() -> None:
+    config, cfg = load_config(APP / "configs" / "open_vocab_v3_content_repair_v2.yaml")
+    assert content_schema(cfg) == "openvoice-v3-content-repair-v2"
+    assert "open_vocab_v3_content_repair_v2" in str(output_path(config, cfg, "encodec_cache"))
+    assert checkpoint_schema(cfg, "audio").endswith("v2-repair")
+    assert checkpoint_schema(cfg, "fit").endswith("v2-repair")
+
+
+def test_audio_content_repair_loss_uses_teacher_and_anti_collapse_terms() -> None:
+    prediction = torch.randn(4, 40, 256, requires_grad=True)
+    target = torch.randn(4, 40, 256)
+    tokens = torch.randn(4, 32, 16, requires_grad=True)
+    hubert = torch.randn(4, 50, 768)
+    projection = torch.nn.Linear(768, 16)
+    labels = ["a", "a", "b", "b"]
+    loss, parts = audio_content_repair_loss(
+        prediction, target, tokens, hubert, torch.ones(4, 50, dtype=torch.bool), projection,
+        torch.nn.Linear(16, 2)(tokens.mean(1)), torch.tensor([0, 0, 1, 1]),
+        torch.nn.Linear(16, 2)(tokens.mean(1)), torch.tensor([0, 1, 0, 1]), labels,
+        {"hubert": .25, "label": .1, "variance": .15, "covariance": .05, "diversity": .1},
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert {"hubert_teacher", "variance", "covariance", "diversity"} <= set(parts)
+    assert tokens.grad is not None
 
 
 def test_v3_eeg_path_has_no_label_text_or_speaker_forward_input() -> None:

@@ -12,7 +12,7 @@ APP=Path(__file__).resolve().parents[1];sys.path.insert(0,str(APP)) if str(APP) 
 from src.open_vocab_v3.data import V3Dataset,_accepted_denoise_paths,_read_waveform,channel_shuffled_eeg,light_prepare_waveform,time_shuffled_eeg
 from src.open_vocab_0724.audio_features import AudioPreparationConfig
 from src.open_vocab_v3.native_mel import native_speecht5_mel
-from src.open_vocab_v3.runtime import capture_lineage,default_device,load_config,move_batch,output_path,read_json,sha256_file,write_json
+from src.open_vocab_v3.runtime import capture_lineage,checkpoint_schema,content_schema,default_device,load_config,move_batch,output_path,read_json,sha256_file,write_json
 from src.open_vocab_v3.encodec_content import EnCodecGenerator
 from scripts.train_open_vocab_v3_encodec_clip import TokenDataset,attach_codes,micro_subset,modules,load,token_collate
 
@@ -27,7 +27,7 @@ def image(path,rows,title):
 @torch.inference_mode()
 def main():
  a=parse();cp,cfg=load_config(a.config);device=default_device(a.device);print(f'[v3 export] stage={a.stage} device={device} max_pairs={a.max_pairs or "all"}',flush=True);from src.open_vocab_v3.data import load_prepared
- records=load_prepared(output_path(cp,cfg,'prepared_cache'));checkpoint_stage='micro' if a.stage=='micro' else 'fit';base=micro_subset(records,cfg) if a.stage=='micro' else V3Dataset(records,('fit',),eligible_only=True);cache,map_=attach_codes(records,cp,cfg);ds=TokenDataset(base,cache,map_);audio,decoder,eeg=modules(cfg,device);load(output_path(cp,cfg,'audio_content_checkpoint'),'openvoice-v3-audio-content-v1',{'audio':audio,'decoder':decoder},device);load(output_path(cp,cfg,f'{checkpoint_stage}_checkpoint'),f'openvoice-v3-eeg-encodec-clip-{checkpoint_stage}-v1',{'eeg':eeg},device);print(f'[v3 export] loaded content/EEG checkpoints; pairs={len(ds)}',flush=True);from transformers import SpeechT5HifiGan
+ records=load_prepared(output_path(cp,cfg,'prepared_cache'));checkpoint_stage='micro' if a.stage=='micro' else 'fit';base=micro_subset(records,cfg) if a.stage=='micro' else V3Dataset(records,('fit',),eligible_only=True);cache,map_=attach_codes(records,cp,cfg);ds=TokenDataset(base,cache,map_);audio,decoder,eeg=modules(cfg,device);load(output_path(cp,cfg,'audio_content_checkpoint'),checkpoint_schema(cfg,'audio'),{'audio':audio,'decoder':decoder},device);load(output_path(cp,cfg,f'{checkpoint_stage}_checkpoint'),checkpoint_schema(cfg,checkpoint_stage),{'eeg':eeg},device);print(f'[v3 export] loaded content/EEG checkpoints; pairs={len(ds)}',flush=True);from transformers import SpeechT5HifiGan
  if a.stage=='final' and not a.explore:
   review=output_path(cp,cfg,'training_review');expected=capture_lineage(cp,cfg,artifact_keys=('fit_checkpoint','fit_gate','fit_preview_manifest'));payload=read_json(review) if review.is_file() else {}
   if not payload.get('passed',False) or payload.get('lineage')!=expected:raise RuntimeError('final export refused before exact, non-stale training preview approval')
@@ -37,7 +37,7 @@ def main():
  cvae_path=output_path(cp,cfg,'cvae_checkpoint')
  if not cvae_path.is_file():raise RuntimeError('cannot export training WAVs before T2 CVAE checkpoint exists')
  from src.open_vocab_v3.model import NativeSpeechT5MFCCMelCVAE
- cvae=NativeSpeechT5MFCCMelCVAE(mfcc_bins=40,mel_bins=80,dimension=int(cfg['model']['audio_dimension']),voice_dim=int(cfg['speaker']['embedding_dimension']),latent_dim=int(cfg['model']['audio_latent_dimension']),residual_limit_log10=float(cfg['model']['audio_residual_limit_log10'])).to(device);load(cvae_path,'openvoice-v3-native-mel-cvae-v1',{'cvae':cvae},device);cvae.eval();print('[v3 export] loaded MFCC→native-Mel CVAE',flush=True)
+ cvae=NativeSpeechT5MFCCMelCVAE(mfcc_bins=40,mel_bins=80,dimension=int(cfg['model']['audio_dimension']),voice_dim=int(cfg['speaker']['embedding_dimension']),latent_dim=int(cfg['model']['audio_latent_dimension']),residual_limit_log10=float(cfg['model']['audio_residual_limit_log10'])).to(device);load(cvae_path,checkpoint_schema(cfg,'cvae'),{'cvae':cvae},device);cvae.eval();print('[v3 export] loaded MFCC→native-Mel CVAE',flush=True)
  for batch in DataLoader(ds,batch_size=1,shuffle=False,collate_fn=token_collate,num_workers=0):
   b=move_batch(batch,device);key=b['sample_key'][0].replace(':','_');folder=root/key;folder.mkdir(parents=True,exist_ok=True)
   print(f'[v3 export] {len(manifest)+1}/{min(len(ds), a.max_pairs) if a.max_pairs else len(ds)} {b["sample_key"][0]}',flush=True)

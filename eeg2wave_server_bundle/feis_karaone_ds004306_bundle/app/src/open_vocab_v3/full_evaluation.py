@@ -22,7 +22,7 @@ from .metrics import (bootstrap_mean_gain, paired_r_at_1_above_chance,
                       variance_ratio)
 from .model import NativeSpeechT5MFCCMelCVAE
 from .native_mel import CONTRACT, native_speecht5_mel
-from .runtime import (capture_lineage, move_batch, output_path, read_json,
+from .runtime import (capture_lineage, checkpoint_schema, move_batch, output_path, read_json,
                       sha256_file)
 from .speaker import ECAPAEncoder, speaker_distribution
 
@@ -126,7 +126,7 @@ def _cvae(config_path, cfg, device):
         dimension=int(cfg["model"]["audio_dimension"]), voice_dim=int(cfg["speaker"]["embedding_dimension"]),
         latent_dim=int(cfg["model"]["audio_latent_dimension"]),
         residual_limit_log10=float(cfg["model"]["audio_residual_limit_log10"])).to(device)
-    load(output_path(config_path, cfg, "cvae_checkpoint"), "openvoice-v3-native-mel-cvae-v1", {"cvae": model}, device)
+    load(output_path(config_path, cfg, "cvae_checkpoint"), checkpoint_schema(cfg, "cvae"), {"cvae": model}, device)
     return model.eval()
 
 
@@ -166,14 +166,15 @@ def gate_t0b(config_path,cfg,records,device):
 
 def _load_audio_content(config_path,cfg,device):
     from scripts.train_open_vocab_v3_encodec_clip import load,modules
-    audio,decoder,_=modules(cfg,device);load(output_path(config_path,cfg,"audio_content_checkpoint"),"openvoice-v3-audio-content-v1",{"audio":audio,"decoder":decoder},device);return audio.eval(),decoder.eval()
+    audio,decoder,_=modules(cfg,device);load(output_path(config_path,cfg,"audio_content_checkpoint"),checkpoint_schema(cfg,"audio"),{"audio":audio,"decoder":decoder},device);return audio.eval(),decoder.eval()
 
 
 @torch.no_grad()
 def gate_t1(config_path,cfg,records,device,token_dataset,batcher):
-    audio,decoder=_load_audio_content(config_path,cfg,device);pred=[];target=[];labels=[];keys=[]
-    for b in batcher(token_dataset,cfg,device):pred.append(decoder(audio(b["encodec_codes"],b["encodec_mask"])).cpu().numpy());target.append(b["mfcc"].cpu().numpy());labels+=b["label"];keys+=b["sample_key"]
-    p,t=np.concatenate(pred),np.concatenate(target);r=retrieval(p,t,labels,keys);ratio=float(np.mean(abs(p-t))/max(float(np.mean(abs(same_label_template(t,labels)-t))),1e-8));vr=variance_ratio(p,t,labels);g=cfg["gates"]["t1"];return {"gate":"T1","n":len(labels),"metrics":r|{"template_error_ratio":ratio,"variance_ratio":vr},"thresholds":g,"checks":{"label":r["label_top1"]>=g["label_top1_min"],"paired":r["paired_r_at_1"]>=g["paired_r_at_1_min"],"template":ratio<=g["template_ratio_max"],"variance":vr>=g["variance_ratio_min"]}}
+    audio,decoder=_load_audio_content(config_path,cfg,device);pred=[];target=[];tokens=[];labels=[];keys=[]
+    for b in batcher(token_dataset,cfg,device):
+        value=audio(b["encodec_codes"],b["encodec_mask"]);pred.append(decoder(value).cpu().numpy());target.append(b["mfcc"].cpu().numpy());tokens.append(value.cpu().numpy());labels+=b["label"];keys+=b["sample_key"]
+    p,t,z=np.concatenate(pred),np.concatenate(target),np.concatenate(tokens);r=retrieval(p,t,labels,keys);ratio=float(np.mean(abs(p-t))/max(float(np.mean(abs(same_label_template(t,labels)-t))),1e-8));vr=variance_ratio(p,t,labels);singular=np.linalg.svd(z.reshape(-1,z.shape[-1])-z.reshape(-1,z.shape[-1]).mean(0),compute_uv=False);weight=singular/max(singular.sum(),1e-8);rank=float(np.exp(-(weight*np.log(np.maximum(weight,1e-12))).sum()));correlation=float(np.mean((p-p.mean())*(t-t.mean()))/max(float(p.std()*t.std()),1e-8));g=cfg["gates"]["t1"];checks={"label":r["label_top1"]>=g["label_top1_min"],"paired":r["paired_r_at_1"]>=g["paired_r_at_1_min"],"template":ratio<=g["template_ratio_max"],"variance":vr>=g["variance_ratio_min"],"token_effective_rank":rank>=float(g.get("token_effective_rank_min",0.0)),"target_covariance":correlation>=float(g.get("target_covariance_min",-1.0))};return {"gate":"T1","n":len(labels),"metrics":r|{"template_error_ratio":ratio,"variance_ratio":vr,"token_effective_rank":rank,"predicted_target_correlation":correlation},"thresholds":g,"checks":checks}
 
 
 def _cv_nearest_centroid(x: np.ndarray, y: list[str], folds: int = 5) -> float:
@@ -212,8 +213,26 @@ def gate_t2_family(config_path,cfg,records,device,phase):
 @torch.no_grad()
 def eeg_metrics(config_path,cfg,records,device,stage,dataset):
     from scripts.train_open_vocab_v3_encodec_clip import load,modules
-    _,decoder,eeg=modules(cfg,device);load(output_path(config_path,cfg,"audio_content_checkpoint"),"openvoice-v3-audio-content-v1",{"audio":modules(cfg,device)[0],"decoder":decoder},device);load(output_path(config_path,cfg,f"{stage}_checkpoint"),f"openvoice-v3-eeg-encodec-clip-{stage}-v1",{"eeg":eeg},device);pred=[];target=[];labels=[];keys=[];controls={"zero":[],"time":[],"channel":[]}
+    _,decoder,eeg=modules(cfg,device);load(output_path(config_path,cfg,"audio_content_checkpoint"),checkpoint_schema(cfg,"audio"),{"audio":modules(cfg,device)[0],"decoder":decoder},device);load(output_path(config_path,cfg,f"{stage}_checkpoint"),checkpoint_schema(cfg,stage),{"eeg":eeg},device);pred=[];target=[];labels=[];keys=[];subjects=[];controls={"zero":[],"time":[],"channel":[]}
     for b in standard_batches(dataset,cfg,device):
         def run(x):return decoder(eeg(x,b["channel_xyz"].float(),b["channel_mask"],b["time_mask"]))
-        pred.append(run(b["eeg"].float()).cpu().numpy());target.append(b["mfcc"].cpu().numpy());controls["zero"].append(run(torch.zeros_like(b["eeg"])).cpu().numpy());controls["time"].append(run(time_shuffled_eeg(b["eeg"].float(),b["time_mask"])).cpu().numpy());controls["channel"].append(run(channel_shuffled_eeg(b["eeg"].float(),b["channel_mask"])).cpu().numpy());labels+=b["label"];keys+=b["sample_key"]
-    p,t=np.concatenate(pred),np.concatenate(target);control={k:np.concatenate(v) for k,v in controls.items()};r=retrieval(p,t,labels,keys);wins={k:paired_win_rate(p,v,t) for k,v in control.items()};boot={k:bootstrap_mean_gain(p,v,t,samples=int(cfg["evaluation"]["bootstrap_samples"]),seed=int(cfg["training"]["seed"])+i) for i,(k,v) in enumerate(control.items())};return p,t,control,labels,keys,r|{"masked_mfcc_mae":float(np.mean(abs(p-t))),"variance_ratio":variance_ratio(p,t,labels),"control_win_rates":wins,"correct_minus_control_bootstrap":boot}
+        pred.append(run(b["eeg"].float()).cpu().numpy());target.append(b["mfcc"].cpu().numpy());controls["zero"].append(run(torch.zeros_like(b["eeg"])).cpu().numpy());controls["time"].append(run(time_shuffled_eeg(b["eeg"].float(),b["time_mask"])).cpu().numpy());controls["channel"].append(run(channel_shuffled_eeg(b["eeg"].float(),b["channel_mask"])).cpu().numpy());labels+=b["label"];keys+=b["sample_key"];subjects+=b["subject"]
+    p,t=np.concatenate(pred),np.concatenate(target);control={k:np.concatenate(v) for k,v in controls.items()};r=retrieval(p,t,labels,keys);wins={k:paired_win_rate(p,v,t) for k,v in control.items()};boot={k:bootstrap_mean_gain(p,v,t,samples=int(cfg["evaluation"]["bootstrap_samples"]),seed=int(cfg["training"]["seed"])+i) for i,(k,v) in enumerate(control.items())}
+    # Full-fit aggregate scores can hide a single-subject template solution.
+    # Subject is never a forward input; it is retained only as a diagnostic
+    # stratum in the gate report.
+    subject_metrics={}
+    subject_values=np.asarray(subjects)
+    for subject in sorted(set(subjects)):
+        index=np.flatnonzero(subject_values==subject)
+        one_prediction,one_target=p[index],t[index]
+        one_labels=[labels[i] for i in index];one_keys=[keys[i] for i in index]
+        one_retrieval=retrieval(one_prediction,one_target,one_labels,one_keys)
+        subject_metrics[str(subject)]={
+            "n":int(len(index)),"label_top1":one_retrieval["label_top1"],
+            "paired_r_at_1":one_retrieval["paired_r_at_1"],
+            "masked_mfcc_mae":float(np.mean(abs(one_prediction-one_target))),
+            "variance_ratio":variance_ratio(one_prediction,one_target,one_labels),
+            "control_win_rates":{name:paired_win_rate(one_prediction,value[index],one_target) for name,value in control.items()},
+        }
+    return p,t,control,labels,keys,r|{"masked_mfcc_mae":float(np.mean(abs(p-t))),"variance_ratio":variance_ratio(p,t,labels),"control_win_rates":wins,"correct_minus_control_bootstrap":boot,"per_subject":subject_metrics}
