@@ -73,8 +73,8 @@ def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
     if (int(cfg["audio"]["encodec_sample_rate"]), int(cfg["audio"]["encodec_codebooks"]),
             int(cfg["audio"]["encodec_codebook_size"]), int(cfg["audio"]["encodec_steps"])) != (24000, 8, 1024, 192):
         raise ValueError("v3 requires the declared 24kHz/6kbps/8x1024/192 EnCodec contract")
-    if int(cfg["audio"]["content_tokens"]) != 32 or int(cfg["audio"]["native_mel_frames"]) != 160:
-        raise ValueError("v3 requires 32 aligned content tokens and 160 native SpeechT5 Mel frames")
+    if int(cfg["audio"]["content_tokens"]) != 32 or int(cfg["audio"]["native_mel_frames"]) != 161:
+        raise ValueError("v3 requires 32 aligned content tokens and 161 native SpeechT5 Mel frames")
     if str(cfg["vocoder"].get("native_contract")) != "speecht5_native_log_mel_v1":
         raise ValueError("v3 rejects the legacy power-dB/10 SpeechT5 adapter contract")
     if float(cfg["training"].get("canonical_voice_dropout", 0.0)) != 0.0:

@@ -97,7 +97,9 @@ audio:
   encodec_codebook_size: 1024
   encodec_steps: 192
   content_tokens: 32
-  native_mel_frames: 160
+  # SpeechT5's 16-ms-hop extractor emits 161 frames for a 2.56-s / 40,960-
+  # sample segment: the native target length is not the 10-ms acoustic-Mel length.
+  native_mel_frames: 161
   low_contrast_db_threshold: 6.0
   manual_review_sample_keys:
     - "karaone:MM18:94"

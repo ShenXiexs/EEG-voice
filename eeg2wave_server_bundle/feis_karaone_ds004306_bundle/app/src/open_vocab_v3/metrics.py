@@ -118,13 +118,53 @@ def mfcc_distance(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
     return np.mean(np.abs(np.asarray(prediction) - np.asarray(target)), axis=(1, 2))
 
 
+def pairwise_mfcc_l1(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    *,
+    query_chunk: int = 16,
+    target_chunk: int = 64,
+    feature_chunk: int = 2048,
+) -> np.ndarray:
+    """Exact pairwise MFCC L1 without an ``N×N×F×T`` allocation.
+
+    The former broadcast for 1,016 trials materialized roughly 42 GB of
+    float32 differences and was killed by macOS.  This computes the identical
+    mean absolute distance in bounded blocks (about 8 MB with the defaults),
+    retaining only the small ``N×M`` distance matrix.
+    """
+    prediction = np.asarray(predictions, dtype=np.float32)
+    target = np.asarray(targets, dtype=np.float32)
+    if prediction.ndim < 2 or target.ndim < 2:
+        raise ValueError("pairwise MFCC inputs require a batch plus feature dimensions")
+    if prediction.shape[1:] != target.shape[1:]:
+        raise ValueError(f"pairwise MFCC feature shapes differ: {prediction.shape[1:]} != {target.shape[1:]}")
+    left = np.ascontiguousarray(prediction.reshape(len(prediction), -1))
+    right = np.ascontiguousarray(target.reshape(len(target), -1))
+    dimensions = int(left.shape[1])
+    if dimensions == 0:
+        raise ValueError("pairwise MFCC inputs have zero feature dimensions")
+    result = np.empty((len(left), len(right)), dtype=np.float32)
+    for q0 in range(0, len(left), int(query_chunk)):
+        q1 = min(q0 + int(query_chunk), len(left))
+        for t0 in range(0, len(right), int(target_chunk)):
+            t1 = min(t0 + int(target_chunk), len(right))
+            totals = np.zeros((q1 - q0, t1 - t0), dtype=np.float64)
+            for f0 in range(0, dimensions, int(feature_chunk)):
+                f1 = min(f0 + int(feature_chunk), dimensions)
+                difference = np.abs(left[q0:q1, None, f0:f1] - right[None, t0:t1, f0:f1])
+                totals += difference.sum(axis=2, dtype=np.float64)
+            result[q0:q1, t0:t1] = (totals / dimensions).astype(np.float32)
+    return result
+
+
 def retrieval(predictions: np.ndarray, targets: np.ndarray, labels: Iterable[str], keys: Iterable[str]) -> dict[str, object]:
     """Label retrieval plus strict within-label target-trial R@1."""
     prediction = np.asarray(predictions, dtype=np.float32)
     target = np.asarray(targets, dtype=np.float32)
     labels = [str(value).strip().strip("/").lower() for value in labels]
     keys = [str(value) for value in keys]
-    distances = np.mean(np.abs(prediction[:, None] - target[None]), axis=(2, 3))
+    distances = pairwise_mfcc_l1(prediction, target)
     nearest = distances.argmin(1)
     label_top1 = float(np.mean([labels[index] == labels[candidate] for index, candidate in enumerate(nearest)]))
     ranks, hit = [], []
@@ -224,7 +264,7 @@ def paired_r_at_1_above_chance(
     prediction = np.asarray(predictions, dtype=np.float32)
     target = np.asarray(targets, dtype=np.float32)
     canonical = [str(value).strip().strip("/").lower() for value in labels]
-    distances = np.mean(np.abs(prediction[:, None] - target[None]), axis=(2, 3))
+    distances = pairwise_mfcc_l1(prediction, target)
     gains: list[float] = []
     for index, label in enumerate(canonical):
         candidates = np.flatnonzero(np.asarray(canonical) == label)

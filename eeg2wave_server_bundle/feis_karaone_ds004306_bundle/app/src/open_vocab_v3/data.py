@@ -23,7 +23,7 @@ from src.open_vocab_0724.audio_features import (
 
 
 SOURCE_SPLITS = ("train", "validation", "locked_test", "diagnostic")
-PREPARATION_SCHEMA = "openvoice-v3-encodec-clip-mfcc-preparation-v1"
+PREPARATION_SCHEMA = "openvoice-v3-encodec-clip-mfcc-preparation-v2-native-mel-161"
 PAIR_ROLES = (
     "fit",
     "subject_holdout_seen",
@@ -258,13 +258,30 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         mfcc_std.append(utterance_std)
         raw_mel.append(acoustic.log_mel_energy)
         canonical_mel.append(_canonical_mel(acoustic.log_mel_energy, acoustic.activity_mask, acoustic.frame_valid_mask))
+        # Long/manual-review trials must be excluded before the fixed native
+        # SpeechT5-Mel cache shape is imposed.  They remain in the 1,913-row
+        # cache only for split/lineage auditability, never as train targets.
+        pending_manual_review = str(key) in manual_review and str(key) not in denoised_paths
+        eligible = bool(
+            prepared.reconstruction_eligible
+            and prepared.active_duration_seconds <= float(cfg["audio"]["max_active_seconds"])
+            and not pending_manual_review
+        )
         from .native_mel import native_speecht5_mel
         native = native_speecht5_mel(
             torch.from_numpy(prepared.waveform[: max(1, prepared.valid_samples)]).unsqueeze(0), cfg,
         ).squeeze(0).cpu().numpy().astype(np.float32)
         maximum=int(cfg["audio"]["native_mel_frames"])
+        source_native_frames = int(native.shape[-1])
         if native.shape[-1] > maximum:
-            raise RuntimeError(f"official SpeechT5 Mel exceeds {maximum} frames for eligible-length trial {key}")
+            if eligible:
+                raise RuntimeError(
+                    f"official SpeechT5 Mel exceeds {maximum} frames for eligible trial {key}; "
+                    "the audio-length contract is inconsistent"
+                )
+            # Store an audit-only fixed-size view.  Because `eligible` is
+            # false, this cannot silently truncate a fit or primary target.
+            native = _interpolate(native, maximum)
         native_frames=native.shape[-1];native_padded=np.full((native.shape[0],maximum),float(native.min()),dtype=np.float32);native_padded[:,:native_frames]=native
         speech_t5_mel.append(native_padded)
         one_mask=np.zeros(maximum,dtype=bool);one_mask[:native_frames]=True;speech_t5_mask.append(one_mask)
@@ -284,12 +301,6 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
             np.isfinite(contrast_db)
             and contrast_db < float(cfg["audio"]["low_contrast_db_threshold"])
         )
-        pending_manual_review = str(key) in manual_review and str(key) not in denoised_paths
-        eligible = bool(
-            prepared.reconstruction_eligible
-            and prepared.active_duration_seconds <= float(cfg["audio"]["max_active_seconds"])
-            and not pending_manual_review
-        )
         valid_samples.append(prepared.valid_samples)
         active_seconds.append(prepared.active_duration_seconds)
         fit_eligible.append(eligible)
@@ -301,6 +312,8 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
                 "used_accepted_denoising": str(key) in denoised_paths,
                 "label": str(arrays["labels"][index]), "subject": str(arrays["subjects"][index]),
                 "native_sample_rate": native_rate, "valid_samples": int(prepared.valid_samples),
+                "speech_t5_native_frames_raw": source_native_frames,
+                "speech_t5_native_resampled_for_ineligible": bool(source_native_frames > maximum),
                 "dc_removed": True, "dc_offset": dc_offset,
                 "active_duration_seconds": float(prepared.active_duration_seconds),
                 "exceeds_2_56_seconds": bool(prepared.exceeds_max_active_seconds),
@@ -387,6 +400,10 @@ class V3Dataset(Dataset[dict[str, Any]]):
         index = self.indices[item]
         value = self.records.arrays
         return {
+            # Preserve the immutable 1,913-record source identity through any
+            # number of torch.utils.data.Subset wrappers.  Downstream token
+            # caches must key on this value, never on a subset-local position.
+            "source_index": int(index),
             "eeg": value["eeg"][index], "channel_xyz": value["channel_xyz"][index],
             "channel_mask": value["channel_mask"][index], "time_mask": value["time_mask"][index],
             "hubert": value["hubert"][index], "hubert_mask": value["hubert_mask"][index],

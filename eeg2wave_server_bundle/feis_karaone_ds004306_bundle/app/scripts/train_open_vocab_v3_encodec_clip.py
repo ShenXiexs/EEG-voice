@@ -37,12 +37,18 @@ class TokenDataset(Dataset):
  def __init__(self,base,cache,mapping):self.base,self.cache,self.mapping=base,cache,mapping
  def __len__(self):return len(self.base)
  def __getitem__(self,i):
-  out=self.base[i];source=int(self.base.indices[i] if hasattr(self.base,'indices') else self.base.dataset.indices[self.base.indices[i]])
+  out=self.base[i]
+  if 'source_index' not in out:raise RuntimeError('v3 dataset item lacks immutable source_index')
+  source=int(out['source_index'])
   if source not in self.mapping:raise RuntimeError('attempted to access held-out / absent EnCodec token before approval')
   j=self.mapping[source];out['encodec_codes']=self.cache['encodec_codes'][j];out['encodec_mask']=self.cache['encodec_mask'][j];return out
 def token_collate(items):
  out=collate(items);out['encodec_codes']=torch.as_tensor(np.stack([x['encodec_codes'] for x in items])).long();out['encodec_mask']=torch.as_tensor(np.stack([x['encodec_mask'] for x in items])).bool();return out
-def loader(ds,cfg,train):return DataLoader(ds,batch_size=int(cfg['training']['audio_batch_size'] if train else cfg['evaluation']['batch_size']),shuffle=train,collate_fn=token_collate,num_workers=0)
+def loader(ds,cfg,train,kind='audio'):
+ if kind not in {'audio','eeg'}:raise ValueError(f'unknown v3 loader kind: {kind}')
+ batch_key='audio_batch_size' if kind=='audio' else 'eeg_batch_size'
+ batch_size=int(cfg['training'][batch_key] if train else cfg['evaluation']['batch_size'])
+ return DataLoader(ds,batch_size=batch_size,shuffle=train,collate_fn=token_collate,num_workers=0)
 def modules(cfg,device):
  d=int(cfg['model']['content_dimension']);kw=dict(dimension=d,heads=int(cfg['model']['heads']),layers=int(cfg['model']['content_layers']),dropout=float(cfg['model']['dropout']))
  return AudioContentEncoder(codebooks=8,vocabulary=1024,tokens=32,**kw).to(device),SharedMFCCDecoder(dimension=d,token_steps=32,frames=256).to(device),EEGContentEncoder(tokens=32,**kw).to(device)
@@ -55,7 +61,7 @@ def train_audio_content(cp,cfg,records,device,a):
  cache,map_=attach_codes(records,cp,cfg);base=V3Dataset(records,('fit',),eligible_only=True);ds=TokenDataset(base,cache,map_);audio,decoder,_=modules(cfg,device);subjects=sorted(set(records.arrays['subjects'][base.indices].astype(str)));sid={x:i for i,x in enumerate(subjects)};adv=nn.Linear(int(cfg['model']['content_dimension']),len(subjects)).to(device);opt=torch.optim.AdamW(list(audio.parameters())+list(decoder.parameters())+list(adv.parameters()),lr=float(cfg['training']['audio_lr']),weight_decay=float(cfg['training']['weight_decay']));best=math.inf;history=[]
  for epoch in range(int(cfg['training']['audio_content_epochs'])):
   values=[]
-  for step,b in enumerate(loader(ds,cfg,True)):
+  for step,b in enumerate(loader(ds,cfg,True,'audio')):
    if dead(a):break
    b=move_batch(b,device);tokens=audio(b['encodec_codes'],b['encodec_mask']);pred=decoder(tokens);target=b['mfcc'].float();speaker=torch.tensor([sid[x] for x in b['subject']],device=device);loss,parts=audio_content_loss(pred,target,tokens,text_anchor(b['label'],tokens.shape[-1],device),adv(Reverse.apply(tokens.mean(1))),speaker);opt.zero_grad();loss.backward();torch.nn.utils.clip_grad_norm_(list(audio.parameters())+list(decoder.parameters())+list(adv.parameters()),float(cfg['training']['grad_clip']));opt.step();values.append(float(loss.detach()))
    if a.smoke_steps and step+1>=a.smoke_steps:break
@@ -99,7 +105,7 @@ def train_eeg(cp,cfg,records,device,a,phase):
  opt=torch.optim.AdamW(eeg.parameters(),lr=float(cfg['training']['eeg_lr']),weight_decay=float(cfg['training']['weight_decay']));epochs=int(cfg['training']['micro_epochs'] if phase=='micro' else cfg['training']['fit_epochs']);history=[];best=math.inf
  for epoch in range(epochs):
   values=[]
-  for step,b in enumerate(loader(ds,cfg,True)):
+  for step,b in enumerate(loader(ds,cfg,True,'eeg')):
    if dead(a):break
    b=move_batch(b,device);tok=eeg(b['eeg'].float(),b['channel_xyz'].float(),b['channel_mask'],b['time_mask']);pred=decoder(tok);l1=mfcc_l1(pred,b['mfcc'].float());delta=delta_l1(pred,b['mfcc'].float());token,global_=clip_token_global_losses(tok,audio(b['encodec_codes'],b['encodec_mask']).detach(),b['label'],eeg.clip_logit_scale)
    if phase=='micro':loss=.55*l1+.20*delta+.15*token+.10*global_

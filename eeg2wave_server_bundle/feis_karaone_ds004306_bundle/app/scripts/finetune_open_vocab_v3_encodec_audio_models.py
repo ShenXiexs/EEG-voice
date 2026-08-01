@@ -17,7 +17,7 @@ from src.open_vocab_v3.audio_adaptation import parameter_change, tensor_state, s
 from src.open_vocab_v3.data import load_prepared
 from src.open_vocab_v3.encodec_content import _resample
 from src.open_vocab_v3.native_mel import native_speecht5_mel
-from src.open_vocab_v3.runtime import default_device, load_config, output_path, seed_everything, sha256_file, write_json
+from src.open_vocab_v3.runtime import default_device, load_config, output_path, read_json, seed_everything, sha256_file, write_json
 from scripts.finetune_open_vocab_v3_audio_models import AudioDomainDataset, collate as audio_collate, _fit_speaker
 
 def args():
@@ -53,6 +53,18 @@ def fit_encodec(cp,cfg,data,dst,device,a):
  if first is None:raise RuntimeError('EnCodec adaptation performed zero optimizer steps')
  selected=EncodecModel.from_pretrained(str(dst),local_files_only=True);change=parameter_change(before,selected);groups={'encoder':parameter_change(before_encoder,selected.encoder),'quantizer_ema_buffers':buffer_change(before_quantizer,selected.quantizer),'decoder':parameter_change(before_decoder,selected.decoder)}
  return {'component':'Encodec_encoder_quantizer_decoder','base_root':str(base),'adapted_root':str(dst),'all_pretrained_generator_parameters_trainable':all(x.requires_grad for x in model.parameters()),'quantizer_note':'HF EnCodec quantizer has zero Parameters; its EMA codebook state is checked as trainable buffers','component_change':groups,'epochs_completed':len(history),'first_epoch_loss':first,'best_loss':best,'relative_loss_improvement':float((first-best)/max(abs(first),1e-8)),'pretrained_parameter_change':change,'history':history}
+def recover_encodec_for_explore(cp,cfg,dst):
+ """Recover a valid best checkpoint saved before a downstream crash.
+
+ This is deliberately explore-only: loss history was held in memory when the
+ old process died, so improvement is recorded as unverified (0.0) and the A0
+ improvement check remains false rather than being fabricated.
+ """
+ from transformers import EncodecModel
+ base_root=output_path(cp,cfg,'encodec_root');base=EncodecModel.from_pretrained(str(base_root),local_files_only=True);selected=EncodecModel.from_pretrained(str(dst),local_files_only=True)
+ before=tensor_state(base);before_encoder=tensor_state(base.encoder);before_decoder=tensor_state(base.decoder);before_quantizer=buffer_state(base.quantizer)
+ change=parameter_change(before,selected);groups={'encoder':parameter_change(before_encoder,selected.encoder),'quantizer_ema_buffers':buffer_change(before_quantizer,selected.quantizer),'decoder':parameter_change(before_decoder,selected.decoder)}
+ return {'component':'Encodec_encoder_quantizer_decoder','base_root':str(base_root),'adapted_root':str(dst),'all_pretrained_generator_parameters_trainable':all(x.requires_grad for x in selected.parameters()),'quantizer_note':'recovered after downstream crash; quantizer EMA buffers compared with frozen base','component_change':groups,'epochs_completed':None,'first_epoch_loss':None,'best_loss':None,'relative_loss_improvement':0.0,'pretrained_parameter_change':change,'history':[],'recovered_exploratory_checkpoint':True,'improvement_unverified':True}
 def fit_hifigan(cp,cfg,data,dst,device,a):
  from transformers import SpeechT5HifiGan
  base=output_path(cp,cfg,'vocoder_root');model=SpeechT5HifiGan.from_pretrained(str(base),local_files_only=True).to(device)
@@ -78,8 +90,13 @@ def fit_hifigan(cp,cfg,data,dst,device,a):
 def main():
  a=args();cp,cfg=load_config(a.config);seed_everything(int(cfg['training']['seed']));device=default_device(a.device);records=load_prepared(output_path(cp,cfg,'prepared_cache'));indices=selected_audio_indices(records,a.scope);data=AudioDomainDataset(records,indices,config_path=cp,cfg=cfg);p=paths(cp,cfg,a.scope)
  if a.scope=='fit' and any(records.roles[i]!='fit' for i in indices):raise RuntimeError('fit-only audio adaptation attempted held-out WAV access')
- enc=fit_encodec(cp,cfg,data,p['encodec'],device,a);voc=fit_hifigan(cp,cfg,data,p['vocoder'],device,a);spk=_fit_speaker(cp,cfg,data,p['speaker'],device,a)
- write_json(p['encodec_manifest'],enc);write_json(p['vocoder_manifest'],voc);write_json(p['speaker_manifest'],spk)
+ if a.explore and p['encodec_manifest'].is_file() and p['encodec'].is_dir():enc=read_json(p['encodec_manifest']);print('[v3 adaptation] resume completed EnCodec manifest',flush=True)
+ elif a.explore and (p['encodec']/'config.json').is_file() and (p['encodec']/'model.safetensors').is_file():enc=recover_encodec_for_explore(cp,cfg,p['encodec']);write_json(p['encodec_manifest'],enc);print('[v3 adaptation] recovered completed EnCodec checkpoint; improvement remains unverified',flush=True)
+ else:enc=fit_encodec(cp,cfg,data,p['encodec'],device,a);write_json(p['encodec_manifest'],enc)
+ if a.explore and p['vocoder_manifest'].is_file() and p['vocoder'].is_dir():voc=read_json(p['vocoder_manifest']);print('[v3 adaptation] resume completed HiFi-GAN manifest',flush=True)
+ else:voc=fit_hifigan(cp,cfg,data,p['vocoder'],device,a);write_json(p['vocoder_manifest'],voc)
+ if a.explore and p['speaker_manifest'].is_file() and p['speaker'].is_file():spk=read_json(p['speaker_manifest']);print('[v3 adaptation] resume completed ECAPA manifest',flush=True)
+ else:spk=_fit_speaker(cp,cfg,data,p['speaker'],device,a);write_json(p['speaker_manifest'],spk)
  threshold=cfg['audio_adaptation'];checks={'fit_only':a.scope!='fit' or all(records.roles[i]=='fit' for i in indices),'encodec_all_trainable':enc['all_pretrained_generator_parameters_trainable'],'encodec_encoder_changed':enc['component_change']['encoder']['changed_parameter_fraction']>0,'encodec_quantizer_changed':enc['component_change']['quantizer_ema_buffers']['changed_buffer_fraction']>0,'encodec_decoder_changed':enc['component_change']['decoder']['changed_parameter_fraction']>0,'encodec_changed':enc['pretrained_parameter_change']['changed_parameter_fraction']>=float(threshold['min_changed_parameter_fraction']),'encodec_improved':enc['relative_loss_improvement']>=float(threshold['min_relative_loss_improvement']),'hifigan_changed':voc['pretrained_parameter_change']['changed_parameter_fraction']>=float(threshold['min_changed_parameter_fraction']),'hifigan_improved':voc['relative_loss_improvement']>=float(threshold['min_relative_loss_improvement']),'ecapa_changed':spk['pretrained_parameter_change']['changed_parameter_fraction']>=float(threshold['min_changed_parameter_fraction']),'ecapa_improved':spk['relative_loss_improvement']>=float(threshold['min_relative_loss_improvement'])}
  gate={'schema_version':'openvoice-v3-encodec-clip-adaptation-v1','scope':a.scope,'corpus_size':len(indices),'heldout_eeg_claims_allowed':a.scope=='fit','exploratory_gate_bypass':bool(a.explore),'components':{'encodec':enc,'hifigan':voc,'ecapa':spk},'checks':checks,'passed':bool(all(checks.values()))};write_json(p['gate'],gate);print(f"[v3 adaptation] scope={a.scope} n={len(indices)} passed={gate['passed']}",flush=True)
  if not gate['passed'] and not a.explore:raise SystemExit(2)

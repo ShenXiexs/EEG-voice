@@ -24,6 +24,7 @@ EVAL_DEVICE="${EVAL_DEVICE:-cpu}"
 EXPORT_DEVICE="${EXPORT_DEVICE:-cpu}"
 BUDGET_HOURS="${BUDGET_HOURS:-20}"
 FRESH="${FRESH:-1}"
+REUSE_CHECKPOINTS="${REUSE_CHECKPOINTS:-1}"
 
 mkdir -p "$LOG_ROOT"
 RUN_LOG="$LOG_ROOT/run_explore_v3_$(date +%Y%m%d_%H%M%S).log"
@@ -42,6 +43,7 @@ echo "[v3 explore] artifact_root=$OUTPUT_ROOT"
 echo "[v3 explore] log=$RUN_LOG"
 echo "[v3 explore] train_device=$TRAIN_DEVICE evaluation_device=$EVAL_DEVICE export_device=$EXPORT_DEVICE"
 echo "[v3 explore] total_training_budget_hours=$BUDGET_HOURS"
+echo "[v3 explore] reuse_existing_checkpoints=$REUSE_CHECKPOINTS"
 
 if ! "$PY" -c 'import speechbrain, librosa' >/dev/null 2>&1; then
   echo "[v3 explore] missing v3 dependencies. Run: ./bootstrap_open_vocab_v3.sh"
@@ -56,6 +58,16 @@ fi
 BUDGET_SECONDS="$("$PY" -c 'import sys; print(int(float(sys.argv[1]) * 3600))' "$BUDGET_HOURS")"
 DEADLINE_EPOCH="$(( $(date +%s) + BUDGET_SECONDS ))"
 
+train_or_reuse() {
+  local phase="$1"
+  local checkpoint="$2"
+  if [[ "$REUSE_CHECKPOINTS" == "1" && -f "$checkpoint" ]]; then
+    echo "[v3 explore] reusing $phase checkpoint: $checkpoint"
+    return 0
+  fi
+  "$PY" scripts/train_open_vocab_v3_encodec_clip.py --config "$CFG" --phase "$phase" --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" --explore
+}
+
 # A0: audit and generator-path adaptation.  --explore only bypasses a failed
 # numerical A0 threshold; real execution/model errors still stop the run.
 "$PY" scripts/audit_open_vocab_v3_audio.py --config "$CFG"
@@ -69,20 +81,20 @@ DEADLINE_EPOCH="$(( $(date +%s) + BUDGET_SECONDS ))"
 "$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t0 --device "$EVAL_DEVICE" --no-fail --explore
 "$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t0b --device "$EVAL_DEVICE" --no-fail --explore
 "$PY" scripts/build_open_vocab_v3_encodec_cache.py --config "$CFG" --device "$EVAL_DEVICE" --force
-"$PY" scripts/train_open_vocab_v3_encodec_clip.py --config "$CFG" --phase audio_content --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" --explore
+train_or_reuse audio_content "$OUTPUT_ROOT/audio_content_encodec_v1/checkpoints/best.pt"
 "$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t1 --device "$EVAL_DEVICE" --no-fail --explore
 "$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t1d --device "$EVAL_DEVICE" --no-fail --explore
-"$PY" scripts/train_open_vocab_v3_encodec_clip.py --config "$CFG" --phase cvae --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" --explore
+train_or_reuse cvae "$OUTPUT_ROOT/mfcc_native_mel_cvae_v1/checkpoints/best.pt"
 "$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t2 --device "$EVAL_DEVICE" --no-fail --explore
 "$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t2v --device "$EVAL_DEVICE" --no-fail --explore
 "$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase t3 --device "$EVAL_DEVICE" --no-fail --explore
 
 # C/D: train-pair micro and full-fit EEG experiments, then export their WAVs
 # even if they fail their stated engineering gates.
-"$PY" scripts/train_open_vocab_v3_encodec_clip.py --config "$CFG" --phase micro --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" --explore
+train_or_reuse micro "$OUTPUT_ROOT/eeg_encodec_clip_mfcc_v1/micro_50/checkpoints/best.pt"
 "$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase micro --device "$EVAL_DEVICE" --no-fail --explore
 "$PY" scripts/export_open_vocab_v3_encodec_clip_pairs.py --config "$CFG" --stage micro --device "$EXPORT_DEVICE" --resume --explore
-"$PY" scripts/train_open_vocab_v3_encodec_clip.py --config "$CFG" --phase fit --device "$TRAIN_DEVICE" --deadline-epoch "$DEADLINE_EPOCH" --explore
+train_or_reuse fit "$OUTPUT_ROOT/eeg_encodec_clip_mfcc_v1/full_fit/checkpoints/best.pt"
 "$PY" scripts/evaluate_open_vocab_v3_encodec_clip.py --config "$CFG" --phase fit --device "$EVAL_DEVICE" --no-fail --explore
 "$PY" scripts/export_open_vocab_v3_encodec_clip_pairs.py --config "$CFG" --stage fit --device "$EXPORT_DEVICE" --resume --explore
 

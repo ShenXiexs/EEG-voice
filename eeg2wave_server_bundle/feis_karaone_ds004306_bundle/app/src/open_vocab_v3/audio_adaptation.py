@@ -93,6 +93,22 @@ def module_parameter_change(
     }
 
 
+def _wave_batch(value: torch.Tensor, *, name: str) -> torch.Tensor:
+    """Normalize waveform tensors to the 2-D shape accepted by torch.stft.
+
+    Generator APIs are inconsistent here: HiFi-GAN returns ``[B, T]`` while
+    Hugging Face EnCodec returns ``[B, C, T]``.  Treat channels as independent
+    batch entries for mono/multichannel-safe reconstruction losses.
+    """
+    if value.ndim == 1:
+        return value.unsqueeze(0)
+    if value.ndim == 2:
+        return value
+    if value.ndim == 3:
+        return value.reshape(-1, value.shape[-1])
+    raise ValueError(f"{name} waveform must be [T], [B,T], or [B,C,T], got {tuple(value.shape)}")
+
+
 def multi_resolution_stft_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -101,6 +117,13 @@ def multi_resolution_stft_loss(
     hop_sizes: Iterable[int],
 ) -> torch.Tensor:
     """Differentiable spectral loss suitable for generator-only adaptation."""
+    prediction = _wave_batch(prediction, name="prediction")
+    target = _wave_batch(target, name="target")
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"STFT prediction/target shapes must match after channel flattening: "
+            f"{tuple(prediction.shape)} != {tuple(target.shape)}"
+        )
     values = []
     for fft_size, hop_size in zip(fft_sizes, hop_sizes):
         fft_size = int(fft_size)
@@ -122,9 +145,41 @@ def multi_resolution_stft_loss(
     return torch.stack(values).mean()
 
 
+def _segment_mean_pool1d(value: torch.Tensor, frames: int) -> torch.Tensor:
+    """Mean-pool ``[B,T]`` into arbitrary frame counts on CPU/CUDA/MPS.
+
+    PyTorch's MPS adaptive-average-pool currently requires the input length to
+    be divisible by the output length.  Cumulative sums plus integer segment
+    boundaries implement the intended non-overlapping envelope averages for
+    any waveform length while preserving autograd on the original device.
+    """
+    if value.ndim != 2:
+        raise ValueError(f"segment mean pool expects [B,T], got {tuple(value.shape)}")
+    frames = int(frames)
+    length = int(value.shape[-1])
+    if frames <= 0 or length < frames:
+        raise ValueError(f"envelope frames must satisfy 0 < frames <= samples, got {frames} and {length}")
+    edges = torch.div(
+        torch.arange(frames + 1, device=value.device, dtype=torch.long) * length,
+        frames,
+        rounding_mode="floor",
+    )
+    integral = F.pad(torch.cumsum(value, dim=-1), (1, 0))
+    totals = integral.index_select(-1, edges[1:]) - integral.index_select(-1, edges[:-1])
+    widths = (edges[1:] - edges[:-1]).to(dtype=value.dtype).clamp_min(1)
+    return totals / widths.unsqueeze(0)
+
+
 def envelope_loss(prediction: torch.Tensor, target: torch.Tensor, frames: int = 160) -> torch.Tensor:
-    pred = F.adaptive_avg_pool1d(prediction.abs().unsqueeze(1), int(frames)).squeeze(1)
-    truth = F.adaptive_avg_pool1d(target.abs().unsqueeze(1), int(frames)).squeeze(1)
+    prediction = _wave_batch(prediction, name="prediction")
+    target = _wave_batch(target, name="target")
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"envelope prediction/target shapes must match after channel flattening: "
+            f"{tuple(prediction.shape)} != {tuple(target.shape)}"
+        )
+    pred = _segment_mean_pool1d(prediction.abs(), int(frames))
+    truth = _segment_mean_pool1d(target.abs(), int(frames))
     return F.l1_loss(pred, truth)
 
 
@@ -134,4 +189,3 @@ def file_sha256(path: str | Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-

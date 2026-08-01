@@ -13,6 +13,7 @@ from src.open_vocab_v3.metrics import (
     fit_loss,
     overfit_loss,
     paired_r_at_1_above_chance,
+    pairwise_mfcc_l1,
     retrieval,
     variance_ratio,
 )
@@ -21,6 +22,86 @@ from src.open_vocab_v3.denoise import envelope_lag_ms, resample_waveform
 from src.open_vocab_v3.model import AnalyticMFCCToMel, EEGMFCCEncoder, MFCCMelDecoder
 from src.open_vocab_v3.encodec_content import AudioContentEncoder, EEGContentEncoder, SharedMFCCDecoder
 from src.open_vocab_v3.runtime import load_config
+from src.open_vocab_v3.audio_adaptation import envelope_loss, multi_resolution_stft_loss
+from scripts.train_open_vocab_v3_encodec_clip import TokenDataset, loader
+
+
+class _SourceIndexedDataset(torch.utils.data.Dataset):
+    def __init__(self):
+        self.source_indices = (101, 205, 309)
+
+    def __len__(self):
+        return len(self.source_indices)
+
+    def __getitem__(self, index):
+        return {"source_index": self.source_indices[index], "value": index}
+
+
+def test_token_dataset_uses_immutable_source_index_through_nested_subset():
+    base = _SourceIndexedDataset()
+    nested = torch.utils.data.Subset(torch.utils.data.Subset(base, [2, 0]), [1])
+    cache = {
+        "encodec_codes": np.asarray([[[7]]], dtype=np.int16),
+        "encodec_mask": np.asarray([[True]], dtype=bool),
+    }
+    item = TokenDataset(nested, cache, {101: 0})[0]
+    assert item["source_index"] == 101
+    assert int(item["encodec_codes"][0, 0]) == 7
+
+
+def test_eeg_loader_uses_eeg_batch_size_not_audio_batch_size():
+    class _TokenReady(torch.utils.data.Dataset):
+        def __len__(self):
+            return 20
+
+        def __getitem__(self, index):
+            return {
+                "eeg": np.zeros((2, 8), np.float32), "channel_xyz": np.zeros((2, 3), np.float32),
+                "channel_mask": np.ones(2, bool), "time_mask": np.ones(8, bool),
+                "hubert": np.zeros((2, 2), np.float32), "hubert_mask": np.ones(2, bool),
+                "mfcc": np.zeros((40, 256), np.float32), "mel": np.zeros((80, 256), np.float32),
+                "speech_t5_mel": np.zeros((80, 161), np.float32), "speech_t5_mel_mask": np.ones(161, bool),
+                "mfcc_mask": np.ones(256, bool), "activity": np.ones(256, bool),
+                "speaker_reference": np.zeros(192, np.float32), "speaker_target": np.zeros(192, np.float32),
+                "speaker_audit_reference": np.zeros(192, np.float32),
+                "canonical_voice": np.zeros(192, np.float32), "canonical_mfcc_mean": np.zeros(40, np.float32),
+                "canonical_mfcc_std": np.ones(40, np.float32), "speaker_reference_mfcc_mean": np.zeros(40, np.float32),
+                "speaker_reference_mfcc_std": np.ones(40, np.float32),
+                "target_mfcc_mean": np.zeros(40, np.float32), "target_mfcc_std": np.ones(40, np.float32),
+                "sample_key": str(index), "audio_key": str(index), "label": "x", "subject": "s", "role": "fit",
+                "encodec_codes": np.zeros((8, 192), np.int64), "encodec_mask": np.ones(192, bool),
+            }
+
+    cfg = {"training": {"audio_batch_size": 16, "eeg_batch_size": 10}, "evaluation": {"batch_size": 8}}
+    assert len(next(iter(loader(_TokenReady(), cfg, True, "eeg")))["label"]) == 10
+
+
+def test_audio_adaptation_losses_accept_encodec_bct_and_backpropagate():
+    # 2051 is deliberately not divisible by the 64 envelope frames.  This is
+    # the MPS case that adaptive_avg_pool1d cannot execute.
+    prediction = torch.randn(2, 1, 2051, requires_grad=True)
+    target = torch.randn(2, 1, 2051)
+    spectral = multi_resolution_stft_loss(
+        prediction, target, fft_sizes=(256, 512), hop_sizes=(64, 128)
+    )
+    envelope = envelope_loss(prediction, target, frames=64)
+    loss = spectral + envelope
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert prediction.grad is not None
+    assert torch.isfinite(prediction.grad).all()
+
+
+def test_chunked_pairwise_mfcc_l1_matches_exact_broadcast():
+    rng = np.random.default_rng(13)
+    prediction = rng.normal(size=(7, 4, 19)).astype(np.float32)
+    target = rng.normal(size=(9, 4, 19)).astype(np.float32)
+    expected = np.mean(np.abs(prediction[:, None] - target[None]), axis=(2, 3))
+    actual = pairwise_mfcc_l1(
+        prediction, target, query_chunk=3, target_chunk=4, feature_chunk=11
+    )
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 APP = Path(__file__).resolve().parents[1]
@@ -41,6 +122,7 @@ def test_v3_config_has_a_new_artifact_firewall_and_fixed_content_contract() -> N
     assert cfg["denoise"]["processing_sample_rate"] == 16000
     assert cfg["audio"]["encodec_codebooks"] == 8
     assert cfg["audio"]["content_tokens"] == 32
+    assert cfg["audio"]["native_mel_frames"] == 161
     assert "training_review" in cfg["paths"]
 
 

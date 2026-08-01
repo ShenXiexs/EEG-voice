@@ -83,7 +83,10 @@ def heldout(cp, cfg, records, device, phase, explore=False):
     if not explore and (not review_payload.get("passed", False) or review_payload.get("lineage") != expected):
         raise RuntimeError("held-out access refused before exact, non-stale training-WAV approval")
     roles = {"validation": ("subject_holdout_seen",), "locked": ("locked_test_seen_label",), "locked_unseen": ("locked_test_unseen_label",)}[phase]
-    dataset = selected(records, roles, eligible=False)
+    # The fixed-duration MFCC/Mel protocol excludes overlong/manual-review
+    # audio from every primary role, not only from fit.  This prevents an
+    # audit-only resampled cache row from entering a held-out metric.
+    dataset = selected(records, roles, eligible=True)
     prediction, target, controls, labels, keys, metric = eeg_metrics(cp, cfg, records, device, "fit", dataset)
     references = [ReferenceAudio(cp, cfg)(key) for key in keys]
     teacher = HubertMetric(output_path(cp, cfg, "hubert_root"), layer=int(cfg["teachers"]["hubert_layer"]), device=device)
@@ -98,6 +101,7 @@ def heldout(cp, cfg, records, device, phase, explore=False):
         "schema_version": SCHEMA,
         "phase": phase,
         "n": len(labels),
+        "eligible_only": True,
         "metrics": metric,
         "human_review_sha256": sha256_file(review) if review.is_file() else None,
         "human_review_bypassed": bool(explore),
