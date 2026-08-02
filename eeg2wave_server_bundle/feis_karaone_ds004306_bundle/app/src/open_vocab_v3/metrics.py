@@ -257,12 +257,22 @@ def _vicreg(tokens: torch.Tensor, *, floor: float = 0.5) -> tuple[torch.Tensor, 
 
 
 def _mfcc_diversity(prediction: torch.Tensor, target: torch.Tensor, labels: list[str]) -> torch.Tensor:
+    def pairwise_mean_l1(values: torch.Tensor) -> torch.Tensor:
+        """Small in-batch L1 matrix without ``torch.cdist``.
+
+        MPS implements the forward path for ``cdist`` but not
+        ``aten::_cdist_backward``.  Label groups are bounded by the training
+        batch size, so this explicit [K,K,F] difference is compact and has a
+        fully supported MPS backward graph.
+        """
+        return (values[:, None, :] - values[None, :, :]).abs().mean(-1)
+
     penalties=[]
     for label in sorted(set(labels)):
         indices=[i for i,item in enumerate(labels) if item==label]
         if len(indices)<2: continue
         pred=prediction[indices].flatten(1);truth=target[indices].flatten(1)
-        distance_pred=torch.cdist(pred,pred,p=1)/pred.shape[-1];distance_truth=torch.cdist(truth,truth,p=1)/truth.shape[-1]
+        distance_pred=pairwise_mean_l1(pred);distance_truth=pairwise_mean_l1(truth)
         upper=torch.triu(torch.ones_like(distance_pred,dtype=torch.bool),diagonal=1)
         penalties.append(F.relu(.5*distance_truth[upper]-distance_pred[upper]).mean())
     return torch.stack(penalties).mean() if penalties else prediction.new_zeros(())

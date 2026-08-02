@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from src.open_vocab_0724.audio_features import AudioPreparationConfig
 
 from .data import PreparedRecords, _accepted_denoise_paths, _read_waveform, light_prepare_waveform
+from .runtime import output_path
 
 
 class ECAPAEncoder:
@@ -39,7 +40,7 @@ class ECAPAEncoder:
             if not adapted_checkpoint.is_file():
                 raise FileNotFoundError(
                     f"KaraOne ECAPA adaptation is missing: {adapted_checkpoint}. "
-                    "Run scripts/finetune_open_vocab_v3_audio_models.py first."
+                    "Run the configured v3 audio-adaptation stage first."
                 )
             payload = torch.load(adapted_checkpoint, map_location="cpu", weights_only=False)
             if str(payload.get("source")) != str(source):
@@ -81,8 +82,13 @@ def attach_speaker_embeddings(
     path always uses the cached canonical voice, never a target-subject voice.
     """
     source = str(cfg["speaker"]["model_id"])
-    cache_dir = (config_path.parent / cfg["paths"]["speaker_model_root"]).resolve()
-    adapted_checkpoint = (config_path.parent / cfg["paths"]["speaker_adapted_checkpoint"]).resolve()
+    # These are experiment artifacts, so they must pass through output_path.
+    # In explore mode it redirects both paths into the isolated ``_explore``
+    # namespace.  Resolving cfg["paths"] directly here previously made prepare
+    # look for the primary checkpoint after adaptation had correctly written
+    # the exploratory one.
+    cache_dir = output_path(config_path, cfg, "speaker_model_root")
+    adapted_checkpoint = output_path(config_path, cfg, "speaker_adapted_checkpoint")
     encoder = ECAPAEncoder(
         source=source, savedir=cache_dir, device=device, adapted_checkpoint=adapted_checkpoint
     )

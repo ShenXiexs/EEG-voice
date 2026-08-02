@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from pathlib import Path
 
 import numpy as np
@@ -133,6 +134,22 @@ def test_content_repair_config_has_new_schema_and_cannot_reuse_v3_artifacts() ->
     assert "open_vocab_v3_content_repair_v2" in str(output_path(config, cfg, "encodec_cache"))
     assert checkpoint_schema(cfg, "audio").endswith("v2-repair")
     assert checkpoint_schema(cfg, "fit").endswith("v2-repair")
+
+
+def test_content_repair_explore_redirects_speaker_checkpoint_with_other_artifacts() -> None:
+    config, cfg = load_config(APP / "configs" / "open_vocab_v3_content_repair_v2.yaml")
+    previous = os.environ.get("OPEN_VOCAB_V3_EXPLORATION")
+    os.environ["OPEN_VOCAB_V3_EXPLORATION"] = "1"
+    try:
+        speaker = output_path(config, cfg, "speaker_adapted_checkpoint")
+        prepared = output_path(config, cfg, "prepared_cache")
+    finally:
+        if previous is None:
+            os.environ.pop("OPEN_VOCAB_V3_EXPLORATION", None)
+        else:
+            os.environ["OPEN_VOCAB_V3_EXPLORATION"] = previous
+    assert "open_vocab_v3_content_repair_v2_explore" in str(speaker)
+    assert "open_vocab_v3_content_repair_v2_explore" in str(prepared)
 
 
 def test_audio_content_repair_loss_uses_teacher_and_anti_collapse_terms() -> None:
