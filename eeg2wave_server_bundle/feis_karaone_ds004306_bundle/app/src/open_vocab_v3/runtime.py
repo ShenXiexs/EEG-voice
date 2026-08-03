@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import yaml
 
-from . import LEGACY_VERSION, VERSION
+from . import CP_TEMPORAL_VERSION, LEGACY_VERSION, VERSION
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -38,6 +38,19 @@ def content_schema(cfg: dict[str, Any]) -> str:
 
 
 def checkpoint_schema(cfg: dict[str, Any], component: str) -> str:
+    if content_schema(cfg) == "openvoice-v3-cp-temporal-large-v1":
+        values = {
+            "oracle": "openvoice-v3-cp-temporal-oracle-v1",
+            "prosody": "openvoice-v3-cp-temporal-prosody-v1",
+            "content": "openvoice-v3-cp-temporal-content-v1",
+            "cvae": "openvoice-v3-cp-temporal-residual-cvae-v1",
+            "micro": "openvoice-v3-cp-temporal-eeg-micro-v1",
+            "fit": "openvoice-v3-cp-temporal-eeg-fit-v1",
+            "eeg_prosody": "openvoice-v3-cp-temporal-eeg-prosody-v1",
+        }
+        if component not in values:
+            raise KeyError(f"unknown CP-temporal checkpoint component: {component}")
+        return values[component]
     repair = content_schema(cfg) == "openvoice-v3-content-repair-v2"
     if repair:
         values = {
@@ -111,14 +124,16 @@ def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
         if not isinstance(base, dict):
             raise ValueError(f"invalid inherited YAML mapping: {base_path}")
         cfg = _deep_merge(base, cfg)
-    if cfg.get("version") not in {VERSION, LEGACY_VERSION}:
+    if cfg.get("version") not in {VERSION, LEGACY_VERSION, CP_TEMPORAL_VERSION}:
         raise ValueError(f"unsupported v3 config: {cfg.get('version')!r}")
     if tuple(cfg["split"]["subject_holdout"]) != ("karaone:MM19", "karaone:MM20"):
         raise ValueError("v3 preregisters MM19/MM20 as the subject holdout")
     if str(cfg["split"]["unseen_label"]).strip().lower() != "pot":
         raise ValueError("v3 preregisters pot as the unseen label")
-    if int(cfg["audio"]["canonical_frames"]) != 256:
-        raise ValueError("v3 content gate requires exactly 256 canonical MFCC frames")
+    cp_temporal = cfg.get("version") == CP_TEMPORAL_VERSION
+    expected_frames = 161 if cp_temporal else 256
+    if int(cfg["audio"]["canonical_frames"]) != expected_frames:
+        raise ValueError(f"v3 content gate requires exactly {expected_frames} canonical MFCC frames")
     if int(cfg["audio"]["mfcc_bins"]) != 40:
         raise ValueError("v3 content gate requires exactly 40 MFCC coefficients")
     if int(cfg["model"]["audio_latent_dimension"]) <= 0:
@@ -128,8 +143,9 @@ def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
     if (int(cfg["audio"]["encodec_sample_rate"]), int(cfg["audio"]["encodec_codebooks"]),
             int(cfg["audio"]["encodec_codebook_size"]), int(cfg["audio"]["encodec_steps"])) != (24000, 8, 1024, 192):
         raise ValueError("v3 requires the declared 24kHz/6kbps/8x1024/192 EnCodec contract")
-    if int(cfg["audio"]["content_tokens"]) != 32 or int(cfg["audio"]["native_mel_frames"]) != 161:
-        raise ValueError("v3 requires 32 aligned content tokens and 161 native SpeechT5 Mel frames")
+    expected_tokens = 96 if cp_temporal else 32
+    if int(cfg["audio"]["content_tokens"]) != expected_tokens or int(cfg["audio"]["native_mel_frames"]) != 161:
+        raise ValueError(f"v3 requires {expected_tokens} aligned content tokens and 161 native SpeechT5 Mel frames")
     if str(cfg["vocoder"].get("native_contract")) != "speecht5_native_log_mel_v1":
         raise ValueError("v3 rejects the legacy power-dB/10 SpeechT5 adapter contract")
     if float(cfg["training"].get("canonical_voice_dropout", 0.0)) != 0.0:

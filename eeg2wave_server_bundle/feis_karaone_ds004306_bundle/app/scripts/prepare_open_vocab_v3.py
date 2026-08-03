@@ -63,7 +63,11 @@ def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, reco
         # Once speaker conditioning is attached, this is the final prepared
         # cache and must be cryptographically bound to both fine-tuned audio
         # backbones and their fail-closed adaptation gate.
-        for key in ("encodec_manifest", "vocoder_manifest", "speaker_adaptation_manifest", "audio_adaptation_gate"):
+        dependencies = (
+            () if str(cfg.get("experiment", {}).get("schema", "")) == "openvoice-v3-cp-temporal-large-v1"
+            else ("encodec_manifest", "vocoder_manifest", "speaker_adaptation_manifest", "audio_adaptation_gate")
+        )
+        for key in dependencies:
             artifact = output_path(config_path, cfg, key)
             if not artifact.is_file():
                 raise RuntimeError(f"v3 adapted audio artifact is missing: {artifact}")
@@ -76,7 +80,7 @@ def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, reco
         path,
         {
             "schema_version": "openvoice-v3-prepared-manifest-v1",
-            "preparation_schema": PREPARATION_SCHEMA,
+            "preparation_schema": str(records.arrays["v3_preparation_schema"].item()),
             "prepared_cache": str(cache_path),
             "config": str(config_path),
             "config_sha256": sha256_file(config_path),

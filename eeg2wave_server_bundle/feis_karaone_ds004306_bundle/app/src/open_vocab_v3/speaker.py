@@ -88,11 +88,12 @@ def attach_speaker_embeddings(
     # look for the primary checkpoint after adaptation had correctly written
     # the exploratory one.
     cache_dir = output_path(config_path, cfg, "speaker_model_root")
-    adapted_checkpoint = output_path(config_path, cfg, "speaker_adapted_checkpoint")
+    use_adapted = str(cfg.get("speaker", {}).get("conditioning", "adapted")).lower() == "adapted"
+    adapted_checkpoint = output_path(config_path, cfg, "speaker_adapted_checkpoint") if use_adapted else None
     encoder = ECAPAEncoder(
         source=source, savedir=cache_dir, device=device, adapted_checkpoint=adapted_checkpoint
     )
-    audit_encoder = ECAPAEncoder(source=source, savedir=cache_dir, device=device)
+    audit_encoder = ECAPAEncoder(source=source, savedir=cache_dir, device=device) if use_adapted else encoder
     audio_root = (config_path.parent / cfg["data"]["audio_root"]).resolve()
     manifest = (config_path.parent / cfg["data"]["unified_manifest"]).resolve()
     paths = _audio_paths(manifest)
@@ -104,17 +105,29 @@ def attach_speaker_embeddings(
     )
     keys = records.arrays["sample_keys"].astype(str)
     subjects = records.arrays["subjects"].astype(str)
+    cp_temporal = str(cfg.get("version", "")) == "openvoice-v3-cp-temporal-large-v1"
+    fit = (records.roles == "fit") & records.arrays["fit_eligible"].astype(bool)
+    if cp_temporal and "fit_internal_dev" in records.arrays:
+        fit &= ~records.arrays["fit_internal_dev"].astype(bool)
+    expected_dimension = int(cfg["speaker"]["embedding_dimension"])
     embeddings: list[np.ndarray] = []
     audit_embeddings: list[np.ndarray] = []
-    for key in tqdm(keys.tolist(), desc="[v3 prepare] ECAPA audio references", unit="trial", dynamic_ncols=True):
+    for index, key in enumerate(tqdm(keys.tolist(), desc="[v3 prepare] ECAPA audio references", unit="trial", dynamic_ncols=True)):
+        # CP-temporal primary synthesis uses a fit-only canonical voice. Do not
+        # run the generation-side speaker model over held-out WAVs before the
+        # listening gate merely to populate unused target-speaker fields.
+        if cp_temporal and not fit[index]:
+            embeddings.append(np.zeros(expected_dimension, dtype=np.float32))
+            audit_embeddings.append(np.zeros(expected_dimension, dtype=np.float32))
+            continue
         waveform, rate = _read_waveform(denoised_paths.get(key, audio_root / paths[key]))
         prepared, _ = light_prepare_waveform(waveform, rate, prep_cfg)
         active_wave = prepared.waveform[: max(1, prepared.valid_samples)]
-        embeddings.append(encoder.encode(active_wave))
-        audit_embeddings.append(audit_encoder.encode(active_wave))
+        embedding = encoder.encode(active_wave)
+        embeddings.append(embedding)
+        audit_embeddings.append(audit_encoder.encode(active_wave) if audit_encoder is not encoder else embedding.copy())
     values = np.stack(embeddings).astype(np.float32)
     audit_values = np.stack(audit_embeddings).astype(np.float32)
-    expected_dimension = int(cfg["speaker"]["embedding_dimension"])
     if values.shape[1] != expected_dimension:
         raise ValueError(
             f"configured ECAPA dimension is {expected_dimension}, but {source} returned {values.shape[1]}"
@@ -124,7 +137,6 @@ def attach_speaker_embeddings(
     reference_mfcc_mean = np.zeros_like(records.arrays["mfcc_mean"], dtype=np.float32)
     reference_mfcc_std = np.zeros_like(records.arrays["mfcc_std"], dtype=np.float32)
     reference_keys: list[str] = []
-    fit = (records.roles == "fit") & records.arrays["fit_eligible"].astype(bool)
     eligible = records.arrays["fit_eligible"].astype(bool)
     for index, subject in enumerate(subjects.tolist()):
         # Fit trials use only clean/eligible fit references, so validation,
@@ -132,6 +144,9 @@ def attach_speaker_embeddings(
         # audio-decoder training. Held-out rows get an eligible same-subject
         # fallback solely to keep the audio-only cache structurally complete.
         candidates = [candidate for candidate in np.flatnonzero((subjects == subject) & fit).tolist() if candidate != index]
+        if cp_temporal and not candidates:
+            reference_keys.append("fit_only_canonical_pending")
+            continue
         if not candidates:
             candidates = [candidate for candidate in np.flatnonzero((subjects == subject) & eligible).tolist() if candidate != index]
         if not candidates:
@@ -158,6 +173,13 @@ def attach_speaker_embeddings(
     medoid = centers[medoid_index]
     medoid_subject = center_subjects[medoid_index]
     medoid_trials = (subjects == medoid_subject) & fit
+    if cp_temporal:
+        audit_medoid = audit_values[medoid_trials].mean(0)
+        audit_medoid = audit_medoid / max(float(np.linalg.norm(audit_medoid)), 1.0e-8)
+        reference[~fit] = medoid
+        audit_reference[~fit] = audit_medoid
+        values[~fit] = medoid
+        audit_values[~fit] = audit_medoid
     records.arrays["speaker_target_embedding"] = values
     records.arrays["speaker_reference_embedding"] = reference
     records.arrays["speaker_audit_target_embedding"] = audit_values
@@ -170,8 +192,8 @@ def attach_speaker_embeddings(
     records.arrays["canonical_mfcc_std"] = records.arrays["mfcc_std"][medoid_trials].mean(0).astype(np.float32)
     return {
         "backend": "speechbrain_ecapa", "model_id": source, "model_cache": str(cache_dir),
-        "conditioning_checkpoint": str(adapted_checkpoint),
-        "conditioning_encoder": "KaraOne-fit-finetuned ECAPA backbone",
+        "conditioning_checkpoint": str(adapted_checkpoint) if adapted_checkpoint is not None else None,
+        "conditioning_encoder": "KaraOne-fit-finetuned ECAPA backbone" if use_adapted else "frozen external ECAPA checkpoint",
         "audit_encoder": "untouched external ECAPA checkpoint",
         "embedding_dimension": int(values.shape[1]), "reference_trials": int(cfg["speaker"]["reference_trials"]),
         "canonical_voice_policy": "fit_subject_centroid_medoid",

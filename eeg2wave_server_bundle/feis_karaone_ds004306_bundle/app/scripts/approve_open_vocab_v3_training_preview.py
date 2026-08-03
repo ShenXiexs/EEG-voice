@@ -14,6 +14,13 @@ from src.open_vocab_v3.runtime import capture_lineage,load_config,output_path,re
 
 
 def expected_lineage(config_path,cfg):
+    if str(cfg.get("experiment",{}).get("schema",""))=="openvoice-v3-cp-temporal-large-v1":
+        require_passed_gate(config_path,cfg,"fit_gate",lineage_artifact_keys=("fit_checkpoint",))
+        preview=read_json(output_path(config_path,cfg,"fit_preview_manifest"))
+        if preview.get("stage")!="fit" or not preview.get("complete",False):raise RuntimeError("CP-temporal full-fit training preview is incomplete")
+        expected_preview=capture_lineage(config_path,cfg,artifact_keys=("fit_checkpoint","content_checkpoint","cvae_checkpoint"))
+        if preview.get("lineage")!=expected_preview:raise RuntimeError("CP-temporal full-fit preview lineage is stale")
+        return capture_lineage(config_path,cfg,artifact_keys=("fit_checkpoint","fit_gate","fit_preview_manifest"))
     require_passed_gate(config_path,cfg,"fit_gate",lineage_artifact_keys=("fit_checkpoint","micro_gate"))
     preview=read_json(output_path(config_path,cfg,"fit_preview_manifest"))
     if preview.get("stage")!="fit" or not preview.get("complete",False):raise RuntimeError("full-fit training preview is incomplete")
