@@ -379,7 +379,15 @@ def train_content(cp,cfg,records,device,args):
     run_stage("joint",cfg["training"]["content_joint_epochs"],joint,lambda state,batch:(lambda a,b:(a[0]+b[0],a[1]|{f"decoder_{k}":v for k,v in b[1].items()}))(_content_encoder_loss(state,batch,projection,label_head,speaker_head,label_map,subject_map,scale),_decoder_loss(state,decoder,batch)),float(cfg["training"]["joint_lr_scale"]))
 
 
-def _kl(mean,logvar):return .5*(mean.square()+logvar.exp()-1-logvar).mean()
+def _kl(mean, logvar):
+    """Numerically bounded diagonal-Gaussian KL.
+
+    Sampling already clamps log-variance.  The loss must use the same bound;
+    otherwise a transient large posterior log-variance can overflow exp() and
+    poison every parameter in the CVAE.
+    """
+    bounded = logvar.clamp(-12.0, 8.0)
+    return .5 * (mean.square() + bounded.exp() - 1.0 - bounded).mean()
 
 
 def train_cvae(cp,cfg,records,device,args):
@@ -391,26 +399,45 @@ def train_cvae(cp,cfg,records,device,args):
         {"params":residual_parameters,"lr":base_lr},
         {"params":list(cvae.backbone.parameters()),"lr":base_lr*float(cfg["training"]["joint_lr_scale"])},
     ],weight_decay=float(cfg["training"]["weight_decay"]));best=math.inf;stale=0;history=[]
+    # Always leave a loadable, lineage-correct checkpoint.  A finite dev epoch
+    # replaces this zero-residual initialization.  If numerical validation
+    # fails, explore mode can still record a failed gate instead of crashing
+    # later with a misleading FileNotFoundError.
+    checkpoint_path=output_path(cp,cfg,"cvae_checkpoint")
+    save_checkpoint(checkpoint_path,checkpoint_schema(cfg,"cvae"),{"cvae":cvae,"teacher":teacher},history=history,parameter_count=parameter_count(cvae,teacher),residual_limit=float(cfg["model"]["audio_residual_limit_log10"]),fit_internal_dev=True,numerical_fallback=True)
     def cvae_loss(batch, *, stochastic):
         target=batch["speech_t5_mel"].float();post=cvae(batch["content_mfcc"].float(),batch["p_base"].float(),batch["canonical_voice"].float(),None,target=target,stochastic=stochastic);prior=cvae(batch["content_mfcc"].float(),batch["p_base"].float(),batch["canonical_voice"].float(),None,target=None,stochastic=False)
-        post_l1=masked_l1(post["mel"],target,batch["speech_t5_mel_mask"]);prior_l1=masked_l1(prior["mel"],target,batch["speech_t5_mel_mask"]);kl=_kl(post["posterior_global_mean"],post["posterior_global_logvar"])+_kl(post["posterior_local_mean"],post["posterior_local_logvar"]);content=(1-F.cosine_similarity(teacher.encode_mel(prior["mel"]),teacher.encode_mel(target).detach(),dim=-1)).mean();budget=F.relu(prior["residual"].square().mean().sqrt()-.30*prior["deterministic"].square().mean().sqrt());inactive=(prior["residual"].abs().mean(1)*(1-batch["p_base"][...,0].float())).mean();loss=.45*post_l1+.20*prior_l1+.15*content+.05*current_beta*kl+.10*budget+.05*inactive
+        post_l1=masked_l1(post["mel"],target,batch["speech_t5_mel_mask"]);prior_l1=masked_l1(prior["mel"],target,batch["speech_t5_mel_mask"]);kl=_kl(post["posterior_global_mean"],post["posterior_global_logvar"])+_kl(post["posterior_local_mean"],post["posterior_local_logvar"]);content=(1-F.cosine_similarity(teacher.encode_mel(prior["mel"]),teacher.encode_mel(target).detach(),dim=-1)).mean()
+        # The residual head is intentionally zero-initialized. sqrt(mean(x²))
+        # has an infinite derivative at x=0, and 0 * inf through the inactive
+        # ReLU produced NaN gradients on the very first optimizer step.
+        eps=torch.finfo(prior["residual"].dtype).eps
+        residual_rms=prior["residual"].square().mean().add(eps).sqrt()
+        deterministic_rms=prior["deterministic"].square().mean().add(eps).sqrt()
+        budget=F.relu(residual_rms-.30*deterministic_rms);inactive=(prior["residual"].abs().mean(1)*(1-batch["p_base"][...,0].float())).mean();loss=.45*post_l1+.20*prior_l1+.15*content+.05*current_beta*kl+.10*budget+.05*inactive
         return loss,{"posterior":float(post_l1.detach()),"prior":float(prior_l1.detach()),"content":float(content.detach()),"kl":float(kl.detach()),"beta":current_beta,"budget":float(budget.detach()),"inactive":float(inactive.detach())}
     current_beta=0.0
     for epoch in range(int(cfg["training"]["cvae_epochs"])):
-        frozen=epoch<int(cfg["training"]["cvae_backbone_frozen_epochs"]);[p.requires_grad_(not frozen) for p in cvae.backbone.parameters()];values=[]
+        frozen=epoch<int(cfg["training"]["cvae_backbone_frozen_epochs"]);[p.requires_grad_(not frozen) for p in cvae.backbone.parameters()];cvae.train();teacher.eval()
+        if frozen:cvae.backbone.eval()
+        values=[];nonfinite_batches=0;parts={}
         current_beta=float(cfg["training"]["cvae_kl_beta_max"])*min(1.0,((epoch%int(cfg["training"]["cvae_kl_cycle_epochs"]))+1)/(int(cfg["training"]["cvae_kl_cycle_epochs"])*.5))
         for step,batch in enumerate(loader(train_set,cfg,train=True,token=False)):
             if expired(args):break
             batch=move_batch(batch,device);loss,parts=cvae_loss(batch,stochastic=True)
+            if not torch.isfinite(loss):
+                nonfinite_batches+=1;optimizer.zero_grad(set_to_none=True);continue
             optimizer.zero_grad(set_to_none=True);loss.backward();nn.utils.clip_grad_norm_(cvae.parameters(),float(cfg["training"]["grad_clip"]));optimizer.step();values.append(float(loss.detach()))
             if args.smoke_steps and step+1>=args.smoke_steps:break
-        if not values:break
+        if not values:
+            print(f"[v3 CP CVAE] stopped: no finite training batches at epoch={epoch+1} nonfinite_batches={nonfinite_batches}; zero-residual fallback checkpoint retained",flush=True);break
         cvae.eval();dev_values=[]
         with torch.no_grad():
             for dev_batch in loader(dev_set,cfg,train=False,token=False):
-                dev_batch=move_batch(dev_batch,device);dev_loss,_=cvae_loss(dev_batch,stochastic=False);dev_values.append(float(dev_loss))
-        val=float(np.mean(dev_values)) if dev_values else math.inf;history.append({"epoch":epoch+1,"train":float(np.mean(values)),"dev":val,"parts":parts})
-        if val<best:best,stale=val,0;save_checkpoint(output_path(cp,cfg,"cvae_checkpoint"),checkpoint_schema(cfg,"cvae"),{"cvae":cvae,"teacher":teacher},history=history,parameter_count=parameter_count(cvae,teacher),residual_limit=float(cfg["model"]["audio_residual_limit_log10"]),fit_internal_dev=True)
+                dev_batch=move_batch(dev_batch,device);dev_loss,_=cvae_loss(dev_batch,stochastic=False)
+                if torch.isfinite(dev_loss):dev_values.append(float(dev_loss))
+        val=float(np.mean(dev_values)) if dev_values else math.inf;history.append({"epoch":epoch+1,"train":float(np.mean(values)),"dev":val,"parts":parts,"nonfinite_train_batches":nonfinite_batches})
+        if math.isfinite(val) and val<best:best,stale=val,0;save_checkpoint(checkpoint_path,checkpoint_schema(cfg,"cvae"),{"cvae":cvae,"teacher":teacher},history=history,parameter_count=parameter_count(cvae,teacher),residual_limit=float(cfg["model"]["audio_residual_limit_log10"]),fit_internal_dev=True,numerical_fallback=False)
         else:stale+=1
         print(f"[v3 CP CVAE] epoch={epoch+1} train={np.mean(values):.5f} dev={val:.5f} beta={current_beta:.6f}",flush=True)
         if stale>=int(cfg["training"]["cvae_patience"]) or args.smoke_steps:break
