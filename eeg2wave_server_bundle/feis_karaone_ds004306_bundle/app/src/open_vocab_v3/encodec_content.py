@@ -117,7 +117,10 @@ class EnCodecGenerator:
     def __init__(self, root: Path, *, device: torch.device, bandwidth: float = 6.0):
         from transformers import EncodecModel
         self.device, self.bandwidth = device, float(bandwidth)
-        self.model = EncodecModel.from_pretrained(str(root), local_files_only=True).to(device)
+        # This wrapper is used exclusively as a frozen tokenizer/round-trip
+        # evaluator.  Keep it in inference mode so evaluation cannot retain a
+        # graph and exhaust memory when a complete audio split is processed.
+        self.model = EncodecModel.from_pretrained(str(root), local_files_only=True).to(device).eval()
         self.model.config.normalize = True
 
     @property
@@ -127,7 +130,7 @@ class EnCodecGenerator:
     def encode(self, waveform_16k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         wave = _resample(waveform_16k.to(self.device), 16000, self.sample_rate).unsqueeze(1)
         mask = torch.ones(wave.shape[0], wave.shape[-1], dtype=torch.bool, device=self.device)
-        with torch.no_grad():
+        with torch.inference_mode():
             encoded = self.model.encode(wave, padding_mask=mask, bandwidth=self.bandwidth)
         codes = encoded.audio_codes
         if codes.ndim == 4:  # [B,frames,Q,S], normal files have one frame.
@@ -139,8 +142,9 @@ class EnCodecGenerator:
 
     def decode(self, codes: torch.Tensor, *, target_samples_16k: int | None = None) -> torch.Tensor:
         # EnCodec decoder accepts codes with the frame axis restored.
-        values = self.model.decode(codes.to(self.device).long().unsqueeze(1), audio_scales=[None])
-        waveform = _resample(values.audio_values[:, 0], self.sample_rate, 16000)
+        with torch.inference_mode():
+            values = self.model.decode(codes.to(self.device).long().unsqueeze(1), audio_scales=[None])
+            waveform = _resample(values.audio_values[:, 0], self.sample_rate, 16000)
         return waveform[..., :target_samples_16k] if target_samples_16k is not None else waveform
 
 

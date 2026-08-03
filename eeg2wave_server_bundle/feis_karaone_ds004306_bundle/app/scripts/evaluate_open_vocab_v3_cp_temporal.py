@@ -92,9 +92,15 @@ def gate_t0(cp,cfg,records,device):
     references=[];codec_wavs=[];side_wavs=[];vocoder_wavs=[];labels=[]
     for batch in batches(dataset,cfg,device):
         for key,label in zip(batch["sample_key"],batch["label"]):
-            wave=reference(key);references.append(wave);labels.append(label);value=torch.from_numpy(wave).unsqueeze(0).to(device);codes,mask=codec.encode(value);valid=int(mask[0].sum());codec_wavs.append(codec.decode(codes[:,:,:valid],target_samples_16k=len(wave))[0].cpu().numpy())
+            wave=reference(key);references.append(wave);labels.append(label)
+            value=torch.from_numpy(wave).unsqueeze(0).to(device)
+            codes,mask=codec.encode(value);valid=int(mask[0].sum())
+            decoded=codec.decode(codes[:,:,:valid],target_samples_16k=len(wave))
+            codec_wavs.append(decoded[0].detach().cpu().numpy())
             if side_codec is not None:
-                side_codes,side_mask=side_codec.encode(value);side_valid=int(side_mask[0].sum());side_wavs.append(side_codec.decode(side_codes[:,:,:side_valid],target_samples_16k=len(wave))[0].cpu().numpy())
+                side_codes,side_mask=side_codec.encode(value);side_valid=int(side_mask[0].sum())
+                side_decoded=side_codec.decode(side_codes[:,:,:side_valid],target_samples_16k=len(wave))
+                side_wavs.append(side_decoded[0].detach().cpu().numpy())
         vocoder_wavs.extend(render(vocoder,batch["speech_t5_mel"].float()))
     raw_metric=hubert_metrics(references,references,labels,teacher)|waveform_fidelity(references,references);codec_metric=hubert_metrics(codec_wavs,references,labels,teacher)|waveform_fidelity(codec_wavs,references);vocoder_metric=hubert_metrics(vocoder_wavs,references,labels,teacher)|waveform_fidelity(vocoder_wavs,references);metrics={"raw_reference":raw_metric,"frozen_encodec":codec_metric,"native_mel_vocoder":vocoder_metric,"0724_oracle":"legacy 0724 WAVs remain read-only; only key-matched artifacts should be compared in the same evaluator"}
     promotion={"available":side_codec is not None,"allowed":False,"selected":False,"load_error":side_load_error}
