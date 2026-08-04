@@ -640,7 +640,11 @@ class V3Dataset(Dataset[dict[str, Any]]):
 
 def collate(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
     tensors = (
-        "eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask",
+        # ``source_index`` is the immutable identity used by fit-only EnCodec
+        # caches and by evaluation to recover the corresponding HuBERT target.
+        # Keep it through collation rather than accidentally replacing it with
+        # a DataLoader-local row number.
+        "source_index", "eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask",
         "mfcc", "mel", "speech_t5_mel", "speech_t5_mel_mask", "mfcc_mask", "activity", "speaker_reference", "speaker_target", "speaker_audit_reference",
         "canonical_voice", "target_mfcc_mean", "target_mfcc_std",
         "speaker_reference_mfcc_mean", "speaker_reference_mfcc_std",

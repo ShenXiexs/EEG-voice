@@ -206,16 +206,19 @@ def b0(cp,cfg,records,device):
 
 @torch.no_grad()
 def c1(cp,cfg,records,device):
-    selected=fit_indices(records,dev=True);dataset=cache_dataset(records,cp,cfg,selected);audio,decoder,_,_=_models(cp,cfg,records,device,audio=True);fit=fit_indices(records,dev=False);names,prototypes=label_prototypes(records,fit);prediction=[];truth=[];global_pred=[];global_target=[];subjects=[];labels=[]
+    selected=fit_indices(records,dev=True);dataset=cache_dataset(records,cp,cfg,selected);audio,decoder,_,_=_models(cp,cfg,records,device,audio=True);fit=fit_indices(records,dev=False);names,prototypes=label_prototypes(records,fit);prediction=[];truth=[];hubert_global_pred=[];probe_global_pred=[];global_target=[];subjects=[];labels=[]
     for batch in batches(dataset,cfg,device):
-        state=audio(batch["encodec_codes"],batch["encodec_mask"]);content,_=decoder(state.local,state.token_mask);prediction+=list(content.cpu().numpy());truth+=list(batch["content_mfcc"].cpu().numpy());global_pred+=list(F.normalize(audio.hubert_global(state.global_embedding),dim=-1).cpu().numpy());global_target+=list(F.normalize(batch["hubert"].float().mean(1),dim=-1).cpu().numpy());subjects+=batch["subject"];labels+=batch["label"]
-    metric=content_label_metrics(np.stack(prediction),np.stack(truth),labels,names,prototypes);similarity=np.asarray(global_pred)@np.asarray(global_target).T;metric["hubert_global_retrieval"]=float(np.mean(similarity.argmax(1)==np.arange(len(similarity))))
+        state=audio(batch["encodec_codes"],batch["encodec_mask"]);content,_=decoder(state.local,state.token_mask);prediction+=list(content.cpu().numpy());truth+=list(batch["content_mfcc"].cpu().numpy());hubert_global_pred+=list(F.normalize(audio.hubert_global(state.global_embedding),dim=-1).cpu().numpy());probe_global_pred+=list(state.global_embedding.cpu().numpy());global_target+=list(F.normalize(batch["hubert"].float().mean(1),dim=-1).cpu().numpy());subjects+=batch["subject"];labels+=batch["label"]
+    metric=content_label_metrics(np.stack(prediction),np.stack(truth),labels,names,prototypes);similarity=np.asarray(hubert_global_pred)@np.asarray(global_target).T;metric["hubert_global_retrieval"]=float(np.mean(similarity.argmax(1)==np.arange(len(similarity))))
     # Linear probes train separately on fit-train features.
     train_set=cache_dataset(records,cp,cfg,fit);train_global=[];train_labels=[];train_subjects=[]
     for batch in batches(train_set,cfg,device):
         state=audio(batch["encodec_codes"],batch["encodec_mask"]);train_global+=list(state.global_embedding.cpu().numpy());train_labels+=batch["label"];train_subjects+=batch["subject"]
-    metric["label_probe_top1"]= _probe(np.asarray(train_global),train_labels,np.asarray(global_pred),labels,sorted(set(train_labels)))
-    speaker_classes=sorted(set(train_subjects));speaker_acc=_probe(np.asarray(train_global),train_subjects,np.asarray(global_pred),subjects,speaker_classes);chance=1/max(len(speaker_classes),1);metric["speaker_probe_top1"]=speaker_acc;metric["normalized_speaker_advantage"]=(speaker_acc-chance)/max(1-chance,1e-8)
+    # Probes use the unprojected 256-D Audio-C global space.  The separate
+    # 768-D HuBERT projection above is only for teacher retrieval and must not
+    # be mixed into these linear diagnostics.
+    metric["label_probe_top1"]= _probe(np.asarray(train_global),train_labels,np.asarray(probe_global_pred),labels,sorted(set(train_labels)))
+    speaker_classes=sorted(set(train_subjects));speaker_acc=_probe(np.asarray(train_global),train_subjects,np.asarray(probe_global_pred),subjects,speaker_classes);chance=1/max(len(speaker_classes),1);metric["speaker_probe_top1"]=speaker_acc;metric["normalized_speaker_advantage"]=(speaker_acc-chance)/max(1-chance,1e-8)
     checks={"hubert_global":metric["hubert_global_retrieval"]>=float(cfg["gates"]["c1"]["hubert_global_retrieval_min"]),"template":metric["template_improvement"]>=float(cfg["gates"]["c1"]["template_improvement_min"]),"variance":metric["temporal_variance_ratio"]>=float(cfg["gates"]["c1"]["temporal_variance_ratio_min"]),"probe_not_training_loss":True}
     return {"gate":"C1","metrics":metric,"checks":checks,"passed":bool(all(checks.values()))}
 

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from scripts.train_open_vocab_v3_encodec_bridge import LabelGroupedBatchSampler, micro_generalization_folds
-from src.open_vocab_v3.data import _bridge_content_target, _p_medoid_bank
+from src.open_vocab_v3.data import _bridge_content_target, _p_medoid_bank, collate
 from src.open_vocab_v3.encodec_bridge import (
     AudioCEncoder, ContinuousEnCodecBridge, EEGCEncoder,
     SharedContentMFCCDecoder, masked_token_infonce,
@@ -104,3 +104,24 @@ def test_label_grouped_batch_sampler_keeps_multiple_labels_and_repeats():
     sampler=LabelGroupedBatchSampler(Items(),batch_size=6,seed=31)
     batch=next(iter(sampler));labels=[Items()[index]["label"] for index in batch]
     assert len(batch)==6 and len(set(labels))>=2
+
+
+def test_collate_preserves_immutable_source_indices_for_cache_lineage():
+    """E0/M0 must never use a DataLoader-local row as cache identity."""
+    item = {
+        "source_index": 17,
+        "eeg": np.zeros((2, 3), dtype=np.float32), "channel_xyz": np.zeros((2, 3), dtype=np.float32),
+        "channel_mask": np.ones(2, dtype=bool), "time_mask": np.ones(3, dtype=bool),
+        "hubert": np.zeros((2, 3), dtype=np.float32), "hubert_mask": np.ones(2, dtype=bool),
+        "mfcc": np.zeros((40, 3), dtype=np.float32), "mel": np.zeros((80, 3), dtype=np.float32),
+        "speech_t5_mel": np.zeros((80, 3), dtype=np.float32), "speech_t5_mel_mask": np.ones(3, dtype=bool),
+        "mfcc_mask": np.ones(3, dtype=bool), "activity": np.ones(3, dtype=bool),
+        "speaker_reference": np.zeros(2, dtype=np.float32), "speaker_target": np.zeros(2, dtype=np.float32),
+        "speaker_audit_reference": np.zeros(2, dtype=np.float32), "canonical_voice": np.zeros(2, dtype=np.float32),
+        "target_mfcc_mean": np.zeros(40, dtype=np.float32), "target_mfcc_std": np.ones(40, dtype=np.float32),
+        "speaker_reference_mfcc_mean": np.zeros(40, dtype=np.float32), "speaker_reference_mfcc_std": np.ones(40, dtype=np.float32),
+        "canonical_mfcc_mean": np.zeros(40, dtype=np.float32), "canonical_mfcc_std": np.ones(40, dtype=np.float32),
+        "sample_key": "k17", "audio_key": "a17", "label": "l", "subject": "s", "role": "fit",
+    }
+    batch = collate([item, {**item, "source_index": 93, "sample_key": "k93"}])
+    assert batch["source_index"].tolist() == [17, 93]
