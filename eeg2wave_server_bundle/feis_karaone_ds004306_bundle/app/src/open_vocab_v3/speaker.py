@@ -106,8 +106,10 @@ def attach_speaker_embeddings(
     keys = records.arrays["sample_keys"].astype(str)
     subjects = records.arrays["subjects"].astype(str)
     cp_temporal = str(cfg.get("version", "")) == "openvoice-v3-cp-temporal-large-v1"
+    bridge = str(cfg.get("version", "")) == "openvoice-v3-mfcc-encodec-bridge-v2"
+    strict_fit_voice = cp_temporal or bridge
     fit = (records.roles == "fit") & records.arrays["fit_eligible"].astype(bool)
-    if cp_temporal and "fit_internal_dev" in records.arrays:
+    if strict_fit_voice and "fit_internal_dev" in records.arrays:
         fit &= ~records.arrays["fit_internal_dev"].astype(bool)
     expected_dimension = int(cfg["speaker"]["embedding_dimension"])
     embeddings: list[np.ndarray] = []
@@ -116,7 +118,7 @@ def attach_speaker_embeddings(
         # CP-temporal primary synthesis uses a fit-only canonical voice. Do not
         # run the generation-side speaker model over held-out WAVs before the
         # listening gate merely to populate unused target-speaker fields.
-        if cp_temporal and not fit[index]:
+        if strict_fit_voice and not fit[index]:
             embeddings.append(np.zeros(expected_dimension, dtype=np.float32))
             audit_embeddings.append(np.zeros(expected_dimension, dtype=np.float32))
             continue
@@ -144,7 +146,7 @@ def attach_speaker_embeddings(
         # audio-decoder training. Held-out rows get an eligible same-subject
         # fallback solely to keep the audio-only cache structurally complete.
         candidates = [candidate for candidate in np.flatnonzero((subjects == subject) & fit).tolist() if candidate != index]
-        if cp_temporal and not candidates:
+        if strict_fit_voice and not candidates:
             reference_keys.append("fit_only_canonical_pending")
             continue
         if not candidates:
@@ -173,7 +175,7 @@ def attach_speaker_embeddings(
     medoid = centers[medoid_index]
     medoid_subject = center_subjects[medoid_index]
     medoid_trials = (subjects == medoid_subject) & fit
-    if cp_temporal:
+    if strict_fit_voice:
         audit_medoid = audit_values[medoid_trials].mean(0)
         audit_medoid = audit_medoid / max(float(np.linalg.norm(audit_medoid)), 1.0e-8)
         reference[~fit] = medoid
@@ -196,7 +198,7 @@ def attach_speaker_embeddings(
         "conditioning_encoder": "KaraOne-fit-finetuned ECAPA backbone" if use_adapted else "frozen external ECAPA checkpoint",
         "audit_encoder": "untouched external ECAPA checkpoint",
         "embedding_dimension": int(values.shape[1]), "reference_trials": int(cfg["speaker"]["reference_trials"]),
-        "canonical_voice_policy": "fit_subject_centroid_medoid",
+        "canonical_voice_policy": "fit_train_subject_centroid_medoid" if strict_fit_voice else "fit_subject_centroid_medoid",
         "canonical_voice_subject": medoid_subject,
         "canonical_voice_subject_count": len(subject_centroids),
         "accepted_denoised_trials": len(denoised_paths),

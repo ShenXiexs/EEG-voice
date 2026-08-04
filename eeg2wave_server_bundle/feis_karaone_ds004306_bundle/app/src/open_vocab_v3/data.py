@@ -26,6 +26,7 @@ from src.open_vocab_0724.audio_features import (
 SOURCE_SPLITS = ("train", "validation", "locked_test", "diagnostic")
 PREPARATION_SCHEMA = "openvoice-v3-encodec-clip-mfcc-preparation-v2-native-mel-161"
 CP_TEMPORAL_PREPARATION_SCHEMA = "openvoice-v3-cp-temporal-preparation-v1-161"
+BRIDGE_PREPARATION_SCHEMA = "openvoice-v3-mfcc-encodec-bridge-preparation-v2-161"
 PAIR_ROLES = (
     "fit",
     "subject_holdout_seen",
@@ -228,6 +229,64 @@ def _cp_temporal_targets(acoustic: Any, raw_mfcc: np.ndarray, duration: float,
     return p_base.astype(np.float32), p_plus.astype(np.float32), c0.astype(np.float32), duration_fraction
 
 
+def _bridge_content_target(normalized_mfcc: np.ndarray, active: np.ndarray,
+                           valid: np.ndarray, frames: int) -> tuple[np.ndarray, int, int]:
+    """Build the bridge-v2 C target on the VAD-active, normalized-time grid.
+
+    This is deliberately different from the CP-temporal cache: silence and
+    duration are not carried by C.  ``P`` owns those factors, while C always
+    occupies the complete 161-frame relative-time grid.
+    """
+    support = np.asarray(active, dtype=bool) & np.asarray(valid, dtype=bool)
+    if int(support.sum()) < 2:
+        support = np.asarray(valid, dtype=bool)
+    if int(support.sum()) < 2:
+        return np.zeros((normalized_mfcc.shape[0] - 1, frames), dtype=np.float32), 0, 0
+    indices = np.flatnonzero(support)
+    start, end = int(indices[0]), int(indices[-1])
+    content = _interpolate(np.asarray(normalized_mfcc[1:, start:end + 1], dtype=np.float32), frames)
+    return content.astype(np.float32), start, end
+
+
+def _p_medoid_bank(p_base: np.ndarray, duration: np.ndarray, keys: np.ndarray,
+                   count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return deterministic, actual fit-train P medoids without label access."""
+    values = np.asarray(p_base, dtype=np.float32)
+    if len(values) < int(count):
+        raise ValueError("fit-train P bank has fewer trials than requested medoids")
+    flat = values.reshape(len(values), -1)
+    # Standardize dimensions so activity, envelope, and delta contribute on a
+    # comparable scale.  Add duration explicitly because it belongs to P.
+    scale = np.maximum(flat.std(0, keepdims=True), 1.0e-4)
+    flat = (flat - flat.mean(0, keepdims=True)) / scale
+    feature = np.concatenate((flat, np.asarray(duration, dtype=np.float32)[:, None] * 5.0), axis=1)
+    norm = (feature * feature).sum(1, keepdims=True)
+    distance = np.maximum(norm + norm.T - 2.0 * (feature @ feature.T), 0.0)
+    # First medoid is the actual point nearest the global P centre.  The other
+    # slots use deterministic farthest-first initialisation, followed by a
+    # short PAM update.  No labels or target trial are consulted.
+    selected = [int(np.argmin(distance.sum(1)))]
+    while len(selected) < int(count):
+        nearest = distance[:, selected].min(1)
+        candidates = np.flatnonzero(nearest == nearest.max())
+        selected.append(int(sorted(candidates.tolist(), key=lambda i: str(keys[i]))[0]))
+    for _ in range(4):
+        assignment = distance[:, selected].argmin(1)
+        replacement: list[int] = []
+        for cluster, old in enumerate(selected):
+            members = np.flatnonzero(assignment == cluster)
+            if not len(members):
+                replacement.append(old); continue
+            costs = distance[np.ix_(members, members)].sum(1)
+            minima = members[np.flatnonzero(costs == costs.min())]
+            replacement.append(int(sorted(minima.tolist(), key=lambda i: str(keys[i]))[0]))
+        if replacement == selected:
+            break
+        selected = replacement
+    order = [selected[0]] + sorted(selected[1:], key=lambda i: str(keys[i]))
+    return values[order].astype(np.float32), np.asarray(duration, dtype=np.float32)[order], np.asarray(keys, dtype=str)[order]
+
+
 def _fit_internal_dev_mask(roles: np.ndarray, eligible: np.ndarray, subjects: np.ndarray,
                            labels: np.ndarray, sample_keys: np.ndarray, seed: int = 31) -> np.ndarray:
     """Deterministic 10% subject-label stratified dev split inside fit only."""
@@ -254,6 +313,8 @@ class PreparedRecords:
 
 def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRecords, list[dict[str, Any]]]:
     cp_temporal = str(cfg.get("version", "")) == "openvoice-v3-cp-temporal-large-v1"
+    bridge = str(cfg.get("version", "")) == "openvoice-v3-mfcc-encodec-bridge-v2"
+    temporal_schema = cp_temporal or bridge
     source_root = (config_path.parent / cfg["paths"]["source_cache_root"]).resolve()
     audio_root = (config_path.parent / cfg["data"]["audio_root"]).resolve()
     manifest = (config_path.parent / cfg["data"]["unified_manifest"]).resolve()
@@ -287,6 +348,7 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
     raw_mel, canonical_mel, speech_t5_mel, speech_t5_mask = [], [], [], []
     frame_mask, activity_mask, valid_samples, active_seconds, fit_eligible = [], [], [], [], []
     content_mfcc_targets, p_base_targets, p_plus_targets, c0_targets, duration_fractions = [], [], [], [], []
+    active_frame_start, active_frame_end = [], []
     audit: list[dict[str, Any]] = []
     manual_review = set(map(str, cfg["audio"].get("manual_review_sample_keys", ())))
     for index, key in enumerate(tqdm(arrays["sample_keys"].tolist(), desc="[v3 prepare] light audio audit", unit="trial", dynamic_ncols=True)):
@@ -354,9 +416,15 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         )
         valid_samples.append(prepared.valid_samples)
         active_seconds.append(prepared.active_duration_seconds)
-        if cp_temporal:
-            content_target = mfcc_normalized[1:].copy()
-            content_target[:, ~np.asarray(acoustic.frame_valid_mask, dtype=bool)] = 0.0
+        if temporal_schema:
+            if bridge:
+                content_target, active_start, active_end = _bridge_content_target(
+                    mfcc_normalized, acoustic.activity_mask, acoustic.frame_valid_mask, frames
+                )
+            else:
+                content_target = mfcc_normalized[1:].copy()
+                content_target[:, ~np.asarray(acoustic.frame_valid_mask, dtype=bool)] = 0.0
+                active_start, active_end = 0, int(frames - 1)
             p_base, p_plus, c0, duration_fraction = _cp_temporal_targets(
                 acoustic, mfcc_unscaled, prepared.active_duration_seconds,
                 float(cfg["audio"]["max_active_seconds"]),
@@ -366,6 +434,8 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
             p_plus_targets.append(p_plus)
             c0_targets.append(c0)
             duration_fractions.append(duration_fraction)
+            active_frame_start.append(active_start)
+            active_frame_end.append(active_end)
         fit_eligible.append(eligible)
         frame_rms = prepared.waveform[: max(1, prepared.valid_samples)]
         audit.append(
@@ -399,8 +469,7 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
             }
         )
     preparation_schema = (
-        CP_TEMPORAL_PREPARATION_SCHEMA
-        if cp_temporal
+        CP_TEMPORAL_PREPARATION_SCHEMA if cp_temporal else BRIDGE_PREPARATION_SCHEMA if bridge
         else PREPARATION_SCHEMA
     )
     arrays.update(
@@ -422,13 +491,15 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
             "fit_eligible": np.asarray(fit_eligible, dtype=bool),
         }
     )
-    if cp_temporal:
+    if temporal_schema:
         arrays.update({
             "content_mfcc": np.stack(content_mfcc_targets).astype(np.float32),
             "p_base": np.stack(p_base_targets).astype(np.float32),
             "p_plus": np.stack(p_plus_targets).astype(np.float32),
             "mfcc_c0": np.stack(c0_targets).astype(np.float32),
             "duration_fraction": np.asarray(duration_fractions, dtype=np.float32),
+            "active_frame_start": np.asarray(active_frame_start, dtype=np.int16),
+            "active_frame_end": np.asarray(active_frame_end, dtype=np.int16),
         })
         internal_dev = _fit_internal_dev_mask(
             roles, arrays["fit_eligible"], arrays["subjects"], arrays["labels"],
@@ -436,17 +507,30 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
         )
         arrays["fit_internal_dev"] = internal_dev
         fit_train = (roles == "fit") & arrays["fit_eligible"] & ~internal_dev
-        arrays["canonical_p_base"] = np.median(arrays["p_base"][fit_train], axis=0).astype(np.float32)
-        arrays["canonical_duration_fraction"] = np.asarray(
-            np.median(arrays["duration_fraction"][fit_train]), dtype=np.float32
-        )
-        canonical_length = int(np.clip(round(float(arrays["canonical_duration_fraction"]) * frames), 1, frames))
-        eeg_targets = np.zeros((len(roles), int(cfg["audio"]["mfcc_bins"]) - 1, frames), dtype=np.float32)
-        for index in range(len(roles)):
-            eeg_targets[index, :, :canonical_length] = _interpolate(arrays["mfcc"][index, 1:], canonical_length)
-        arrays["eeg_content_mfcc"] = eeg_targets
-        canonical_mask = np.zeros(frames, dtype=bool); canonical_mask[:canonical_length] = True
-        arrays["canonical_content_mask"] = canonical_mask
+        if bridge:
+            bank, bank_duration, bank_keys = _p_medoid_bank(
+                arrays["p_base"][fit_train], arrays["duration_fraction"][fit_train],
+                arrays["sample_keys"][fit_train], int(cfg["audio"].get("canonical_p_bank_size", 4)),
+            )
+            arrays["canonical_p_bank"] = bank
+            arrays["canonical_p_bank_duration_fraction"] = bank_duration.astype(np.float32)
+            arrays["canonical_p_bank_keys"] = bank_keys.astype(str)
+            arrays["canonical_p_base"] = bank[0]
+            arrays["canonical_duration_fraction"] = np.asarray(bank_duration[0], dtype=np.float32)
+            arrays["eeg_content_mfcc"] = arrays["content_mfcc"].copy()
+            arrays["canonical_content_mask"] = np.ones(frames, dtype=bool)
+        else:
+            arrays["canonical_p_base"] = np.median(arrays["p_base"][fit_train], axis=0).astype(np.float32)
+            arrays["canonical_duration_fraction"] = np.asarray(
+                np.median(arrays["duration_fraction"][fit_train]), dtype=np.float32
+            )
+            canonical_length = int(np.clip(round(float(arrays["canonical_duration_fraction"]) * frames), 1, frames))
+            eeg_targets = np.zeros((len(roles), int(cfg["audio"]["mfcc_bins"]) - 1, frames), dtype=np.float32)
+            for index in range(len(roles)):
+                eeg_targets[index, :, :canonical_length] = _interpolate(arrays["mfcc"][index, 1:], canonical_length)
+            arrays["eeg_content_mfcc"] = eeg_targets
+            canonical_mask = np.zeros(frames, dtype=bool); canonical_mask[:canonical_length] = True
+            arrays["canonical_content_mask"] = canonical_mask
     return PreparedRecords(arrays=arrays, roles=roles), audit
 
 
@@ -467,12 +551,12 @@ def load_prepared(path: Path, expected_schema: str | None = None) -> PreparedRec
     if missing:
         raise ValueError(f"v3 prepared cache lacks {sorted(missing)}")
     schema = str(np.asarray(raw["v3_preparation_schema"]).item())
-    accepted = {PREPARATION_SCHEMA, CP_TEMPORAL_PREPARATION_SCHEMA}
+    accepted = {PREPARATION_SCHEMA, CP_TEMPORAL_PREPARATION_SCHEMA, BRIDGE_PREPARATION_SCHEMA}
     if schema not in accepted or (expected_schema is not None and schema != expected_schema):
         raise ValueError(
             f"v3 cache schema {schema!r} is stale; rerun prepare_open_vocab_v3.py --force"
         )
-    if schema == CP_TEMPORAL_PREPARATION_SCHEMA:
+    if schema in {CP_TEMPORAL_PREPARATION_SCHEMA, BRIDGE_PREPARATION_SCHEMA}:
         cp_required = {
             "content_mfcc", "eeg_content_mfcc", "canonical_content_mask", "p_base", "p_plus", "mfcc_c0", "duration_fraction",
             "canonical_p_base", "canonical_duration_fraction", "fit_internal_dev",
@@ -480,6 +564,14 @@ def load_prepared(path: Path, expected_schema: str | None = None) -> PreparedRec
         cp_missing = cp_required - set(raw.files)
         if cp_missing:
             raise ValueError(f"CP-temporal cache lacks {sorted(cp_missing)}; rerun prepare --force")
+    if schema == BRIDGE_PREPARATION_SCHEMA:
+        bridge_required = {
+            "active_frame_start", "active_frame_end", "canonical_p_bank",
+            "canonical_p_bank_duration_fraction", "canonical_p_bank_keys",
+        }
+        missing_bridge = bridge_required - set(raw.files)
+        if missing_bridge:
+            raise ValueError(f"EnCodec-bridge cache lacks {sorted(missing_bridge)}; rerun prepare --force")
     arrays = {key: np.asarray(raw[key]) for key in raw.files if key != "roles"}
     return PreparedRecords(arrays=arrays, roles=np.asarray(raw["roles"]).astype(str))
 
@@ -538,6 +630,10 @@ class V3Dataset(Dataset[dict[str, Any]]):
                 "canonical_p_base": value["canonical_p_base"],
                 "canonical_duration_fraction": value["canonical_duration_fraction"],
                 "fit_internal_dev": value["fit_internal_dev"][index],
+                "active_frame_start": value["active_frame_start"][index] if "active_frame_start" in value else np.int16(0),
+                "active_frame_end": value["active_frame_end"][index] if "active_frame_end" in value else np.int16(value["content_mfcc"].shape[-1] - 1),
+                "canonical_p_bank": value["canonical_p_bank"] if "canonical_p_bank" in value else value["canonical_p_base"][None],
+                "canonical_p_bank_duration_fraction": value["canonical_p_bank_duration_fraction"] if "canonical_p_bank_duration_fraction" in value else np.asarray([value["canonical_duration_fraction"]], dtype=np.float32),
             })
         return result
 
@@ -554,6 +650,8 @@ def collate(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
     optional = (
         "content_mfcc", "eeg_content_mfcc", "canonical_content_mask", "p_base", "p_plus", "mfcc_c0", "duration_fraction",
         "canonical_p_base", "canonical_duration_fraction", "fit_internal_dev",
+        "active_frame_start", "active_frame_end", "canonical_p_bank",
+        "canonical_p_bank_duration_fraction",
     )
     for key in optional:
         if key in items[0]:

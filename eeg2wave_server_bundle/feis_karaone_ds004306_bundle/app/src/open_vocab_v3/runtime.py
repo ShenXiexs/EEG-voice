@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import yaml
 
-from . import CP_TEMPORAL_VERSION, LEGACY_VERSION, VERSION
+from . import BRIDGE_VERSION, CP_TEMPORAL_VERSION, LEGACY_VERSION, VERSION
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -38,6 +38,16 @@ def content_schema(cfg: dict[str, Any]) -> str:
 
 
 def checkpoint_schema(cfg: dict[str, Any], component: str) -> str:
+    if content_schema(cfg) == BRIDGE_VERSION:
+        values = {
+            "bridge": "openvoice-v3-encodec-latent-bridge-v2",
+            "audio_c": "openvoice-v3-audio-c-teacher-v2",
+            "micro_m0": "openvoice-v3-eeg-c-memorization-v2",
+            "micro_m1": "openvoice-v3-eeg-c-micro-generalization-v2",
+        }
+        if component not in values:
+            raise KeyError(f"unknown EnCodec-bridge checkpoint component: {component}")
+        return values[component]
     if content_schema(cfg) == "openvoice-v3-cp-temporal-large-v1":
         values = {
             "oracle": "openvoice-v3-cp-temporal-oracle-v1",
@@ -69,19 +79,40 @@ def checkpoint_schema(cfg: dict[str, Any], component: str) -> str:
     return values[component]
 
 
+def artifact_root_name(cfg: dict[str, Any]) -> str:
+    """Return the per-run artifact namespace, optionally selected by a runner.
+
+    A timestamped namespace is deliberately supplied by the bridge runners so
+    that ``--fresh`` can never erase a previous experiment.  Keep the
+    override narrow: it is a directory *name*, never an arbitrary path.
+    """
+    configured = str(cfg.get("experiment", {}).get("artifact_root_name", "open_vocab_v3_mfcc_training_first"))
+    override = os.environ.get("OPEN_VOCAB_V3_ARTIFACT_ROOT_NAME")
+    if not override:
+        return configured
+    valid = all(character.isalnum() or character in "._-" for character in override)
+    if not valid or not override.startswith("open_vocab_v3_"):
+        raise ValueError("OPEN_VOCAB_V3_ARTIFACT_ROOT_NAME must be a safe open_vocab_v3_* directory name")
+    return override
+
+
 def output_path(config_path: str | Path, cfg: dict[str, Any], key: str) -> Path:
     path = resolve_config_path(config_path, cfg["paths"][key])
-    root_name = str(cfg.get("experiment", {}).get("artifact_root_name", "open_vocab_v3_mfcc_training_first"))
+    root_name = artifact_root_name(cfg)
     # A content-repair config inherits the legacy path map but each writable
     # artifact must be redirected to its own namespace before any cache/model
     # lookup.  Immutable source caches never carry the old artifact root name.
     parts = list(path.parts)
     if root_name != "open_vocab_v3_mfcc_training_first":
-        try:
-            parts[parts.index("open_vocab_v3_mfcc_training_first")] = root_name
-            path = Path(*parts)
-        except ValueError:
-            pass
+        # Configs intentionally inherit the earlier v3 path map.  Replace the
+        # first *artifact* namespace, whether it comes from the original,
+        # content-repair, or CP-temporal experiment.  Immutable v072x inputs
+        # never begin with ``open_vocab_v3_`` and therefore cannot be rerouted.
+        for index, part in enumerate(parts):
+            if part.startswith("open_vocab_v3_"):
+                parts[index] = root_name
+                path = Path(*parts)
+                break
     # The exploratory runner must never mix bypassed checkpoints/reports with
     # the fail-closed primary experiment.  Keep the configuration identical so
     # the feature contract is identical, but route every v3-output path to a
@@ -99,7 +130,7 @@ def output_path(config_path: str | Path, cfg: dict[str, Any], key: str) -> Path:
 
 def ensure_output_firewall(config_path: str | Path, cfg: dict[str, Any]) -> None:
     root = output_path(config_path, cfg, "output_root")
-    configured = str(cfg.get("experiment", {}).get("artifact_root_name", "open_vocab_v3_mfcc_training_first"))
+    configured = artifact_root_name(cfg)
     expected = f"{configured}_explore" if os.environ.get("OPEN_VOCAB_V3_EXPLORATION") == "1" else configured
     if root.name != expected:
         raise ValueError(f"v3 output root must end in {expected}, got {root}")
@@ -114,24 +145,28 @@ def ensure_output_firewall(config_path: str | Path, cfg: dict[str, Any]) -> None
 
 def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
     config_path = Path(path).resolve()
-    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    if not isinstance(cfg, dict):
-        raise ValueError(f"invalid YAML mapping: {config_path}")
-    inherited = cfg.get("inherits")
-    if inherited:
-        base_path = resolve_config_path(config_path, str(inherited))
-        base = yaml.safe_load(base_path.read_text(encoding="utf-8"))
-        if not isinstance(base, dict):
-            raise ValueError(f"invalid inherited YAML mapping: {base_path}")
-        cfg = _deep_merge(base, cfg)
-    if cfg.get("version") not in {VERSION, LEGACY_VERSION, CP_TEMPORAL_VERSION}:
+    def read_recursive(candidate: Path, seen: set[Path]) -> dict[str, Any]:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            raise ValueError(f"cyclic v3 config inheritance: {candidate}")
+        value = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError(f"invalid YAML mapping: {candidate}")
+        inherited = value.get("inherits")
+        if not inherited:
+            return value
+        base = read_recursive(resolve_config_path(candidate, str(inherited)), seen | {candidate})
+        return _deep_merge(base, value)
+    cfg = read_recursive(config_path, set())
+    if cfg.get("version") not in {VERSION, LEGACY_VERSION, CP_TEMPORAL_VERSION, BRIDGE_VERSION}:
         raise ValueError(f"unsupported v3 config: {cfg.get('version')!r}")
     if tuple(cfg["split"]["subject_holdout"]) != ("karaone:MM19", "karaone:MM20"):
         raise ValueError("v3 preregisters MM19/MM20 as the subject holdout")
     if str(cfg["split"]["unseen_label"]).strip().lower() != "pot":
         raise ValueError("v3 preregisters pot as the unseen label")
     cp_temporal = cfg.get("version") == CP_TEMPORAL_VERSION
-    expected_frames = 161 if cp_temporal else 256
+    bridge = cfg.get("version") == BRIDGE_VERSION
+    expected_frames = 161 if (cp_temporal or bridge) else 256
     if int(cfg["audio"]["canonical_frames"]) != expected_frames:
         raise ValueError(f"v3 content gate requires exactly {expected_frames} canonical MFCC frames")
     if int(cfg["audio"]["mfcc_bins"]) != 40:
@@ -143,7 +178,7 @@ def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
     if (int(cfg["audio"]["encodec_sample_rate"]), int(cfg["audio"]["encodec_codebooks"]),
             int(cfg["audio"]["encodec_codebook_size"]), int(cfg["audio"]["encodec_steps"])) != (24000, 8, 1024, 192):
         raise ValueError("v3 requires the declared 24kHz/6kbps/8x1024/192 EnCodec contract")
-    expected_tokens = 96 if cp_temporal else 32
+    expected_tokens = 96 if (cp_temporal or bridge) else 32
     if int(cfg["audio"]["content_tokens"]) != expected_tokens or int(cfg["audio"]["native_mel_frames"]) != 161:
         raise ValueError(f"v3 requires {expected_tokens} aligned content tokens and 161 native SpeechT5 Mel frames")
     if str(cfg["vocoder"].get("native_contract")) != "speecht5_native_log_mel_v1":

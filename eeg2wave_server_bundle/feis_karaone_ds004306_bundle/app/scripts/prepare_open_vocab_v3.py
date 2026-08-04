@@ -64,7 +64,9 @@ def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, reco
         # cache and must be cryptographically bound to both fine-tuned audio
         # backbones and their fail-closed adaptation gate.
         dependencies = (
-            () if str(cfg.get("experiment", {}).get("schema", "")) == "openvoice-v3-cp-temporal-large-v1"
+            () if str(cfg.get("experiment", {}).get("schema", "")) in {
+                "openvoice-v3-cp-temporal-large-v1", "openvoice-v3-mfcc-encodec-bridge-v2"
+            }
             else ("encodec_manifest", "vocoder_manifest", "speaker_adaptation_manifest", "audio_adaptation_gate")
         )
         for key in dependencies:
@@ -91,6 +93,18 @@ def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, reco
             "role_counts": role_counts(records),
             "fit_eligible": int(((records.roles == "fit") & records.arrays["fit_eligible"]).sum()),
             "has_speaker_embeddings": "speaker_reference_embedding" in records.arrays,
+            "feature_contract": {
+                "sample_rate": int(cfg["audio"]["sample_rate"]),
+                "n_fft": int(cfg["audio"]["n_fft"]),
+                "mel_bins": int(cfg["audio"]["mel_bins"]),
+                "mfcc_bins": int(cfg["audio"]["mfcc_bins"]),
+                "content_coefficients": "c1..c39" if "bridge" in str(cfg.get("version", "")) else "schema_specific",
+                "c0_in_content": False if "bridge" in str(cfg.get("version", "")) else None,
+                "cmvn": "utterance_level_active_support" if "bridge" in str(cfg.get("version", "")) else "schema_specific",
+                "vad_crop": "active_start_to_active_end_then_relative_time_resample" if "bridge" in str(cfg.get("version", "")) else "schema_specific",
+                "target_frames": int(cfg["audio"]["canonical_frames"]),
+                "interpolation": "torch_linear_align_corners_false",
+            },
             "supporting_artifacts": supporting_artifacts,
         },
     )
