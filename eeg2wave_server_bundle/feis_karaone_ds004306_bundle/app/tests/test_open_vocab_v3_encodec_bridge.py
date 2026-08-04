@@ -13,6 +13,7 @@ from src.open_vocab_v3.encodec_bridge import (
     SharedContentMFCCDecoder, masked_token_infonce,
 )
 from src.open_vocab_v3.runtime import checkpoint_schema, load_config, output_path
+from scripts.evaluate_open_vocab_v3_encodec_bridge import _probe
 
 
 APP=Path(__file__).resolve().parents[1]
@@ -63,8 +64,11 @@ def test_c_local_decoder_and_eeg_forward_have_the_fixed_public_contract():
     assert diagnostics["attention"].shape==(2,161,96)
     assert tuple(inspect.signature(EEGCEncoder.forward).parameters)==("self","eeg","channel_xyz","channel_mask","time_mask")
     eeg=EEGCEncoder(dimension=32,heads=4,layers=1,local_layers=1,dropout=0)
-    state=eeg(torch.randn(2,4,128),torch.randn(2,4,3),torch.ones(2,4,dtype=torch.bool),torch.ones(2,128,dtype=torch.bool))
+    signal=torch.randn(2,4,257,requires_grad=True)  # deliberately not divisible by 96
+    state=eeg(signal,torch.randn(2,4,3),torch.ones(2,4,dtype=torch.bool),torch.ones(2,257,dtype=torch.bool))
     assert state.local.shape==(2,96,32)
+    state.local.square().mean().backward()
+    assert signal.grad is not None and torch.isfinite(signal.grad).all()
 
 
 def test_same_label_trials_are_masked_from_local_contrastive_negatives():
@@ -125,3 +129,10 @@ def test_collate_preserves_immutable_source_indices_for_cache_lineage():
     }
     batch = collate([item, {**item, "source_index": 93, "sample_key": "k93"}])
     assert batch["source_index"].tolist() == [17, 93]
+
+
+def test_probe_can_train_inside_a_no_grad_evaluation_gate():
+    train = np.asarray([[0., 0.], [0.1, 0.], [2., 2.], [2.1, 2.]], dtype=np.float32)
+    with torch.no_grad():
+        score = _probe(train, ["a", "a", "b", "b"], train, ["a", "a", "b", "b"], ["a", "b"], epochs=20)
+    assert score >= 0.75

@@ -140,7 +140,12 @@ class EEGCEncoder(nn.Module):
         signal = eeg.reshape(batch * channels, 1, samples)
         multi = torch.cat([F.gelu(layer(signal)) for layer in self.temporal], dim=1)
         hidden = self.temporal_projection(multi)
-        hidden = F.adaptive_avg_pool1d(hidden, 96).transpose(1, 2).reshape(batch, channels, 96, -1)
+        # PyTorch/MPS does not implement adaptive_avg_pool1d when the input
+        # length is not divisible by 96 (KaraOne EEG commonly is not).  Linear
+        # normalized-time resampling preserves the public 96-token contract,
+        # remains differentiable, and is supported identically on CPU/MPS.
+        hidden = F.interpolate(hidden, size=96, mode="linear", align_corners=False)
+        hidden = hidden.transpose(1, 2).reshape(batch, channels, 96, -1)
         hidden = hidden + self.coordinate(channel_xyz).unsqueeze(2)
         score = self.channel_score(hidden).squeeze(-1).masked_fill(~channel_mask.unsqueeze(-1), -1e4)
         weights = torch.softmax(score, dim=1).unsqueeze(-1)

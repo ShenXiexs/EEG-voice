@@ -98,15 +98,19 @@ def _bootstrap_margin(pred,target,controls,draws=1000):
 def _probe(train_x,train_y,dev_x,dev_y,classes,epochs=120):
     # A deliberately separate linear probe: its optimizer only sees detached
     # numpy features, so it cannot update Audio-C or speaker conditioning.
-    device=torch.device("cpu"); mapping={name:index for index,name in enumerate(classes)}
-    mean=train_x.mean(0,keepdims=True);scale=np.maximum(train_x.std(0,keepdims=True),1e-4)
-    train=torch.from_numpy(((train_x-mean)/scale).astype(np.float32));dev=torch.from_numpy(((dev_x-mean)/scale).astype(np.float32))
-    model=torch.nn.Linear(train.shape[1],len(classes));opt=torch.optim.AdamW(model.parameters(),lr=.03,weight_decay=1e-4)
-    target=torch.tensor([mapping[x] for x in train_y]);
-    for _ in range(epochs):
-        opt.zero_grad();loss=F.cross_entropy(model(train),target);loss.backward();opt.step()
-    prediction=model(dev).argmax(1).numpy();truth=np.asarray([mapping[x] for x in dev_y])
-    return float(np.mean(prediction==truth))
+    # C1 is an inference-only gate and therefore decorated with no_grad.  The
+    # probe is intentionally a fresh diagnostic model, so locally re-enable
+    # gradients without reconnecting to the frozen audio feature graph.
+    with torch.enable_grad():
+        device=torch.device("cpu"); mapping={name:index for index,name in enumerate(classes)}
+        mean=train_x.mean(0,keepdims=True);scale=np.maximum(train_x.std(0,keepdims=True),1e-4)
+        train=torch.from_numpy(((train_x-mean)/scale).astype(np.float32));dev=torch.from_numpy(((dev_x-mean)/scale).astype(np.float32))
+        model=torch.nn.Linear(train.shape[1],len(classes));opt=torch.optim.AdamW(model.parameters(),lr=.03,weight_decay=1e-4)
+        target=torch.tensor([mapping[x] for x in train_y]);
+        for _ in range(epochs):
+            opt.zero_grad();loss=F.cross_entropy(model(train),target);loss.backward();opt.step()
+        prediction=model(dev).argmax(1).detach().numpy();truth=np.asarray([mapping[x] for x in dev_y])
+        return float(np.mean(prediction==truth))
 
 
 def _selected_dev(records,cfg):
@@ -223,6 +227,7 @@ def c1(cp,cfg,records,device):
     return {"gate":"C1","metrics":metric,"checks":checks,"passed":bool(all(checks.values()))}
 
 
+@torch.no_grad()
 def c2(cp,cfg,records,device):
     selected=_selected_dev(records,cfg);dataset=cache_dataset(records,cp,cfg,selected);audio,decoder,_,bridge=_models(cp,cfg,records,device,bridge=True,audio=True);renderer=FrozenEnCodecRenderer(output_path(cp,cfg,"encodec_root"),device=device,bandwidth=float(cfg["audio"]["encodec_bandwidth"]));fit=fit_indices(records,dev=False);names,prototypes=label_prototypes(records,fit);hubert=HubertMetric(output_path(cp,cfg,"hubert_root"),layer=int(cfg["teachers"]["hubert_layer"]),device=device);waves={"pred_c_real_p":[],"zero_c_real_p":[],"shuffled_c_real_p":[]};refs=[];labels=[];pred=[];truth=[]
     for batch in batches(dataset,cfg,device):
