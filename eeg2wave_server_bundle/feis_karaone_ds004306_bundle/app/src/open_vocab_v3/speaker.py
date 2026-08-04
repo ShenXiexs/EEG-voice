@@ -106,8 +106,11 @@ def attach_speaker_embeddings(
     keys = records.arrays["sample_keys"].astype(str)
     subjects = records.arrays["subjects"].astype(str)
     cp_temporal = str(cfg.get("version", "")) == "openvoice-v3-cp-temporal-large-v1"
-    bridge = str(cfg.get("version", "")) == "openvoice-v3-mfcc-encodec-bridge-v2"
+    bridge = str(cfg.get("version", "")) in {
+        "openvoice-v3-mfcc-encodec-bridge-v2", "openvoice-v3-mfcc-encodec-rvq-repair-v3"
+    }
     strict_fit_voice = cp_temporal or bridge
+    rvq_repair = str(cfg.get("version", "")) == "openvoice-v3-mfcc-encodec-rvq-repair-v3"
     fit = (records.roles == "fit") & records.arrays["fit_eligible"].astype(bool)
     if strict_fit_voice and "fit_internal_dev" in records.arrays:
         fit &= ~records.arrays["fit_internal_dev"].astype(bool)
@@ -178,10 +181,15 @@ def attach_speaker_embeddings(
     if strict_fit_voice:
         audit_medoid = audit_values[medoid_trials].mean(0)
         audit_medoid = audit_medoid / max(float(np.linalg.norm(audit_medoid)), 1.0e-8)
-        reference[~fit] = medoid
-        audit_reference[~fit] = audit_medoid
-        values[~fit] = medoid
-        audit_values[~fit] = audit_medoid
+        # Repair-v3 E1b is an internal fit-dev oracle.  Its V must be an
+        # independent same-subject reference from fit-train, not a canonical
+        # voice replacement.  External held-out roles still receive only the
+        # fit-only canonical fallback before approval.
+        fallback = (records.roles != "fit") if rvq_repair else ~fit
+        reference[fallback] = medoid
+        audit_reference[fallback] = audit_medoid
+        values[fallback] = medoid
+        audit_values[fallback] = audit_medoid
     records.arrays["speaker_target_embedding"] = values
     records.arrays["speaker_reference_embedding"] = reference
     records.arrays["speaker_audit_target_embedding"] = audit_values

@@ -207,7 +207,12 @@ class FrozenEnCodecRenderer(nn.Module):
         super().__init__()
         from transformers import EncodecModel
         model = EncodecModel.from_pretrained(str(root), local_files_only=True).to(device).eval()
-        model.config.normalize = True
+        # Never override the pretrained codec's normalization contract.  The
+        # repair-v3 renderer additionally persists audio scales when this is
+        # true; legacy bridge-v2 is deliberately rejected in that case rather
+        # than silently discarding scale information.
+        if bool(model.config.normalize):
+            raise RuntimeError("bridge-v2 cannot preserve EnCodec audio_scale; use rvq-repair-v3")
         for parameter in model.parameters():
             parameter.requires_grad_(False)
         self.model = model

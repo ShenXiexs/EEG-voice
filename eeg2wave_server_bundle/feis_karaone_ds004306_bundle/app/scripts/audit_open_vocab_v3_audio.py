@@ -16,8 +16,8 @@ if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
 from src.open_vocab_0724.audio_features import AcousticFeatureConfig, AudioPreparationConfig, extract_acoustic_features
-from src.open_vocab_v3.data import _read_waveform, light_prepare_waveform
-from src.open_vocab_v3.runtime import load_config, output_path, write_json
+from src.open_vocab_v3.data import _read_waveform, fit_source_keys, light_prepare_waveform
+from src.open_vocab_v3.runtime import load_config, output_path, resolve_config_path, write_json
 
 
 def read_manifest(path: Path) -> list[dict[str, str]]:
@@ -41,9 +41,11 @@ def existing_selection(path: Path) -> dict[str, dict[str, str]]:
 
 def main() -> None:
     parser=argparse.ArgumentParser(description="Audit KaraOne raw audio before optional v3 denoising")
-    parser.add_argument("--config",type=Path,required=True);args=parser.parse_args()
+    parser.add_argument("--config",type=Path,required=True);parser.add_argument("--fit-only",action="store_true");args=parser.parse_args()
     config_path,cfg=load_config(args.config)
     rows=read_manifest(output_path(config_path,cfg,"unified_manifest"));root=output_path(config_path,cfg,"audio_root")
+    if args.fit_only:
+        source_root=resolve_config_path(config_path,cfg["paths"]["source_cache_root"]);allowed=fit_source_keys(source_root,subject_holdout=cfg["split"]["subject_holdout"],unseen_label=cfg["split"]["unseen_label"]);rows=[row for row in rows if str(row["sample_key"]) in allowed]
     prep_cfg=AudioPreparationConfig(sample_rate=int(cfg["audio"]["sample_rate"]),max_active_seconds=float(cfg["audio"]["max_active_seconds"]),target_rms=float(cfg["audio"]["target_rms"]))
     feature_cfg=AcousticFeatureConfig(sample_rate=int(cfg["audio"]["sample_rate"]),n_fft=int(cfg["audio"]["n_fft"]),mel_bins=int(cfg["audio"]["mel_bins"]),max_frames=int(cfg["audio"]["canonical_frames"]),min_db=float(cfg["audio"]["mel_db_min"]),max_db=float(cfg["audio"]["mel_db_max"]))
     manual=set(map(str,cfg["audio"].get("manual_review_sample_keys",())))
@@ -56,7 +58,7 @@ def main() -> None:
         low=bool(np.isfinite(contrast) and contrast<float(cfg["audio"]["low_contrast_db_threshold"]));named=key in manual
         audit.append({"sample_key":key,"audio_relpath":row["audio_relpath"],"subject":row.get("subject",""),"label":row.get("label",""),"native_sample_rate":rate,"active_duration_seconds":prepared.active_duration_seconds,"active_inactive_contrast_db":contrast,"low_contrast":low,"manual_review_required":named,"denoise_candidate":low or named})
     write_csv(output_path(config_path,cfg,"raw_audio_audit_csv"),audit)
-    write_json(output_path(config_path,cfg,"raw_audio_audit"),{"schema_version":"openvoice-v3-raw-audio-audit-v1","n":len(audit),"candidate_count":sum(bool(row["denoise_candidate"]) for row in audit),"records":audit})
+    write_json(output_path(config_path,cfg,"raw_audio_audit"),{"schema_version":"openvoice-v3-raw-audio-audit-v1","scope":"fit_only" if args.fit_only else "all_protocol_roles","n":len(audit),"candidate_count":sum(bool(row["denoise_candidate"]) for row in audit),"records":audit})
     selection_path=output_path(config_path,cfg,"denoise_selection");old=existing_selection(selection_path);selection=[]
     for row in audit:
         if not row["denoise_candidate"] and row["sample_key"] not in old:continue

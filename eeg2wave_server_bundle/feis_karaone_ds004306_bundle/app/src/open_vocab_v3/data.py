@@ -27,6 +27,7 @@ SOURCE_SPLITS = ("train", "validation", "locked_test", "diagnostic")
 PREPARATION_SCHEMA = "openvoice-v3-encodec-clip-mfcc-preparation-v2-native-mel-161"
 CP_TEMPORAL_PREPARATION_SCHEMA = "openvoice-v3-cp-temporal-preparation-v1-161"
 BRIDGE_PREPARATION_SCHEMA = "openvoice-v3-mfcc-encodec-bridge-preparation-v2-161"
+RVQ_REPAIR_PREPARATION_SCHEMA = "openvoice-v3-mfcc-encodec-rvq-repair-preparation-v3-161"
 PAIR_ROLES = (
     "fit",
     "subject_holdout_seen",
@@ -69,6 +70,66 @@ def merge_source(root: Path) -> dict[str, np.ndarray]:
     keys = values["sample_keys"].astype(str)
     if len(keys) != 1913 or len(set(keys.tolist())) != len(keys):
         raise ValueError(f"expected 1,913 unique source records, found {len(keys)}")
+    return values
+
+
+def fit_source_keys(root: Path, *, subject_holdout: Sequence[str], unseen_label: str) -> set[str]:
+    """Read train/validation metadata and return only final-role fit rows.
+
+    This helper lets the strict audio audit avoid opening any validation,
+    diagnostic, locked-test, held-subject, or unseen-label WAV.
+    """
+    paths = [root / f"records_{split}.npz" for split in ("train", "validation")]
+    if not all(path.is_file() for path in paths):
+        fallback = root / "prepared_encodec_bridge_v2.npz"
+        if not fallback.is_file():
+            raise FileNotFoundError(f"source records and prepared fallback are both missing under {root}")
+        raw = np.load(fallback, allow_pickle=False); roles = np.asarray(raw["roles"]).astype(str)
+        return set(np.asarray(raw["sample_keys"]).astype(str)[roles == "fit"].tolist())
+    metadata = [np.load(path, allow_pickle=False) for path in paths]
+    keys = np.concatenate([np.asarray(raw["sample_keys"]).astype(str) for raw in metadata])
+    subjects = np.concatenate([np.asarray(raw["subjects"]).astype(str) for raw in metadata])
+    labels = np.concatenate([np.asarray(raw["labels"]).astype(str) for raw in metadata])
+    held = set(map(str, subject_holdout)); unseen = normalize_label(unseen_label)
+    keep = np.asarray([(subject not in held) and normalize_label(label) != unseen for subject, label in zip(subjects, labels)])
+    return set(keys[keep].tolist())
+
+
+def merge_fit_source(root: Path, *, subject_holdout: Sequence[str], unseen_label: str) -> dict[str, np.ndarray]:
+    """Load only final-role fit rows from train/validation source containers.
+
+    The NPZ containers are monolithic, so NumPy may decompress source rows
+    that are subsequently excluded. No excluded row is returned, cached,
+    trained on, evaluated, rendered, or exposed through ``V3Dataset``.
+    """
+    paths = [root / f"records_{split}.npz" for split in ("train", "validation")]
+    required = {
+        "eeg", "channel_xyz", "channel_mask", "time_mask", "hubert", "hubert_mask",
+        "mel", "activity", "duration", "sample_keys", "audio_keys", "labels", "subjects",
+    }
+    if not all(path.is_file() for path in paths):
+        fallback = root / "prepared_encodec_bridge_v2.npz"
+        if not fallback.is_file():
+            raise FileNotFoundError(f"source records and prepared fallback are both missing under {root}")
+        raw = np.load(fallback, allow_pickle=False);missing = required - set(raw.files)
+        if missing:
+            raise ValueError(f"prepared source fallback {fallback} lacks {sorted(missing)}")
+        roles = np.asarray(raw["roles"]).astype(str);keep = roles == "fit"
+        values = {key: np.asarray(raw[key])[keep] for key in required};values["source_split"] = np.asarray(raw["source_split"])[keep].astype(str)
+        if len(values["sample_keys"]) != 1019:
+            raise ValueError(f"prepared source fallback must yield 1,019 fit rows, found {len(values['sample_keys'])}")
+        return values
+    parts = [np.load(path, allow_pickle=False) for path in paths]
+    for path, raw in zip(paths, parts):
+        missing = required - set(raw.files)
+        if missing:
+            raise ValueError(f"source cache {path} lacks {sorted(missing)}")
+    subjects = np.concatenate([np.asarray(raw["subjects"]).astype(str) for raw in parts]); labels = np.concatenate([np.asarray(raw["labels"]).astype(str) for raw in parts])
+    held = set(map(str, subject_holdout)); unseen = normalize_label(unseen_label)
+    keep = np.asarray([(subject not in held) and normalize_label(label) != unseen for subject, label in zip(subjects, labels)])
+    values = {key: np.concatenate([np.asarray(raw[key]) for raw in parts])[keep] for key in required}
+    source_split = np.concatenate([np.full(len(raw["sample_keys"]), split) for split, raw in zip(("train", "validation"), parts)])
+    values["source_split"] = source_split[keep]
     return values
 
 
@@ -311,14 +372,19 @@ class PreparedRecords:
         return int(len(self.roles))
 
 
-def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRecords, list[dict[str, Any]]]:
+def prepare_records(config_path: Path, cfg: dict[str, Any], *, fit_only: bool = False) -> tuple[PreparedRecords, list[dict[str, Any]]]:
     cp_temporal = str(cfg.get("version", "")) == "openvoice-v3-cp-temporal-large-v1"
-    bridge = str(cfg.get("version", "")) == "openvoice-v3-mfcc-encodec-bridge-v2"
+    bridge = str(cfg.get("version", "")) in {
+        "openvoice-v3-mfcc-encodec-bridge-v2", "openvoice-v3-mfcc-encodec-rvq-repair-v3",
+    }
+    rvq_repair = str(cfg.get("version", "")) == "openvoice-v3-mfcc-encodec-rvq-repair-v3"
     temporal_schema = cp_temporal or bridge
     source_root = (config_path.parent / cfg["paths"]["source_cache_root"]).resolve()
     audio_root = (config_path.parent / cfg["data"]["audio_root"]).resolve()
     manifest = (config_path.parent / cfg["data"]["unified_manifest"]).resolve()
-    arrays = merge_source(source_root)
+    arrays = merge_fit_source(
+        source_root, subject_holdout=cfg["split"]["subject_holdout"], unseen_label=cfg["split"]["unseen_label"],
+    ) if fit_only else merge_source(source_root)
     # Legacy v0728 Mel is retained only as lineage, never routed to SpeechT5.
     arrays["legacy_v0728_mel"] = np.asarray(arrays["mel"], dtype=np.float32).copy()
     for key in ("sample_keys", "audio_keys", "labels", "subjects", "source_split"):
@@ -469,7 +535,7 @@ def prepare_records(config_path: Path, cfg: dict[str, Any]) -> tuple[PreparedRec
             }
         )
     preparation_schema = (
-        CP_TEMPORAL_PREPARATION_SCHEMA if cp_temporal else BRIDGE_PREPARATION_SCHEMA if bridge
+        CP_TEMPORAL_PREPARATION_SCHEMA if cp_temporal else RVQ_REPAIR_PREPARATION_SCHEMA if rvq_repair else BRIDGE_PREPARATION_SCHEMA if bridge
         else PREPARATION_SCHEMA
     )
     arrays.update(
@@ -551,12 +617,12 @@ def load_prepared(path: Path, expected_schema: str | None = None) -> PreparedRec
     if missing:
         raise ValueError(f"v3 prepared cache lacks {sorted(missing)}")
     schema = str(np.asarray(raw["v3_preparation_schema"]).item())
-    accepted = {PREPARATION_SCHEMA, CP_TEMPORAL_PREPARATION_SCHEMA, BRIDGE_PREPARATION_SCHEMA}
+    accepted = {PREPARATION_SCHEMA, CP_TEMPORAL_PREPARATION_SCHEMA, BRIDGE_PREPARATION_SCHEMA, RVQ_REPAIR_PREPARATION_SCHEMA}
     if schema not in accepted or (expected_schema is not None and schema != expected_schema):
         raise ValueError(
             f"v3 cache schema {schema!r} is stale; rerun prepare_open_vocab_v3.py --force"
         )
-    if schema in {CP_TEMPORAL_PREPARATION_SCHEMA, BRIDGE_PREPARATION_SCHEMA}:
+    if schema in {CP_TEMPORAL_PREPARATION_SCHEMA, BRIDGE_PREPARATION_SCHEMA, RVQ_REPAIR_PREPARATION_SCHEMA}:
         cp_required = {
             "content_mfcc", "eeg_content_mfcc", "canonical_content_mask", "p_base", "p_plus", "mfcc_c0", "duration_fraction",
             "canonical_p_base", "canonical_duration_fraction", "fit_internal_dev",
@@ -564,7 +630,7 @@ def load_prepared(path: Path, expected_schema: str | None = None) -> PreparedRec
         cp_missing = cp_required - set(raw.files)
         if cp_missing:
             raise ValueError(f"CP-temporal cache lacks {sorted(cp_missing)}; rerun prepare --force")
-    if schema == BRIDGE_PREPARATION_SCHEMA:
+    if schema in {BRIDGE_PREPARATION_SCHEMA, RVQ_REPAIR_PREPARATION_SCHEMA}:
         bridge_required = {
             "active_frame_start", "active_frame_end", "canonical_p_bank",
             "canonical_p_bank_duration_fraction", "canonical_p_bank_keys",
@@ -594,8 +660,8 @@ class V3Dataset(Dataset[dict[str, Any]]):
         index = self.indices[item]
         value = self.records.arrays
         result = {
-            # Preserve the immutable 1,913-record source identity through any
-            # number of torch.utils.data.Subset wrappers.  Downstream token
+            # Preserve the immutable prepared-cache row identity through any
+            # number of torch.utils.data.Subset wrappers. Downstream token
             # caches must key on this value, never on a subset-local position.
             "source_index": int(index),
             "eeg": value["eeg"][index], "channel_xyz": value["channel_xyz"][index],

@@ -24,6 +24,7 @@ def parse() -> argparse.Namespace:
     parser.add_argument("--with-speaker", action="store_true", help="cache non-target ECAPA references for V1/V2 only")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--fit-only", action="store_true", help="exclude every held-out row before WAV feature extraction")
     return parser.parse_args()
 
 
@@ -65,7 +66,7 @@ def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, reco
         # backbones and their fail-closed adaptation gate.
         dependencies = (
             () if str(cfg.get("experiment", {}).get("schema", "")) in {
-                "openvoice-v3-cp-temporal-large-v1", "openvoice-v3-mfcc-encodec-bridge-v2"
+                "openvoice-v3-cp-temporal-large-v1", "openvoice-v3-mfcc-encodec-bridge-v2", "openvoice-v3-mfcc-encodec-rvq-repair-v3"
             }
             else ("encodec_manifest", "vocoder_manifest", "speaker_adaptation_manifest", "audio_adaptation_gate")
         )
@@ -78,6 +79,10 @@ def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, reco
                 "sha256": sha256_file(artifact),
                 "bytes": artifact.stat().st_size,
             }
+    content_only_mfcc = str(cfg.get("version", "")) in {
+        "openvoice-v3-mfcc-encodec-bridge-v2",
+        "openvoice-v3-mfcc-encodec-rvq-repair-v3",
+    }
     write_json(
         path,
         {
@@ -90,6 +95,7 @@ def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, reco
             "bytes": cache_path.stat().st_size,
             "mtime_ns": cache_path.stat().st_mtime_ns,
             "records": len(records),
+            "scope": "fit_only" if set(records.roles.tolist()) == {"fit"} else "all_protocol_roles",
             "role_counts": role_counts(records),
             "fit_eligible": int(((records.roles == "fit") & records.arrays["fit_eligible"]).sum()),
             "has_speaker_embeddings": "speaker_reference_embedding" in records.arrays,
@@ -98,10 +104,10 @@ def write_prepared_manifest(config_path: Path, cfg: dict, cache_path: Path, reco
                 "n_fft": int(cfg["audio"]["n_fft"]),
                 "mel_bins": int(cfg["audio"]["mel_bins"]),
                 "mfcc_bins": int(cfg["audio"]["mfcc_bins"]),
-                "content_coefficients": "c1..c39" if "bridge" in str(cfg.get("version", "")) else "schema_specific",
-                "c0_in_content": False if "bridge" in str(cfg.get("version", "")) else None,
-                "cmvn": "utterance_level_active_support" if "bridge" in str(cfg.get("version", "")) else "schema_specific",
-                "vad_crop": "active_start_to_active_end_then_relative_time_resample" if "bridge" in str(cfg.get("version", "")) else "schema_specific",
+                "content_coefficients": "c1..c39" if content_only_mfcc else "schema_specific",
+                "c0_in_content": False if content_only_mfcc else None,
+                "cmvn": "utterance_level_active_support" if content_only_mfcc else "schema_specific",
+                "vad_crop": "active_start_to_active_end_then_relative_time_resample" if content_only_mfcc else "schema_specific",
                 "target_frames": int(cfg["audio"]["canonical_frames"]),
                 "interpolation": "torch_linear_align_corners_false",
             },
@@ -155,7 +161,7 @@ def main() -> None:
             write_prepared_manifest(config_path, cfg, cache_path, records)
         print(f"[v3 prepare] exists: {cache_path}", flush=True)
         return
-    records, audit = prepare_records(config_path, cfg)
+    records, audit = prepare_records(config_path, cfg, fit_only=args.fit_only)
     speaker = None
     if args.with_speaker:
         speaker = attach_speaker_embeddings(records, config_path=config_path, cfg=cfg, device=default_device(args.device))

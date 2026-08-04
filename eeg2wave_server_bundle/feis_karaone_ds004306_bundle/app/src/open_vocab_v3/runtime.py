@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import yaml
 
-from . import BRIDGE_VERSION, CP_TEMPORAL_VERSION, LEGACY_VERSION, VERSION
+from . import BRIDGE_VERSION, CP_TEMPORAL_VERSION, LEGACY_VERSION, RVQ_REPAIR_VERSION, VERSION
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -38,6 +38,19 @@ def content_schema(cfg: dict[str, Any]) -> str:
 
 
 def checkpoint_schema(cfg: dict[str, Any], component: str) -> str:
+    if content_schema(cfg) == RVQ_REPAIR_VERSION:
+        values = {
+            "rvq_bridge": "openvoice-v3-sequential-rvq-bridge-v3",
+            "rvq_micro": "openvoice-v3-sequential-rvq-micro-v3",
+            "audio_c": "openvoice-v3-audio-c-teacher-rvq-v3",
+            "micro_m0a": "openvoice-v3-eeg-direct-mfcc-memorization-v3",
+            "micro_m0b": "openvoice-v3-eeg-clip-memorization-v3",
+            "micro_m1": "openvoice-v3-eeg-micro-generalization-v3",
+            "label_evaluator": "openvoice-v3-fit-hubert-linear-probe-v3",
+        }
+        if component not in values:
+            raise KeyError(f"unknown RVQ-repair checkpoint component: {component}")
+        return values[component]
     if content_schema(cfg) == BRIDGE_VERSION:
         values = {
             "bridge": "openvoice-v3-encodec-latent-bridge-v2",
@@ -158,14 +171,14 @@ def load_config(path: str | Path) -> tuple[Path, dict[str, Any]]:
         base = read_recursive(resolve_config_path(candidate, str(inherited)), seen | {candidate})
         return _deep_merge(base, value)
     cfg = read_recursive(config_path, set())
-    if cfg.get("version") not in {VERSION, LEGACY_VERSION, CP_TEMPORAL_VERSION, BRIDGE_VERSION}:
+    if cfg.get("version") not in {VERSION, LEGACY_VERSION, CP_TEMPORAL_VERSION, BRIDGE_VERSION, RVQ_REPAIR_VERSION}:
         raise ValueError(f"unsupported v3 config: {cfg.get('version')!r}")
     if tuple(cfg["split"]["subject_holdout"]) != ("karaone:MM19", "karaone:MM20"):
         raise ValueError("v3 preregisters MM19/MM20 as the subject holdout")
     if str(cfg["split"]["unseen_label"]).strip().lower() != "pot":
         raise ValueError("v3 preregisters pot as the unseen label")
     cp_temporal = cfg.get("version") == CP_TEMPORAL_VERSION
-    bridge = cfg.get("version") == BRIDGE_VERSION
+    bridge = cfg.get("version") in {BRIDGE_VERSION, RVQ_REPAIR_VERSION}
     expected_frames = 161 if (cp_temporal or bridge) else 256
     if int(cfg["audio"]["canonical_frames"]) != expected_frames:
         raise ValueError(f"v3 content gate requires exactly {expected_frames} canonical MFCC frames")
