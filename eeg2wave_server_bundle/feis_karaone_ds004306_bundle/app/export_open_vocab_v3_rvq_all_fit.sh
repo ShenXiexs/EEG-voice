@@ -12,7 +12,9 @@ PY="$APP_DIR/.venv_0730/bin/python"
 [[ -f "$CFG" ]] || { echo "missing config: $CFG" >&2; exit 2; }
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 export OPEN_VOCAB_V3_EXPLORATION=1
-export OPEN_VOCAB_V3_ARTIFACT_ROOT_NAME="open_vocab_v3_mfcc_encodec_rvq_repair_v3_run_${RUN_ID}_explore"
+# runtime.py appends `_explore` when OPEN_VOCAB_V3_EXPLORATION=1; keep the
+# base name here so the existing run is resolved exactly once.
+export OPEN_VOCAB_V3_ARTIFACT_ROOT_NAME="open_vocab_v3_mfcc_encodec_rvq_repair_v3_run_${RUN_ID}"
 cd "$APP_DIR"
 if [[ "${RESUME:-0}" == "1" ]]; then
   exec "$PY" scripts/export_open_vocab_v3_encodec_rvq_repair_all_fit.py \

@@ -1,7 +1,0 @@
-{
-  "mode": "eeg_only_direct",
-  "data_root": "data/feis",
-  "app_config": "app/configs/direct_eeg2speech.yaml",
-  "model_inputs": ["eeg", "stage_idx"],
-  "identity_free": true
-}
