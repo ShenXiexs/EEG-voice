@@ -168,11 +168,6 @@ x
 # Local documentation and generated research notes
 docs/
 
-# eeg_to_voice_chinese: track source/config/docs, keep local data and artifacts out of git.
-!eeg2wave_server_bundle/eeg_to_voice_chinese/
-!eeg2wave_server_bundle/eeg_to_voice_chinese/**
-eeg2wave_server_bundle/eeg_to_voice_chinese/data/
-eeg2wave_server_bundle/eeg_to_voice_chinese/artifacts/
 
 # Local cloned/reference model repositories
 paper-ref/audio-decoder/
