@@ -1,0 +1,6 @@
+# Shared EEG/audio alignment environment for both datasets.
+mne
+numpy
+pandas
+pyyaml
+soundfile
