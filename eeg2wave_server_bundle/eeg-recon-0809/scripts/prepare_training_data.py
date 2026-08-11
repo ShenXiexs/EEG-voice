@@ -196,6 +196,15 @@ def runtime():
     return yaml, pd
 
 
+def progress(iterable, *, desc: str, total: int | None = None):
+    """Use tqdm when installed, without making provenance helpers depend on it."""
+    try:
+        from tqdm.auto import tqdm  # type: ignore
+        return tqdm(iterable, desc=desc, total=total, dynamic_ncols=True, unit="item")
+    except ImportError:
+        return iterable
+
+
 def load_config(path: Path) -> tuple[dict[str, Any], str]:
     yaml, _ = runtime()
     raw = path.read_bytes()
@@ -280,7 +289,7 @@ def _ds004_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str
     rows: list[dict[str, Any]] = []
     event_files = sorted(data_root.glob("sub-*/ses-*/eeg/*_events.tsv"))
     subject_seen = set()
-    for events_path in event_files:
+    for events_path in progress(event_files, desc="audit ds004940 event files"):
         parts = events_path.name.split("_")
         task = next((x.removeprefix("task-") for x in parts if x.startswith("task-")), "unknown")
         run = next((x.removeprefix("run-") for x in parts if x.startswith("run-")), "01")
@@ -393,7 +402,8 @@ def _ds006_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str
     rows: list[dict[str, Any]] = []
     subjects = sorted(p.name.replace("sub-", "S") for p in data_root.glob("sub-*"))
     # BIDS subject S01 is named sub-01. Keep the official identifier in auxiliary provenance.
-    for bids_subject in sorted(data_root.glob("sub-*")):
+    bids_subjects = sorted(data_root.glob("sub-*"))
+    for bids_subject in progress(bids_subjects, desc="audit ds006104 subjects"):
         suffix = bids_subject.name.removeprefix("sub-")
         subject = f"S{int(suffix):02d}" if suffix.isdigit() else suffix
         aux = _fetch_aux_event(subject, config) if fetch_aux else output_root(config) / "auxiliary" / spec["auxiliary_repository"]["commit"] / f"{subject}_Tab.csv"
@@ -527,7 +537,7 @@ def audit(config: dict[str, Any], strict: bool, fetch_aux: bool) -> int:
     # Do not put wall-clock state in this immutable lock: its content hash must
     # remain identical when the same raw data are audited again.
     lock: dict[str, Any] = {"schema_version": config["schema_version"], "config_sha256": config["_config_sha256"], "files": [], "official_aux": {}}
-    for dataset, spec in config["sources"].items():
+    for dataset, spec in progress(config["sources"].items(), desc="audit pinned sources", total=len(config["sources"])):
         data_root = ROOT / spec["data_root"]
         description = data_root / "dataset_description.json"
         if description.exists():
@@ -563,7 +573,7 @@ def audit(config: dict[str, Any], strict: bool, fetch_aux: bool) -> int:
     # Add every actually referenced source only once; raw hashes are intentionally computed here,
     # before build, so resume can reject a mutated raw dataset.
     sources = sorted({r[k] for r in rows for k in ("source_eeg_path", "source_event_path", "official_aux_path", "audio_path") if r.get(k)})
-    for relative in sources:
+    for relative in progress(sources, desc="SHA256 source lock"):
         path = ROOT / relative
         if path.exists():
             entry = source_lock_entry(path, "source")
@@ -696,7 +706,7 @@ def build_audio_bank(config: dict[str, Any], resume: bool) -> int:
         bank.attrs["code_diff_hash"] = sha256_bytes(diff.encode())
         bank.attrs["audio_config"] = json.dumps(config["audio"], sort_keys=True)
         index = []
-        for _, row in unique.iterrows():
+        for _, row in progress(unique.iterrows(), desc="audio bank", total=len(unique)):
             source = ROOT / row.audio_path
             wave, source_rate = torchaudio.load(str(source))
             original_channels, original_samples = int(wave.shape[0]), int(wave.shape[1])
@@ -852,7 +862,8 @@ def build(config: dict[str, Any], dataset: str, subjects: str, resume: bool, all
     selected = _rows_for_shards(frame, dataset, requested)
     built_rows = []
     build_timestamp_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    for (ds, subject, task), group in selected.groupby(["dataset", "subject", "task"], sort=True):
+    shard_groups = list(selected.groupby(["dataset", "subject", "task"], sort=True))
+    for (ds, subject, task), group in progress(shard_groups, desc="EEG shards", total=len(shard_groups)):
         spec = config["sources"][ds]
         canonical = spec["channel_order"]
         target_len = config["harmonized"]["epoch"][ds]["total_samples_target"]
@@ -863,7 +874,7 @@ def build(config: dict[str, Any], dataset: str, subjects: str, resume: bool, all
                     raise RuntimeError(f"resume refuses incompatible shard {target}")
             continue
         eegs=[]; valids=[]; cleans=[]; audio_losses=[]; tmsm=[]; bads=[]; interps=[]; zeros=[]; ids=[]; retained=[]
-        for _, row in group.iterrows():
+        for _, row in progress(group.iterrows(), desc=f"{ds}/{subject}/{task}", total=len(group)):
             raw_path = ROOT / row.source_eeg_path
             try:
                 raw = mne.io.read_raw_bdf(raw_path, preload=True, verbose="ERROR") if raw_path.suffix.lower() == ".bdf" else mne.io.read_raw_edf(raw_path, preload=True, verbose="ERROR")
