@@ -252,6 +252,39 @@ def source_lock_entry(path: Path, kind: str) -> dict[str, Any]:
     return {"path": as_relative(path), "sha256": sha256_file(path), "bytes": path.stat().st_size, "kind": kind}
 
 
+def download_pinned_url(url: str, destination: Path, *, retries: int = 3) -> None:
+    """Download a pinned source robustly on macOS Conda/OpenSSL setups.
+
+    Some Conda Python builds fail the TLS handshake against raw.githubusercontent
+    while the system curl trust store succeeds.  We try urllib first, then use
+    curl with retries and write atomically in both cases.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        temporary: Path | None = None
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response, tempfile.NamedTemporaryFile(delete=False, dir=destination.parent) as tmp:
+                shutil.copyfileobj(response, tmp)
+                temporary = Path(tmp.name)
+            os.replace(temporary, destination)
+            return
+        except Exception as exc:
+            last_error = exc
+            if temporary and temporary.exists(): temporary.unlink()
+    temporary = destination.with_name(destination.name + ".download")
+    if temporary.exists(): temporary.unlink()
+    try:
+        subprocess.run(["curl", "--fail", "--location", "--retry", str(retries), "--retry-all-errors",
+                        "--connect-timeout", "20", "--max-time", "180", "--output", str(temporary), url],
+                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        os.replace(temporary, destination)
+        return
+    except Exception as exc:
+        if temporary.exists(): temporary.unlink()
+        raise RuntimeError(f"unable to download pinned source after urllib/curl attempts: {url}; last error: {exc}") from last_error
+
+
 def inventory_sha256(root: Path, suffixes: tuple[str, ...] = (".wav",)) -> str:
     """Hash a deterministic path+content inventory, not merely concatenated WAV bytes."""
     entries = []
@@ -361,10 +394,7 @@ def _fetch_aux_event(subject: str, config: dict[str, Any]) -> Path:
     expected = EVENT_TABLE_SHA256[subject]
     if not target.exists():
         url = f"https://raw.githubusercontent.com/mcjpedro/speech_decoding/{spec['commit']}/events_information/{subject}_Tab.csv"
-        with urllib.request.urlopen(url, timeout=60) as response, tempfile.NamedTemporaryFile(delete=False, dir=cache) as tmp:
-            shutil.copyfileobj(response, tmp)
-            temporary = Path(tmp.name)
-        os.replace(temporary, target)
+        download_pinned_url(url, target)
     actual = sha256_file(target)
     if actual != expected:
         raise RuntimeError(f"official event table hash mismatch {subject}: {actual} != {expected}")
@@ -378,10 +408,7 @@ def _fetch_analysis_bids(config: dict[str, Any], allow_download: bool) -> Path |
     if allow_download and not path.exists():
         cache.mkdir(parents=True, exist_ok=True)
         url = f"https://raw.githubusercontent.com/mcjpedro/speech_decoding/{spec['commit']}/matlab_code/analysis_bids.m"
-        with urllib.request.urlopen(url, timeout=60) as response, tempfile.NamedTemporaryFile(delete=False, dir=cache) as tmp:
-            shutil.copyfileobj(response, tmp)
-            temporary = Path(tmp.name)
-        os.replace(temporary, path)
+        download_pinned_url(url, path)
     if not path.exists():
         return None
     actual = sha256_file(path)
@@ -406,7 +433,12 @@ def _ds006_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str
     for bids_subject in progress(bids_subjects, desc="audit ds006104 subjects"):
         suffix = bids_subject.name.removeprefix("sub-")
         subject = f"S{int(suffix):02d}" if suffix.isdigit() else suffix
-        aux = _fetch_aux_event(subject, config) if fetch_aux else output_root(config) / "auxiliary" / spec["auxiliary_repository"]["commit"] / f"{subject}_Tab.csv"
+        try:
+            aux = _fetch_aux_event(subject, config) if fetch_aux else output_root(config) / "auxiliary" / spec["auxiliary_repository"]["commit"] / f"{subject}_Tab.csv"
+        except RuntimeError as exc:
+            qc["warnings"].append(f"ds006104 {subject}: {exc}")
+            qc["exclusions"]["official_aux_download_failed"] += 1
+            aux = output_root(config) / "auxiliary" / spec["auxiliary_repository"]["commit"] / f"{subject}_Tab.csv"
         if aux.exists():
             lock["official_aux"][f"events_information/{subject}_Tab.csv"] = source_lock_entry(aux, "official_event_table")
         aux_frame = pd.read_csv(aux) if aux.exists() else None
@@ -560,15 +592,21 @@ def audit(config: dict[str, Any], strict: bool, fetch_aux: bool) -> int:
                 qc["warnings"].append(f"{dataset}: stimulus inventory hash mismatch")
         else:
             qc["warnings"].append(f"{dataset}: missing stimulus inventory")
-    auxiliary_code = _fetch_analysis_bids(config, fetch_aux)
+    try:
+        auxiliary_code = _fetch_analysis_bids(config, fetch_aux)
+    except RuntimeError as exc:
+        auxiliary_code = None
+        qc["warnings"].append(f"ds006104 official Matlab source: {exc}")
     if auxiliary_code is None:
         qc["warnings"].append("ds006104: pinned analysis_bids.m is unavailable; use --fetch-aux")
     else:
         lock["official_aux"]["analysis_bids.m"] = source_lock_entry(auxiliary_code, "official_matlab_code")
     try:
         rows = _ds004_trial_rows(config, lock, qc) + _ds006_trial_rows(config, lock, qc, fetch_aux)
-    except RuntimeError as exc:
-        qc["warnings"].append(str(exc))
+    except Exception as exc:
+        # QC must be written even when a dependency/network/source issue is
+        # encountered.  Keep the DS004 inventory if DS006 scanning is blocked.
+        qc["warnings"].append(f"DS006104 scan failed: {type(exc).__name__}: {exc}")
         rows = _ds004_trial_rows(config, lock, qc)
     # Add every actually referenced source only once; raw hashes are intentionally computed here,
     # before build, so resume can reject a mutated raw dataset.
