@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Reproducible DS004940/DS006104 training-data preparation (v2).
+"""Reproducible DS004940/DS006104 training-data preparation (v3).
 
 This program deliberately separates *audit* (inventory and immutable locks),
 *make-splits*, *build*, *validate*, and *fit-normalizer*.  It never edits a
 raw BIDS input.  The only preprocessing profile implemented here is the
-project's ``harmonized_v2`` profile; it is not represented as official data
+project's ``harmonized_v3`` profile; it is not represented as official data
 preprocessing.
 
 Install the optional runtime with ``pip install -r requirements-preprocess.txt``.
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -32,8 +33,8 @@ from typing import Any, Iterable
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-DEFAULT_CONFIG = ROOT / "configs" / "training_data_v2.yaml"
-SPLIT_ALGORITHM = "balanced-greedy-v1"
+DEFAULT_CONFIG = ROOT / "configs" / "training_data_v3.yaml"
+SPLIT_ALGORITHM = "balanced-greedy-v3-subject-content-waveform-label"
 EVENT_TABLE_SHA256 = {
     "S01": "5c9323d3805b30bccc1698145f0adc651f8e4f1073234f3e614b128d6054736c",
     "S02": "6ce6643d7d59213dad2468ec08360a5427a70395248a070fb92f3bc0fb89a17c",
@@ -107,6 +108,26 @@ def clean_perception_mask(target_length: int, start: int, end: int, mixed: bool)
     return [start <= i < end for i in range(target_length)]
 
 
+def acoustic_supervision_mask(target_length: int, valid_length: int, zero_index: int,
+                              duration_seconds: float | str, target_sfreq: int,
+                              pairing: str) -> list[bool]:
+    """Mask only the native presented-audio interval for verified pairs."""
+    mask = [False] * target_length
+    if pairing != "verified_exact":
+        return mask
+    try:
+        duration = float(duration_seconds)
+    except (TypeError, ValueError):
+        return mask
+    if not math.isfinite(duration) or duration <= 0:
+        return mask
+    start = max(0, int(zero_index))
+    end = min(int(valid_length), target_length, start + math.ceil(duration * target_sfreq))
+    for index in range(start, max(start, end)):
+        mask[index] = True
+    return mask
+
+
 def balanced_group_assignment(weights: dict[str, int], folds: int, seed: str, namespace: str) -> dict[str, dict[str, Any]]:
     """Deterministic LPT placement; weights then stable hashes define ordering."""
     if folds < 2:
@@ -124,25 +145,32 @@ def balanced_group_assignment(weights: dict[str, int], folds: int, seed: str, na
     return result
 
 
-def split_role(protocol: str, fold: int, subject_fold: int, audio_fold: int | None,
+def split_role(protocol: str, fold: int, subject_fold: int, content_fold: int | None,
                supervision_type: str, folds: int = 5) -> tuple[str, str]:
-    """Return frozen role and explicit exclusion explanation when appropriate."""
+    """Return a frozen subject/content role for audio and label supervision.
+
+    ``label_only`` examples do not have a waveform, but they still have an
+    audited linguistic-content identity.  Routing them through that identity
+    preserves the same subject x content leakage contract as paired audio.
+    """
     val = (fold + 1) % folds
     if protocol == "subject_ood":
         return ("test", "") if subject_fold == fold else (("validation", "") if subject_fold == val else ("train", ""))
-    if supervision_type != "paired_audio" or audio_fold is None:
-        return "excluded", "not_audio_supervised"
+    if supervision_type not in {"paired_audio", "weak_audio", "label_only"}:
+        return "excluded", "unsupported_supervision"
+    if content_fold is None:
+        return "excluded", "missing_linguistic_content_group"
     if protocol == "audio_ood":
-        return ("test", "") if audio_fold == fold else (("validation", "") if audio_fold == val else ("train", ""))
+        return ("test", "") if content_fold == fold else (("validation", "") if content_fold == val else ("train", ""))
     if protocol != "joint_ood":
         raise ValueError(f"unknown protocol {protocol}")
-    if subject_fold == fold and audio_fold == fold:
+    if subject_fold == fold and content_fold == fold:
         return "test", ""
-    if subject_fold == val and audio_fold == val:
+    if subject_fold == val and content_fold == val:
         return "validation", ""
     held_subject = subject_fold in (fold, val)
-    held_audio = audio_fold in (fold, val)
-    if held_subject or held_audio:
+    held_content = content_fold in (fold, val)
+    if held_subject or held_content:
         return "excluded", "joint_cross_quadrant"
     return "train", ""
 
@@ -183,8 +211,18 @@ def git_provenance() -> tuple[str, str]:
             return subprocess.check_output(args, cwd=ROOT, text=True, stderr=subprocess.DEVNULL).strip()
         except Exception:
             return "unknown"
-    current_sources = "".join(sha256_file(p) for p in (HERE / "prepare_training_data.py", HERE / "training_data_loader.py") if p.exists())
-    return run(["git", "rev-parse", "HEAD"]), run(["git", "diff", "--no-ext-diff", "--binary", "HEAD"]) + current_sources
+    transformation_functions = (
+        "round_half_up", "source_interval_to_target_mask", "clean_perception_mask",
+        "acoustic_supervision_mask", "channel_order_hash", "_descriptive_stats",
+        "_atomic_shard", "_raw_to_canonical", "_rows_for_shards", "build",
+    )
+    current_sources = "".join(
+        f"{name}\n{inspect.getsource(globals()[name])}\n" for name in transformation_functions
+    )
+    loader = HERE / "training_data_loader.py"
+    if loader.exists():
+        current_sources += f"training_data_loader.py\t{sha256_file(loader)}\n"
+    return run(["git", "rev-parse", "HEAD"]), current_sources
 
 
 def runtime():
@@ -205,12 +243,39 @@ def progress(iterable, *, desc: str, total: int | None = None):
         return iterable
 
 
+def _deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 def load_config(path: Path) -> tuple[dict[str, Any], str]:
+    """Load a YAML config, optionally extending one local base config.
+
+    The hash covers the fully resolved configuration.  This keeps the v3 file
+    concise without allowing an edited v2 base file to evade provenance locks.
+    """
     yaml, _ = runtime()
+    path = path.resolve()
     raw = path.read_bytes()
-    config = yaml.safe_load(raw)
-    config["_config_path"] = str(path.resolve())
-    config["_config_sha256"] = sha256_bytes(raw)
+    child = yaml.safe_load(raw) or {}
+    if child.get("extends"):
+        base_path = (path.parent / str(child.pop("extends"))).resolve()
+        base, _ = load_config(base_path)
+        base = {key: value for key, value in base.items() if not key.startswith("_")}
+        config = _deep_merge(base, child)
+        sources = [str(base_path), str(path)]
+    else:
+        config = child
+        sources = [str(path)]
+    config["_config_path"] = str(path)
+    config["_config_sources"] = sources
+    resolved = {key: value for key, value in config.items() if not key.startswith("_")}
+    config["_config_sha256"] = sha256_bytes(stable_json(resolved))
     return config, config["_config_sha256"]
 
 
@@ -231,6 +296,27 @@ def read_tsv(path: Path, pd):
 
 def normalise_ds004_channel(name: str) -> str:
     return name.split("_")[0].strip()
+
+
+def canonical_task_name(value: str) -> str:
+    compact = re.sub(r"[-_\s]", "", str(value)).lower()
+    if compact == "singlephoneme":
+        return "single-phoneme"
+    if compact == "words":
+        return "words"
+    if compact == "phonemes":
+        return "phonemes"
+    return compact
+
+
+def pairing_level(supervision_type: str, audio_semantics: str) -> str:
+    if supervision_type == "label_only":
+        return "label_only"
+    if audio_semantics == "presented_waveform":
+        return "verified_exact"
+    if supervision_type == "weak_audio":
+        return "candidate_filename_timing"
+    return "none"
 
 
 def first_existing(paths: Iterable[Path]) -> Path | None:
@@ -315,58 +401,131 @@ def _event_column(frame, candidates: list[str]) -> str | None:
     return next((lower[c.lower()] for c in candidates if c.lower() in lower), None)
 
 
+def _ds004_recording_runs(events_path: Path, source_sfreq: int) -> list[dict[str, Any]]:
+    """Resolve one logical task recording to one or more physical BDF runs."""
+    base = events_path.name.removesuffix("_events.tsv")
+    exact = events_path.parent / f"{base}_eeg.bdf"
+    split = sorted(
+        events_path.parent.glob(f"{base}_run-*_eeg.bdf"),
+        key=lambda path: int(re.search(r"_run-(\d+)_eeg", path.name).group(1)),
+    )
+    paths = split or ([exact] if exact.exists() else [])
+    offset = 0
+    runs = []
+    for index, path in enumerate(paths, start=1):
+        records, record_duration = parse_bdf_header(path)
+        samples = round_half_up(records * record_duration * source_sfreq)
+        match = re.search(r"_run-(\d+)_eeg", path.name)
+        run = int(match.group(1)) if match else index
+        runs.append({"path": path, "run": run, "start_sample": offset,
+                     "end_sample": offset + samples, "samples": samples})
+        offset += samples
+    return runs
+
+
+def _bad_channels_from_sidecar(path: Path | None, dataset: str) -> list[str]:
+    if path is None or not path.exists():
+        return []
+    _, pd = runtime()
+    frame = read_tsv(path, pd)
+    status_col = _event_column(frame, ["status"])
+    name_col = _event_column(frame, ["name"])
+    if status_col is None or name_col is None:
+        return []
+    bad = frame[frame[status_col].astype(str).str.lower() == "bad"][name_col].astype(str).tolist()
+    return [normalise_ds004_channel(name) for name in bad] if dataset == "ds004940" else bad
+
+
 def _ds004_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str, Any]) -> list[dict[str, Any]]:
     _, pd = runtime()
     spec = config["sources"]["ds004940"]
     data_root = ROOT / spec["data_root"]
+    audio_index = {path.name: path for path in (data_root / "stimuli").glob("*.wav")}
+    audio_hashes: dict[Path, str] = {}
     rows: list[dict[str, Any]] = []
-    event_files = sorted(data_root.glob("sub-*/ses-*/eeg/*_events.tsv"))
+    event_files = sorted(data_root.glob("sub-*/eeg/*_events.tsv"))
     subject_seen = set()
     for events_path in progress(event_files, desc="audit ds004940 event files"):
         parts = events_path.name.split("_")
         task = next((x.removeprefix("task-") for x in parts if x.startswith("task-")), "unknown")
-        run = next((x.removeprefix("run-") for x in parts if x.startswith("run-")), "01")
         subject = next((p.name for p in events_path.parents if p.name.startswith("sub-")), "unknown")
         session = next((p.name for p in events_path.parents if p.name.startswith("ses-")), "")
         subject_seen.add(subject)
         frame = read_tsv(events_path, pd)
         onset_col = _event_column(frame, ["stim_onset_s_", "stim_onset_s", "onset"])
+        duration_col = _event_column(frame, ["stim_dur_s_", "stim_dur_s", "duration"])
         stim_col = _event_column(frame, ["stim_file", "stimulus_file"])
         type_col = _event_column(frame, ["type"])
+        trial_type_col = _event_column(frame, ["trial_type"])
         if not onset_col:
             qc["exclusions"]["missing_onset"] += len(frame)
             continue
-        eeg_base = events_path.name.replace("_events.tsv", "")
-        bdf = first_existing([events_path.parent / f"{eeg_base}_eeg.bdf", events_path.parent / f"{eeg_base}_eeg.edf"])
-        if bdf is None:
+        runs = _ds004_recording_runs(events_path, 512)
+        channels_path = events_path.with_name(events_path.name.replace("_events.tsv", "_channels.tsv"))
+        channels_path = channels_path if channels_path.exists() else None
+        bad_channels = _bad_channels_from_sidecar(channels_path, "ds004940")
+        event_sha = sha256_file(events_path)
+        channels_sha = sha256_file(channels_path) if channels_path else ""
+        if not runs:
             qc["exclusions"]["missing_eeg"] += len(frame)
         for row_index, event in frame.iterrows():
-            # Sound rows are experimental stimuli.  Prompts, instructions and
-            # response rows are retained only as neither source trials nor
-            # silently counted trials.
             if type_col and str(event[type_col]) != "Sound":
                 qc["exclusions"]["non_stimulus_event"] += 1
                 continue
+            condition = str(event[trial_type_col]).strip().upper() if trial_type_col else ""
+            if condition not in {"NPC", "NPI"}:
+                qc["exclusions"]["practice_or_nonexperimental_sound"] += 1
+                continue
             try:
                 onset = float(event[onset_col])
+                stimulus_duration = float(event[duration_col]) if duration_col else float("nan")
             except (TypeError, ValueError):
                 qc["exclusions"]["invalid_stimulus_onset"] += 1
                 continue
-            audio = find_ds004_audio(data_root, str(event[stim_col])) if stim_col and str(event[stim_col]) not in ("nan", "") else None
-            reason = "" if bdf and audio else ("missing_eeg" if not bdf else "missing_audio")
+            if not math.isfinite(stimulus_duration) or stimulus_duration <= 0:
+                qc["exclusions"]["invalid_stimulus_duration"] += 1
+                continue
+            audio = audio_index.get(Path(str(event[stim_col])).name) if stim_col and str(event[stim_col]) not in ("nan", "") else None
+            global_zero = round_half_up(onset * 512)
+            global_start = global_zero - int(config["harmonized"]["epoch"]["ds004940"]["pre_samples_source"])
+            global_end = global_zero + round_half_up((stimulus_duration + float(config["harmonized"]["epoch"]["ds004940"]["post_sentence_s"])) * 512)
+            selected_run = next((item for item in runs if item["start_sample"] <= global_zero < item["end_sample"]), None)
+            boundary = bool(selected_run and (global_start < selected_run["start_sample"] or global_end > selected_run["end_sample"]))
+            bdf = selected_run["path"] if selected_run else None
+            if bdf is None:
+                reason = "missing_eeg_run"
+            elif boundary:
+                reason = "epoch_crosses_run_boundary"
+            elif audio is None:
+                reason = "missing_audio"
+            else:
+                reason = ""
             if reason:
                 qc["exclusions"][reason] += 1
+            run = str(selected_run["run"] if selected_run else "unknown")
+            run_offset = int(selected_run["start_sample"]) if selected_run else 0
             identifier = trial_id("ds004940", subject, task, run, int(row_index), onset)
+            if audio is not None and audio not in audio_hashes:
+                audio_hashes[audio] = sha256_file(audio)
+            audio_sha = audio_hashes.get(audio, "")
+            content_id = stimulus_content_id("ds004940", str(event[stim_col])) if stim_col else ""
             entry = {
                 "trial_id": identifier, "dataset": "ds004940", "dataset_version": spec["openneuro_version"],
                 "subject": subject, "session": session, "task": task, "run": run,
                 "source_eeg_path": as_relative(bdf) if bdf else "", "source_eeg_sha256": "",
-                "source_event_path": as_relative(events_path), "source_event_sha256": sha256_file(events_path),
+                "source_channels_path": as_relative(channels_path) if channels_path else "",
+                "source_channels_sha256": channels_sha,
+                "bad_channels": json.dumps(bad_channels),
+                "source_event_path": as_relative(events_path), "source_event_sha256": event_sha,
                 "source_event_row": int(row_index), "event_onset_seconds": onset,
-                "event_to_sample_error": abs(onset * 512 - round_half_up(onset * 512)), "stim_file": str(event[stim_col]) if stim_col else "",
-                "stimulus_content_id": stimulus_content_id("ds004940", str(event[stim_col])) if stim_col else "",
-                "audio_path": as_relative(audio) if audio else "", "audio_sha256": sha256_file(audio) if audio else "",
+                "event_run_local_onset_seconds": (global_zero - run_offset) / 512,
+                "event_to_sample_error": abs(onset * 512 - global_zero), "stimulus_duration_seconds": stimulus_duration,
+                "condition": "active" if "active" in task.lower() else "passive",
+                "stim_file": str(event[stim_col]) if stim_col else "", "waveform_id": audio_sha,
+                "stimulus_content_id": content_id, "linguistic_content_id": content_id,
+                "audio_path": as_relative(audio) if audio else "", "audio_sha256": audio_sha,
                 "supervision_type": "paired_audio", "audio_semantics": "presented_waveform",
+                "pairing_level": "verified_exact",
                 "audio_semantics_evidence": "bids_stim_file_direct_reference" if audio else "missing_stim_file_target",
                 "neural_task": "perception", "response_onset_relative_s": None,
                 "response_onset_output_index": None, "response_onset_provenance": "",
@@ -374,10 +533,12 @@ def _ds004_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str
                 "clean_perception_end_index": int(spec.get("epoch_target_length", config["harmonized"]["epoch"]["ds004940"]["total_samples_target"])),
                 "source_sfreq_hz": 512, "target_sfreq_hz": 256,
                 "eeg_zero_index": 64, "audio_start_relative_to_eeg_samples": 64,
-                "source_zero_sample": round_half_up(onset * 512),
-                "source_start_sample": round_half_up(onset * 512) - 128,
-                "source_end_sample": round_half_up(onset * 512) - 128 + 2356,
-                "source_run_offsets": json.dumps([{"path": as_relative(bdf), "start_sample": 0}]) if bdf else "[]", "boundary_overlap": False,
+                "source_zero_sample": global_zero - run_offset,
+                "source_start_sample": global_start - run_offset,
+                "source_end_sample": global_end - run_offset,
+                "eeg_valid_samples_target": round_half_up((global_end - global_start) * 256 / 512),
+                "source_run_offsets": json.dumps([{"path": as_relative(item["path"]), "run": item["run"], "start_sample": item["start_sample"], "end_sample": item["end_sample"]} for item in runs]),
+                "boundary_overlap": boundary,
                 "qc_pass": not bool(reason), "build_status": "included" if not reason else "excluded",
                 "exclusion_reason": reason, "channel_order_hash": channel_order_hash(spec["channel_order"]),
             }
@@ -386,11 +547,23 @@ def _ds004_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str
     return rows
 
 
-def _fetch_aux_event(subject: str, config: dict[str, Any]) -> Path:
+def _existing_aux_event(subject: str, config: dict[str, Any]) -> Path:
     spec = config["sources"]["ds006104"]["auxiliary_repository"]
     cache = output_root(config) / "auxiliary" / spec["commit"]
     cache.mkdir(parents=True, exist_ok=True)
     target = cache / f"{subject}_Tab.csv"
+    expected = EVENT_TABLE_SHA256[subject]
+    if not target.exists():
+        candidates = sorted((ROOT / "artifacts" / "training_data").glob(
+            f"*/auxiliary/{spec['commit']}/{subject}_Tab.csv"
+        ))
+        target = next((path for path in candidates if sha256_file(path) == expected), target)
+    return target
+
+
+def _fetch_aux_event(subject: str, config: dict[str, Any]) -> Path:
+    spec = config["sources"]["ds006104"]["auxiliary_repository"]
+    target = _existing_aux_event(subject, config)
     expected = EVENT_TABLE_SHA256[subject]
     if not target.exists():
         url = f"https://raw.githubusercontent.com/mcjpedro/speech_decoding/{spec['commit']}/events_information/{subject}_Tab.csv"
@@ -405,6 +578,11 @@ def _fetch_analysis_bids(config: dict[str, Any], allow_download: bool) -> Path |
     spec = config["sources"]["ds006104"]["auxiliary_repository"]
     cache = output_root(config) / "auxiliary" / spec["commit"]
     path = cache / "analysis_bids.m"
+    if not path.exists():
+        candidates = sorted((ROOT / "artifacts" / "training_data").glob(
+            f"*/auxiliary/{spec['commit']}/analysis_bids.m"
+        ))
+        path = next((candidate for candidate in candidates if sha256_file(candidate) == spec["analysis_bids_sha256"]), path)
     if allow_download and not path.exists():
         cache.mkdir(parents=True, exist_ok=True)
         url = f"https://raw.githubusercontent.com/mcjpedro/speech_decoding/{spec['commit']}/matlab_code/analysis_bids.m"
@@ -421,100 +599,142 @@ def _ds006_clean_hashes(root: Path) -> set[str]:
     return {sha256_file(p) for p in root.glob("audio_internal/stimuli/**/cleaned/**/*.wav")}
 
 
+def _ds006_content_id(aux_row: Any | None, task: str) -> tuple[str, str]:
+    if aux_row is None:
+        return "", ""
+    values = []
+    for key in ("Phoneme1", "Phoneme2", "Phoneme3"):
+        value = str(aux_row.get(key, "")).strip().lower().replace("\x00", "")
+        if value not in {"", "nan", "n/a", "none"}:
+            values.append(value)
+    label = "".join(values)
+    return (f"ds006104:linguistic:{canonical_task_name(task)}:{label}" if label else "", label)
+
+
 def _ds006_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str, Any], fetch_aux: bool) -> list[dict[str, Any]]:
     _, pd = runtime()
     spec = config["sources"]["ds006104"]
     data_root = ROOT / spec["data_root"]
-    clean_hashes = _ds006_clean_hashes(data_root)
+    audio_root = data_root / "audio_internal" / "stimuli"
+    audio_index: dict[str, Path] = {}
+    for path in sorted(audio_root.rglob("*.wav")):
+        audio_index.setdefault(path.stem, path)
+    for path in sorted(audio_root.glob("*.wav")):
+        audio_index[path.stem] = path
+    audio_hashes: dict[Path, str] = {}
     rows: list[dict[str, Any]] = []
-    subjects = sorted(p.name.replace("sub-", "S") for p in data_root.glob("sub-*"))
-    # BIDS subject S01 is named sub-01. Keep the official identifier in auxiliary provenance.
     bids_subjects = sorted(data_root.glob("sub-*"))
     for bids_subject in progress(bids_subjects, desc="audit ds006104 subjects"):
         suffix = bids_subject.name.removeprefix("sub-")
         subject = f"S{int(suffix):02d}" if suffix.isdigit() else suffix
         try:
-            aux = _fetch_aux_event(subject, config) if fetch_aux else output_root(config) / "auxiliary" / spec["auxiliary_repository"]["commit"] / f"{subject}_Tab.csv"
+            aux = _fetch_aux_event(subject, config) if fetch_aux else _existing_aux_event(subject, config)
         except RuntimeError as exc:
             qc["warnings"].append(f"ds006104 {subject}: {exc}")
             qc["exclusions"]["official_aux_download_failed"] += 1
-            aux = output_root(config) / "auxiliary" / spec["auxiliary_repository"]["commit"] / f"{subject}_Tab.csv"
+            aux = _existing_aux_event(subject, config)
         if aux.exists():
             lock["official_aux"][f"events_information/{subject}_Tab.csv"] = source_lock_entry(aux, "official_event_table")
+        else:
+            qc["warnings"].append(f"ds006104 {subject}: pinned official event table unavailable; subject trials remain explicitly excluded")
         aux_frame = pd.read_csv(aux) if aux.exists() else None
         event_files = sorted(bids_subject.glob("ses-*/eeg/*_events.tsv"))
         for events_path in event_files:
-            task = next((x.removeprefix("task-") for x in events_path.name.split("_") if x.startswith("task-")), "unknown")
+            raw_task = next((x.removeprefix("task-") for x in events_path.name.split("_") if x.startswith("task-")), "unknown")
+            task = canonical_task_name(raw_task)
             run = next((x.removeprefix("run-") for x in events_path.name.split("_") if x.startswith("run-")), "01")
             session = next((p.name for p in events_path.parents if p.name.startswith("ses-")), "")
             frame = read_tsv(events_path, pd)
             onset_col = _event_column(frame, ["onset"])
             trial_col = _event_column(frame, ["trial_type", "value"])
+            bids_trial_col = _event_column(frame, ["trial"])
             eeg_path = first_existing([events_path.parent / events_path.name.replace("_events.tsv", "_eeg.edf")])
-            # Stimulus events are joined by their sequential TrialN when available.  In raw BIDS,
-            # TMS and stimulus can be separate rows; only stimulus rows become model trials.
-            for row_index, event in frame.iterrows():
-                value = str(event[trial_col]) if trial_col else ""
-                if task.lower() not in value.lower() and "stim" not in value.lower() and trial_col:
+            channels_path = events_path.with_name(events_path.name.replace("_events.tsv", "_channels.tsv"))
+            channels_path = channels_path if channels_path.exists() else None
+            bad_channels = _bad_channels_from_sidecar(channels_path, "ds006104")
+            event_sha = sha256_file(events_path)
+            channels_sha = sha256_file(channels_path) if channels_path else ""
+            for position in range(len(frame)):
+                event = frame.iloc[position]
+                row_index = frame.index[position]
+                value = str(event[trial_col]).strip().lower() if trial_col else ""
+                if value != "stimulus":
                     continue
                 onset = float(event[onset_col]) if onset_col else float("nan")
                 if not math.isfinite(onset):
                     qc["exclusions"]["missing_onset"] += 1
                     continue
+                previous = frame.iloc[position - 1] if position > 0 else None
+                previous_type = str(previous[trial_col]).strip().lower() if previous is not None and trial_col else ""
+                event_trial = previous[bids_trial_col] if previous is not None and bids_trial_col and previous_type == "tms" else None
                 aux_row = None
                 if aux_frame is not None:
-                    # Events tables use task names (phonemes, singlephoneme, Words) and TrialN.
                     candidates = aux_frame
                     task_col = _event_column(aux_frame, ["Task", "task"])
                     if task_col:
-                        candidates = candidates[candidates[task_col].astype(str).str.lower() == task.lower()]
-                    # TrialN is the only intended join key.  Do not choose an
-                    # apparently close event time, which could silently pair a
-                    # different trial after a dropped BIDS row.
-                    event_trial_col = _event_column(frame, ["trial"])
+                        candidates = candidates[candidates[task_col].astype(str).map(canonical_task_name) == task]
                     aux_trial_col = _event_column(candidates, ["TrialN", "trial"])
-                    if event_trial_col and aux_trial_col:
-                        candidates = candidates[candidates[aux_trial_col].astype(str) == str(event[event_trial_col])]
+                    if event_trial is not None and aux_trial_col and str(event_trial).lower() not in {"nan", "n/a", ""}:
+                        wanted = str(int(float(event_trial)))
+                        candidates = candidates[candidates[aux_trial_col].map(lambda value: str(int(float(value))) if str(value).lower() not in {"nan", "n/a", ""} else "") == wanted]
                     else:
                         candidates = candidates.iloc[0:0]
-                    if len(candidates):
+                    if len(candidates) == 1:
                         aux_row = candidates.iloc[0]
                 stimulus = str(aux_row.get("Stimulus", "")) if aux_row is not None else ""
-                is_single = task.lower() == "singlephoneme"
-                audio = None if is_single else find_ds006_audio(data_root, stimulus)
-                audio_sha = sha256_file(audio) if audio else ""
-                semantics, evidence = audio_semantics_ds006104(audio_sha or None, clean_hashes)
+                is_single = task == "single-phoneme"
+                audio = None if is_single else audio_index.get(Path(stimulus).stem)
+                if audio is not None and audio not in audio_hashes:
+                    audio_hashes[audio] = sha256_file(audio)
+                audio_sha = audio_hashes.get(audio, "")
+                linguistic_content_id, phoneme_label = _ds006_content_id(aux_row, task)
                 reason = ""
                 if eeg_path is None:
                     reason = "missing_eeg"
+                elif previous_type != "tms" or event_trial is None or str(event_trial).lower() in {"nan", "n/a", ""}:
+                    reason = "missing_preceding_tms_trial"
                 elif aux_row is None:
                     reason = "missing_official_aux_row"
                 elif not is_single and audio is None:
                     reason = "missing_audio"
+                source_zero = round_half_up(onset * 2000)
+                official_p1 = int(float(aux_row.get("P1_TSidx"))) if aux_row is not None and str(aux_row.get("P1_TSidx", "")).lower() not in {"", "nan", "n/a"} else None
+                official_error = abs(source_zero - official_p1) if official_p1 is not None else None
+                if not reason and (official_error is None or official_error > 1):
+                    reason = "official_timing_mismatch"
                 if reason:
                     qc["exclusions"][reason] += 1
-                source_zero = round_half_up(onset * 2000)
                 identifier = trial_id("ds006104", subject, task, run, int(row_index), onset)
                 tms = bool(int(aux_row.get("TMS", 0))) if aux_row is not None and str(aux_row.get("TMS", "")).strip() not in ("", "nan") else False
+                supervision = "label_only" if is_single else "weak_audio"
+                semantics = "unknown" if is_single else "candidate_waveform"
+                evidence = "singlephoneme_no_paired_wav" if is_single else "official_aux_filename_and_bids_sample_alignment"
                 entry = {
                     "trial_id": identifier, "dataset": "ds006104", "dataset_version": spec["openneuro_version"],
                     "subject": subject, "session": session, "task": task, "run": run,
                     "source_eeg_path": as_relative(eeg_path) if eeg_path else "", "source_eeg_sha256": "",
-                    "source_event_path": as_relative(events_path), "source_event_sha256": sha256_file(events_path), "source_event_row": int(row_index),
+                    "source_channels_path": as_relative(channels_path) if channels_path else "",
+                    "source_channels_sha256": channels_sha,
+                    "bad_channels": json.dumps(bad_channels),
+                    "source_event_path": as_relative(events_path), "source_event_sha256": event_sha, "source_event_row": int(row_index),
                     "official_aux_path": as_relative(aux) if aux.exists() else "", "official_aux_sha256": sha256_file(aux) if aux.exists() else "", "official_aux_row": int(aux_row.name) if aux_row is not None else None,
                     "event_onset_seconds": onset, "event_to_sample_error": abs(onset * 2000 - source_zero),
-                    "stimulus": stimulus, "audio_path": as_relative(audio) if audio else "", "audio_sha256": audio_sha,
-                    "stimulus_content_id": stimulus_content_id("ds006104", stimulus) if stimulus else "",
-                    "supervision_type": "label_only" if is_single else "paired_audio", "audio_semantics": "unknown" if is_single else semantics,
-                    "audio_semantics_evidence": "singlephoneme_no_paired_wav" if is_single else evidence,
-                    "neural_task": "mixed" if is_single else "perception", "response_onset_relative_s": 0.3 if is_single else None,
-                    "response_onset_output_index": 140 if is_single else None,
-                    "response_onset_provenance": "paper_protocol_nominal" if is_single else "",
-                    "production_contaminated": is_single, "clean_perception_start_index": 64 if is_single else 0,
-                    "clean_perception_end_index": 140 if is_single else 384,
+                    "official_timing_error_samples": official_error if official_error is not None else "",
+                    "trial_number": int(float(event_trial)) if event_trial is not None and str(event_trial).lower() not in {"nan", "n/a", ""} else "",
+                    "condition": task, "stimulus": stimulus, "phoneme_label": phoneme_label,
+                    "waveform_id": audio_sha, "audio_path": as_relative(audio) if audio else "", "audio_sha256": audio_sha,
+                    "stimulus_content_id": linguistic_content_id, "linguistic_content_id": linguistic_content_id,
+                    "supervision_type": supervision, "audio_semantics": semantics,
+                    "pairing_level": "label_only" if is_single else "candidate_filename_timing",
+                    "audio_semantics_evidence": evidence,
+                    "neural_task": "perception", "response_onset_relative_s": None,
+                    "response_onset_output_index": None, "response_onset_provenance": "",
+                    "production_contaminated": False, "clean_perception_start_index": 0,
+                    "clean_perception_end_index": 384,
                     "source_sfreq_hz": 2000, "target_sfreq_hz": 256, "eeg_zero_index": 64,
                     "audio_start_relative_to_eeg_samples": 64, "source_zero_sample": source_zero,
                     "source_start_sample": source_zero - 500, "source_end_sample": source_zero + 2500,
+                    "eeg_valid_samples_target": 384,
                     "source_run_offsets": json.dumps([{"path": as_relative(eeg_path), "start_sample": 0}]) if eeg_path else "[]", "boundary_overlap": False, "tms_applied": tms,
                     "tms_pulse_1_source_sample": None,
                     "tms_pulse_2_source_sample": None, "tms_intervals_source_half_open": "[]",
@@ -522,17 +742,17 @@ def _ds006_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str
                     "build_status": "included" if not reason else "excluded", "exclusion_reason": reason,
                     "channel_order_hash": channel_order_hash(spec["channel_order"]),
                 }
-                p1_index = aux_row.get("P1_TSidx", float("nan")) if aux_row is not None else float("nan")
-                if tms and p1_index is not None and str(p1_index).lower() not in ("", "nan"):
+                p1_index = official_p1
+                if tms and p1_index is not None:
                     # Verified pinned Matlab: pulses occur at P1_TSidx-0.100fs
                     # and P1_TSidx-0.050fs; P1_TSidx itself is not a pulse.
-                    p1 = int(float(p1_index)) - 200
-                    p2 = int(float(p1_index)) - 100
+                    p1 = int(p1_index) - 200
+                    p2 = int(p1_index) - 100
                     entry["tms_pulse_1_source_sample"] = p1
                     entry["tms_pulse_2_source_sample"] = p2
                     entry["tms_intervals_source_half_open"] = json.dumps([[p1 - 10, p1 + 51], [p2 - 10, p2 + 51]])
                 rows.append(entry)
-    qc["actual_subjects"]["ds006104"] = len(subjects)
+    qc["actual_subjects"]["ds006104"] = len(bids_subjects)
     actual_inventory = sha256_bytes("".join(
         f"{subject}\t{EVENT_TABLE_SHA256[subject]}\n" for subject in sorted(EVENT_TABLE_SHA256)
     ).encode())
@@ -559,8 +779,9 @@ def audit(config: dict[str, Any], strict: bool, fetch_aux: bool) -> int:
     root = output_root(config)
     root.mkdir(parents=True, exist_ok=True)
     audit_timestamp_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    profile = config.get("preprocessing_profile", "harmonized_v3")
     qc: dict[str, Any] = {"schema_version": config["schema_version"], "created_at": time.time(), "actual_subjects": {},
-                           "exclusions": Counter(), "warnings": [], "preprocessing_statement": "harmonized_v2 is project preprocessing, not official preprocessing"}
+                           "exclusions": Counter(), "warnings": [], "preprocessing_statement": f"{profile} is project preprocessing, not official preprocessing"}
     free_bytes = shutil.disk_usage(ROOT).free
     qc["disk_free_bytes"] = free_bytes
     qc["estimated_derived_bytes_range"] = [12 * 1024**3, 18 * 1024**3]
@@ -610,7 +831,7 @@ def audit(config: dict[str, Any], strict: bool, fetch_aux: bool) -> int:
         rows = _ds004_trial_rows(config, lock, qc)
     # Add every actually referenced source only once; raw hashes are intentionally computed here,
     # before build, so resume can reject a mutated raw dataset.
-    sources = sorted({r[k] for r in rows for k in ("source_eeg_path", "source_event_path", "official_aux_path", "audio_path") if r.get(k)})
+    sources = sorted({r.get(k, "") for r in rows for k in ("source_eeg_path", "source_channels_path", "source_event_path", "official_aux_path", "audio_path") if r.get(k)})
     for relative in progress(sources, desc="SHA256 source lock"):
         path = ROOT / relative
         if path.exists():
@@ -628,13 +849,19 @@ def audit(config: dict[str, Any], strict: bool, fetch_aux: bool) -> int:
             qc["warnings"].append(f"{dataset}: observed {observed_subjects} subjects; pinned expectation {spec['expected_subjects']}")
     lock["files"].sort(key=lambda x: x["path"])
     lock["source_lock_sha256"] = sha256_bytes(stable_json({k: v for k, v in lock.items() if k != "source_lock_sha256"}))
+    code_commit, code_diff = git_provenance()
+    code_diff_hash = sha256_bytes(code_diff.encode())
     for row in rows:
         row["source_lock_sha256"] = lock["source_lock_sha256"]
         row["preprocess_config_sha256"] = config["_config_sha256"]
-        row["code_commit"], diff = git_provenance()
-        row["code_diff_hash"] = sha256_bytes(diff.encode())
+        row["code_commit"] = code_commit
+        row["code_diff_hash"] = code_diff_hash
         row["audit_timestamp_utc"] = audit_timestamp_utc
     frame = pd.DataFrame(rows)
+    qc["trial_counts"] = dict(Counter(row["dataset"] for row in rows))
+    qc["included_counts"] = dict(Counter(row["dataset"] for row in rows if row.get("qc_pass")))
+    qc["pairing_level_counts"] = dict(Counter(str(row.get("pairing_level", "none")) for row in rows))
+    qc["boundary_overlap_counts"] = dict(Counter(row["dataset"] for row in rows if row.get("boundary_overlap")))
     write_frame(frame, root / "manifests" / "manifest_all", pd)
     (root / "source_lock.json").write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
     qc["exclusions"] = dict(qc["exclusions"])
@@ -651,7 +878,7 @@ def read_manifest(config: dict[str, Any]):
     path = output_root(config) / "manifests" / "manifest_all.csv"
     if not path.exists():
         raise RuntimeError("audit first: manifest_all.csv is missing")
-    return pd.read_csv(path, keep_default_na=False), pd
+    return pd.read_csv(path, keep_default_na=False, low_memory=False), pd
 
 
 def make_splits(config: dict[str, Any]) -> int:
@@ -660,25 +887,38 @@ def make_splits(config: dict[str, Any]) -> int:
     lock = json.loads((root / "source_lock.json").read_text())
     commit, diff = git_provenance()
     eligible = frame[(frame["build_status"] == "included") & (frame["qc_pass"].astype(str).str.lower() == "true")].copy()
-    subject_weights = eligible.groupby("subject").size().astype(int).to_dict()
-    audio_eligible = eligible[eligible["supervision_type"] == "paired_audio"].copy()
-    audio_eligible["audio_group"] = audio_eligible.apply(lambda r: r.get("stimulus_content_id") or f"{r.dataset}:file:{r.audio_sha256}", axis=1)
-    audio_weights = audio_eligible.groupby("audio_group").size().astype(int).to_dict()
+    eligible["subject_group"] = eligible.apply(lambda row: f"{row.dataset}:{row.subject}", axis=1)
+    subject_weights = eligible.groupby("subject_group").size().astype(int).to_dict()
+    content_eligible = eligible[eligible["supervision_type"].isin(["paired_audio", "weak_audio", "label_only"])].copy()
+    content_eligible["content_group"] = content_eligible.apply(
+        lambda r: r.get("linguistic_content_id") or r.get("stimulus_content_id") or
+        (f"{r.dataset}:file:{r.audio_sha256}" if r.audio_sha256 else ""), axis=1
+    )
+    content_eligible["waveform_group"] = content_eligible.apply(
+        lambda r: f"sha256:{r.audio_sha256}" if r.supervision_type in {"paired_audio", "weak_audio"} and r.audio_sha256 else "", axis=1
+    )
+    content_eligible = content_eligible[content_eligible.content_group != ""]
+    content_weights = content_eligible.groupby("content_group").size().astype(int).to_dict()
     subject_assign = balanced_group_assignment(subject_weights, config["folds"], config["split_seed"], "subject")
-    audio_assign = balanced_group_assignment(audio_weights, config["folds"], config["split_seed"], "audio_content")
+    content_assign = balanced_group_assignment(content_weights, config["folds"], config["split_seed"], "linguistic_content")
     records = []
-    audio_groups_by_id = dict(zip(audio_eligible["trial_id"], audio_eligible["audio_group"]))
+    content_groups_by_id = dict(zip(content_eligible["trial_id"], content_eligible["content_group"]))
+    waveform_groups_by_id = dict(zip(content_eligible["trial_id"], content_eligible["waveform_group"]))
     for _, row in eligible.iterrows():
-        s = subject_assign[row.subject]
-        group = audio_groups_by_id.get(row.trial_id)
-        a = audio_assign.get(group) if group else None
+        subject_group = f"{row.dataset}:{row.subject}"
+        s = subject_assign[subject_group]
+        group = content_groups_by_id.get(row.trial_id)
+        waveform_group = waveform_groups_by_id.get(row.trial_id, "")
+        a = content_assign.get(group) if group else None
         for protocol in ("subject_ood", "audio_ood", "joint_ood"):
             for fold in range(config["folds"]):
                 role, reason = split_role(protocol, fold, s["fold"], a["fold"] if a else None, row.supervision_type, config["folds"])
                 records.append({"trial_id": row.trial_id, "protocol": protocol, "fold": fold, "role": role,
-                                "exclusion_reason": reason, "subject_group": row.subject, "subject_fold": s["fold"],
+                                "exclusion_reason": reason, "subject_group": subject_group, "subject_fold": s["fold"],
                                 "subject_group_trial_weight": s["trial_weight"], "subject_sort_position": s["sort_position"],
-                                "audio_group": group or "", "audio_fold": a["fold"] if a else "",
+                                "audio_group": group or "", "linguistic_content_group": group or "", "waveform_group": waveform_group,
+                                "supervision_axis": "label" if row.supervision_type == "label_only" else "audio",
+                                "audio_fold": a["fold"] if a else "",
                                 "audio_group_trial_weight": a["trial_weight"] if a else "", "audio_sort_position": a["sort_position"] if a else "",
                                 "assignment_algorithm": SPLIT_ALGORITHM, "assignment_seed": config["split_seed"],
                                 "source_lock_sha256": lock["source_lock_sha256"], "preprocess_config_sha256": config["_config_sha256"],
@@ -695,7 +935,8 @@ def make_splits(config: dict[str, Any]) -> int:
             target = split_root / f"{protocol}_fold-{fold}.csv"
             subset.to_csv(target, index=False)
     split_hashes = {p.name: sha256_file(p) for p in sorted(split_root.glob("*_fold-*.csv"))}
-    split_index = {"algorithm": SPLIT_ALGORITHM, "seed": config["split_seed"], "subject": subject_assign, "audio_content": audio_assign, "split_csv_sha256": split_hashes,
+    split_index = {"algorithm": SPLIT_ALGORITHM, "seed": config["split_seed"], "subject": subject_assign,
+                   "linguistic_content": content_assign, "split_csv_sha256": split_hashes,
                    "source_lock_sha256": lock["source_lock_sha256"], "preprocess_config_sha256": config["_config_sha256"], "code_commit": commit, "code_diff_hash": sha256_bytes(diff.encode())}
     split_index["split_index_sha256"] = sha256_bytes(stable_json(split_index))
     (split_root / "assignment.json").write_text(json.dumps(split_index, indent=2, sort_keys=True) + "\n")
@@ -726,7 +967,7 @@ def build_audio_bank(config: dict[str, Any], resume: bool) -> int:
                 raise RuntimeError("resume refuses incompatible audio bank")
         print(f"reused {target}")
         return 0
-    paired = frame[(frame.supervision_type == "paired_audio") & (frame.audio_path != "")].copy()
+    paired = frame[(frame.supervision_type.isin(["paired_audio", "weak_audio"])) & (frame.audio_path != "")].copy()
     # The same bytes can be cited under distinct experimental semantics.  Keep
     # separate logical bank records in that rare case rather than collapsing a
     # clean stimulus and a presented waveform into one semantic category.
@@ -832,14 +1073,19 @@ def _atomic_shard(path: Path, arrays: dict[str, Any], attrs: dict[str, Any], str
     return sha256_file(path)
 
 
-def _raw_to_canonical(raw, channels: list[str], dataset: str, config: dict[str, Any], source_intervals: list[tuple[int, int]] | None = None):
-    """Apply source TMS interpolation first, then only project harmonized choices."""
+def _raw_to_canonical(raw, channels: list[str], dataset: str, config: dict[str, Any],
+                      source_intervals: list[tuple[int, int]] | None = None,
+                      bad_channels: list[str] | None = None):
+    """Preprocess one recording once, failing loudly on invalid montage/QC."""
     _, mne, np = require_build_runtime()
     canonical = channels
     aliases = {normalise_ds004_channel(c): c for c in raw.ch_names} if dataset == "ds004940" else {c: c for c in raw.ch_names}
     missing = [c for c in canonical if c not in aliases]
     picked = [aliases[c] for c in canonical if c in aliases]
     raw.pick(picked)
+    rename = {actual: normalise_ds004_channel(actual) for actual in raw.ch_names} if dataset == "ds004940" else {}
+    if rename:
+        raw.rename_channels(rename)
     # TMS is source-rate, before filtering/resampling.  Endpoint interpolation is
     # a stated harmonized substitute for unavailable official fillgaps.
     if source_intervals:
@@ -849,21 +1095,20 @@ def _raw_to_canonical(raw, channels: list[str], dataset: str, config: dict[str, 
             if start < end:
                 data[:, start:end] = np.linspace(data[:, start - 1], data[:, end], end - start, endpoint=False).T
         raw._data = data
-    name_by_canonical = {normalise_ds004_channel(name) if dataset == "ds004940" else name: name for name in raw.ch_names}
-    bad = [name_by_canonical[c] for c in canonical if c in name_by_canonical and c in raw.info.get("bads", [])]
-    interpolated = []
+    available_names = set(raw.ch_names)
+    declared_bad = set(bad_channels or [])
+    bad = sorted(c for c in declared_bad if c in available_names)
+    affected_fraction = len(set(missing) | set(bad)) / max(len(canonical), 1)
+    if affected_fraction > float(config["harmonized"]["interpolation"]["max_bad_fraction"]):
+        raise ValueError(f"bad/missing channel fraction {affected_fraction:.3f} exceeds configured maximum")
     zero = list(missing)
-    try:
-        montage = mne.channels.make_standard_montage(config["harmonized"]["interpolation"][f"{dataset}_montage"])
-        raw.set_montage(montage, on_missing="ignore")
-        if bad and len(bad) / len(canonical) <= config["harmonized"]["interpolation"]["max_bad_fraction"]:
-            raw.info["bads"] = bad
-            raw.interpolate_bads(reset_bads=False)
-            interpolated = [normalise_ds004_channel(c) if dataset == "ds004940" else c for c in bad]
-        elif bad:
-            zero += [normalise_ds004_channel(c) if dataset == "ds004940" else c for c in bad]
-    except Exception:
-        zero += [normalise_ds004_channel(c) if dataset == "ds004940" else c for c in bad]
+    montage = mne.channels.make_standard_montage(config["harmonized"]["interpolation"][f"{dataset}_montage"])
+    raw.set_montage(montage, on_missing="raise")
+    interpolated = []
+    if bad:
+        raw.info["bads"] = bad
+        raw.interpolate_bads(reset_bads=True, verbose="ERROR")
+        interpolated = bad
     raw.set_eeg_reference("average", projection=False)
     raw.filter(*config["harmonized"]["bandpass_hz"], verbose="ERROR")
     raw.resample(config["harmonized"]["target_sfreq_hz"], npad="auto", verbose="ERROR")
@@ -873,18 +1118,30 @@ def _raw_to_canonical(raw, channels: list[str], dataset: str, config: dict[str, 
     for i, c in enumerate(canonical):
         if c in available and c not in zero:
             aligned[i] = data[available[c]]
+    # Use the complete template so a missing electrode can remain masked while
+    # retaining its coordinate in the shared variable-channel contract.
+    positions = montage.get_positions()["ch_pos"]
+    xyz = np.stack([positions[c] if c in positions else np.zeros(3) for c in canonical]).astype("float32")
+    if not np.isfinite(xyz).all() or np.linalg.norm(xyz, axis=1).min() <= 0:
+        raise ValueError("montage produced missing/nonfinite channel coordinates")
     badmask = np.array([c in set(interpolated) | set(zero) for c in canonical], dtype=bool)
-    return aligned, badmask, np.array([c in interpolated for c in canonical], bool), np.array([c in zero for c in canonical], bool)
+    return aligned, badmask, np.array([c in interpolated for c in canonical], bool), np.array([c in zero for c in canonical], bool), xyz
 
 
-def _rows_for_shards(frame, requested_dataset: str, requested_subjects: set[str] | None):
+def _rows_for_shards(frame, requested_dataset: str, requested_subjects: set[str] | None,
+                     requested_tasks: set[str] | None):
     selected = frame[(frame.build_status == "included") & (frame.qc_pass.astype(str).str.lower() == "true")]
     if requested_dataset != "all": selected = selected[selected.dataset == requested_dataset]
     if requested_subjects: selected = selected[selected.subject.isin(requested_subjects)]
+    if requested_tasks: selected = selected[selected.task.isin(requested_tasks)]
     return selected
 
 
-def build(config: dict[str, Any], dataset: str, subjects: str, resume: bool, allow_audit_warnings: bool) -> int:
+def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
+          limit_trials_per_group: int | None, common_contents: int | None,
+          content_ids: str | None,
+          tms_condition: str, split_role_filter: str, split_protocol: str,
+          split_fold: int, resume: bool, allow_audit_warnings: bool) -> int:
     h5py, mne, np = require_build_runtime()
     frame, pd = read_manifest(config)
     root = output_root(config)
@@ -897,11 +1154,50 @@ def build(config: dict[str, Any], dataset: str, subjects: str, resume: bool, all
         raise RuntimeError("make-splits first; HDF5 shards must pin a frozen split index")
     split_index = json.loads(split_index_path.read_text())
     requested = None if subjects == "all" else set(subjects.split(","))
-    selected = _rows_for_shards(frame, dataset, requested)
+    requested_tasks = None if tasks == "all" else {canonical_task_name(value) if dataset == "ds006104" else value for value in tasks.split(",")}
+    selected = _rows_for_shards(frame, dataset, requested, requested_tasks)
+    preprocessing_selected = selected.copy()
+    if split_role_filter != "any":
+        split_path = root / "splits" / f"{split_protocol}_fold-{split_fold}.csv"
+        split_frame = pd.read_csv(split_path, keep_default_na=False)
+        allowed = set(split_frame[split_frame.role == split_role_filter].trial_id)
+        selected = selected[selected.trial_id.isin(allowed)]
+    if tms_condition != "any":
+        if dataset != "ds006104":
+            raise ValueError("--tms-condition is only valid for ds006104")
+        applied = selected.tms_applied.astype(str).str.lower().isin(["true", "1", "yes"])
+        selected = selected[applied if tms_condition == "on" else ~applied]
+    selected_contents: set[str] | None = None
+    if content_ids:
+        if common_contents is not None:
+            raise ValueError("--content-ids and --common-contents are mutually exclusive")
+        selected_contents = {value.strip() for value in content_ids.split(",") if value.strip()}
+        if not selected_contents:
+            raise ValueError("--content-ids supplied no non-empty IDs")
+        selected = selected[selected.linguistic_content_id.isin(selected_contents)]
+        missing = selected_contents - set(selected.linguistic_content_id)
+        if missing:
+            raise RuntimeError(f"requested content IDs are unavailable after filters: {sorted(missing)}")
+    if common_contents is not None:
+        if dataset == "all":
+            raise ValueError("--common-contents requires one explicit dataset")
+        required_subjects = selected.subject.nunique()
+        coverage = selected[selected.linguistic_content_id != ""].groupby("linguistic_content_id").subject.nunique()
+        common = [name for name, count in coverage.items() if int(count) == int(required_subjects)]
+        common.sort(key=lambda name: sha256_bytes(f"pilot-common|{config['split_seed']}|{dataset}|{name}".encode()))
+        if len(common) < common_contents:
+            raise RuntimeError(f"only {len(common)} linguistic contents cover all {required_subjects} selected subjects")
+        selected_contents = set(common[:common_contents])
+        selected = selected[selected.linguistic_content_id.isin(selected_contents)]
     built_rows = []
     build_timestamp_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     shard_groups = list(selected.groupby(["dataset", "subject", "task"], sort=True))
     for (ds, subject, task), group in progress(shard_groups, desc="EEG shards", total=len(shard_groups)):
+        preprocessing_group = preprocessing_selected[(preprocessing_selected.dataset == ds) & (preprocessing_selected.subject == subject) & (preprocessing_selected.task == task)]
+        if selected_contents is not None:
+            group = group.sort_values("trial_id").drop_duplicates("linguistic_content_id")
+        if limit_trials_per_group is not None:
+            group = group.sort_values("trial_id").head(limit_trials_per_group)
         spec = config["sources"][ds]
         canonical = spec["channel_order"]
         target_len = config["harmonized"]["epoch"][ds]["total_samples_target"]
@@ -911,52 +1207,118 @@ def build(config: dict[str, Any], dataset: str, subjects: str, resume: bool, all
                 if not resume_compatible(dict(previous.attrs), config_sha=config["_config_sha256"], source_lock_sha=lock["source_lock_sha256"], channel_hash=channel_order_hash(canonical), split_hash=split_index["split_index_sha256"]):
                     raise RuntimeError(f"resume refuses incompatible shard {target}")
             continue
-        eegs=[]; valids=[]; cleans=[]; audio_losses=[]; tmsm=[]; bads=[]; interps=[]; zeros=[]; ids=[]; retained=[]
-        for _, row in progress(group.iterrows(), desc=f"{ds}/{subject}/{task}", total=len(group)):
-            raw_path = ROOT / row.source_eeg_path
+        # One recording is loaded/filter/resampled once.  DS006104 TMS intervals
+        # are unioned before filtering, which preserves the required operation
+        # order without an O(trials × recording_size) implementation.
+        raw_cache: dict[str, Any] = {}
+        raw_errors: dict[str, str] = {}
+        for raw_relative, recording_rows in preprocessing_group.groupby("source_eeg_path"):
+            raw_path = ROOT / raw_relative
+            intervals: list[tuple[int, int]] = []
+            for text_value in recording_rows.get("tms_intervals_source_half_open", []):
+                text_value = str(text_value)
+                if text_value.startswith("["):
+                    intervals.extend((int(pair[0]), int(pair[1])) for pair in json.loads(text_value))
+            intervals = sorted(set(intervals))
+            declared_bad: set[str] = set()
+            for text_value in recording_rows.get("bad_channels", []):
+                text_value = str(text_value)
+                if text_value.startswith("["):
+                    declared_bad.update(json.loads(text_value))
             try:
                 raw = mne.io.read_raw_bdf(raw_path, preload=True, verbose="ERROR") if raw_path.suffix.lower() == ".bdf" else mne.io.read_raw_edf(raw_path, preload=True, verbose="ERROR")
-                if abs(float(raw.info["sfreq"]) - float(row.source_sfreq_hz)) > 1e-6:
-                    raise ValueError(f"source sampling rate {raw.info['sfreq']} != locked {row.source_sfreq_hz}")
+                expected_sfreq = float(recording_rows.iloc[0].source_sfreq_hz)
+                if abs(float(raw.info["sfreq"]) - expected_sfreq) > 1e-6:
+                    raise ValueError(f"source sampling rate {raw.info['sfreq']} != locked {expected_sfreq}")
+                raw_cache[raw_relative] = _raw_to_canonical(
+                    raw, canonical, ds, config, intervals if ds == "ds006104" else [], sorted(declared_bad)
+                )
+            except Exception as exc:
+                raw_errors[raw_relative] = f"{type(exc).__name__}:{exc}"
+
+        eegs=[]; valids=[]; cleans=[]; audio_losses=[]; tmsm=[]; bads=[]; interps=[]; zeros=[]; ids=[]; retained=[]
+        shard_xyz = None
+        for _, row in progress(group.iterrows(), desc=f"{ds}/{subject}/{task}", total=len(group)):
+            try:
+                if row.source_eeg_path in raw_errors:
+                    raise ValueError(f"recording_preprocess:{raw_errors[row.source_eeg_path]}")
                 interval_text = str(row.get("tms_intervals_source_half_open", ""))
                 intervals = json.loads(interval_text) if ds == "ds006104" and interval_text.startswith("[") else []
-                # intervals are in full-run samples; raw files are one run.  Audit records offset
-                # provenance and out-of-bound intervals simply remain absent from this output mask.
-                tms_enabled = str(row.get("tms_applied", "")).strip().lower() in ("1", "true", "yes")
-                data, bad, interp, zero = _raw_to_canonical(raw, canonical, ds, config, intervals if tms_enabled else [])
-                start_target = round_half_up(int(row.source_start_sample) * 256 / int(row.source_sfreq_hz))
-                end_target = start_target + target_len
+                data, bad, interp, zero, xyz = raw_cache[row.source_eeg_path]
+                if shard_xyz is None:
+                    shard_xyz = xyz
+                elif not np.allclose(shard_xyz, xyz, atol=1e-6):
+                    raise ValueError("recordings in one shard disagree on channel coordinates")
+                target_sfreq = int(config["harmonized"]["target_sfreq_hz"])
+                source_sfreq = int(row.source_sfreq_hz)
+                start_target = round_half_up(int(row.source_start_sample) * target_sfreq / source_sfreq)
+                valid_target = min(int(row.get("eeg_valid_samples_target", target_len)), target_len)
+                end_target = start_target + valid_target
                 if start_target < 0 or end_target > data.shape[1]:
                     raise ValueError("epoch crosses raw-run boundary")
-                ep = data[:, start_target:end_target]
-                if ep.shape != (len(canonical), target_len): raise ValueError("integer epoch shape mismatch")
-                eegs.append(ep.astype("float32")); valids.append(np.ones(target_len, dtype=bool))
-                is_mixed = row.neural_task == "mixed"
-                cleans.append(np.array(clean_perception_mask(target_len, int(row.clean_perception_start_index), int(row.clean_perception_end_index), is_mixed), bool))
-                if ds == "ds004940" and str(row.get("audio_target_duration_s", "")) not in ("", "nan"):
-                    loss_end = min(target_len, 64 + math.ceil((float(row.audio_target_duration_s) + .5) * 256))
-                    audio_losses.append(np.array([i < loss_end for i in range(target_len)], bool))
-                else:
-                    # Label-only trials have no waveform loss; other paired trials
-                    # retain their fixed epoch unless a dataset-specific duration is known.
-                    audio_losses.append(np.array([row.supervision_type == "paired_audio"] * target_len, bool))
+                ep = np.zeros((len(canonical), target_len), dtype="float32")
+                ep[:, :valid_target] = data[:, start_target:end_target].astype("float32")
+                valid_mask = np.arange(target_len) < valid_target
+                eegs.append(ep); valids.append(valid_mask)
+                cleans.append(valid_mask.copy())
+                audio_duration = row.get("audio_target_duration_s", "")
+                if str(audio_duration).strip().lower() in {"", "nan", "none"}:
+                    audio_duration = row.get("stimulus_duration_seconds", "")
+                audio_losses.append(np.asarray(acoustic_supervision_mask(
+                    target_len, valid_target, int(row.eeg_zero_index),
+                    audio_duration, target_sfreq,
+                    str(row.get("pairing_level", "")),
+                ), dtype=bool))
                 ivals = [(int(x[0]), int(x[1])) for x in intervals]
-                tmsm.append(np.array(source_interval_to_target_mask(source_zero=int(row.source_zero_sample), output_zero=int(row.eeg_zero_index), target_length=target_len, source_sfreq=int(row.source_sfreq_hz), target_sfreq=256, intervals=ivals), bool))
+                tmsm.append(np.array(source_interval_to_target_mask(source_zero=int(row.source_zero_sample), output_zero=int(row.eeg_zero_index), target_length=target_len, source_sfreq=source_sfreq, target_sfreq=target_sfreq, intervals=ivals), bool))
                 bads.append(bad); interps.append(interp); zeros.append(zero); ids.append(row.trial_id); retained.append(row.to_dict())
             except Exception as exc:
                 row = row.copy(); row["build_status"] = "excluded"; row["exclusion_reason"] = f"build:{type(exc).__name__}:{exc}"; row["build_timestamp_utc"] = build_timestamp_utc; built_rows.append(row.to_dict())
         if not eegs:
             continue
-        arrays={"eeg": np.stack(eegs), "eeg_valid_mask": np.stack(valids), "clean_perception_mask": np.stack(cleans), "audio_loss_mask": np.stack(audio_losses), "tms_output_mask": np.stack(tmsm), "bad_channel_mask":np.stack(bads), "interpolated_channel_mask":np.stack(interps), "zero_filled_channel_mask":np.stack(zeros), "channel_valid_mask":~np.stack(zeros)}
+        arrays={"eeg": np.stack(eegs), "channel_xyz": shard_xyz, "eeg_valid_mask": np.stack(valids), "clean_perception_mask": np.stack(cleans), "audio_loss_mask": np.stack(audio_losses), "tms_output_mask": np.stack(tmsm), "bad_channel_mask":np.stack(bads), "interpolated_channel_mask":np.stack(interps), "zero_filled_channel_mask":np.stack(zeros), "channel_valid_mask":~np.stack(zeros)}
         commit, diff = git_provenance()
-        attrs={"schema_version": config["schema_version"], "preprocessing_profile": "harmonized_v2", "eeg_unit": "V", "eeg_dtype": "float32", "channel_order": canonical, "channel_order_hash": channel_order_hash(canonical), "preprocess_config_sha256":config["_config_sha256"], "source_lock_sha256":lock["source_lock_sha256"], "split_index_sha256":split_index["split_index_sha256"], "split_hash_required": True, "code_commit":commit, "code_diff_hash":sha256_bytes(diff.encode()), "audit_override_allow_warnings": bool(allow_audit_warnings), "tms_interpolation_algorithm": config["harmonized"]["tms"]["interpolation_algorithm"], "official_tms_code_sha256": config["harmonized"]["tms"]["source_code_sha256"]}
-        checksum=_atomic_shard(target, arrays, attrs, {"trial_id":ids})
+        attrs={"schema_version": config["schema_version"], "preprocessing_profile": config.get("preprocessing_profile", "harmonized_v3"), "eeg_unit": "V", "eeg_dtype": "float32", "channel_order": canonical, "channel_order_hash": channel_order_hash(canonical), "preprocess_config_sha256":config["_config_sha256"], "source_lock_sha256":lock["source_lock_sha256"], "split_index_sha256":split_index["split_index_sha256"], "split_hash_required": True, "code_commit":commit, "code_diff_hash":sha256_bytes(diff.encode()), "audit_override_allow_warnings": bool(allow_audit_warnings), "tms_interpolation_algorithm": config["harmonized"]["tms"]["interpolation_algorithm"], "official_tms_code_sha256": config["harmonized"]["tms"]["source_code_sha256"]}
+        provenance_keys = ("dataset", "subject", "task", "condition", "pairing_level", "supervision_type", "linguistic_content_id", "waveform_id", "phoneme_label", "audio_id")
+        strings = {"trial_id": ids}
+        for key in provenance_keys:
+            strings[key] = [str(row.get(key, "")) for row in retained]
+        checksum=_atomic_shard(target, arrays, attrs, strings)
         for index, row in enumerate(retained):
-            row.update({"shard_path":as_relative(target), "shard_row":index, "shard_sha256":checksum, "build_status":"included", "source_lock_sha256":lock["source_lock_sha256"], "preprocess_config_sha256":config["_config_sha256"], "split_index_sha256":split_index["split_index_sha256"], "audit_override_allow_warnings":bool(allow_audit_warnings), "build_timestamp_utc":build_timestamp_utc, "bad_channel_count":int(bads[index].sum()), "interpolated_channel_count":int(interps[index].sum()), "zero_filled_channel_count":int(zeros[index].sum())})
+            row.update({"shard_path":as_relative(target), "shard_row":index, "shard_sha256":checksum, "build_status":"included", "source_lock_sha256":lock["source_lock_sha256"], "preprocess_config_sha256":config["_config_sha256"], "split_index_sha256":split_index["split_index_sha256"], "code_commit":commit, "code_diff_hash":attrs["code_diff_hash"], "audit_override_allow_warnings":bool(allow_audit_warnings), "build_timestamp_utc":build_timestamp_utc, "bad_channel_count":int(bads[index].sum()), "interpolated_channel_count":int(interps[index].sum()), "zero_filled_channel_count":int(zeros[index].sum())})
             built_rows.append(row)
     built = pd.DataFrame(built_rows)
-    write_frame(built, root / "manifests" / "manifest_built", pd)
-    print(f"build wrote {sum(built.get('build_status', []) == 'included') if len(built) else 0} trials")
+    built_base = root / "manifests" / "manifest_built"
+    previous_path = built_base.with_suffix(".csv")
+    if previous_path.exists() and len(built):
+        previous = pd.read_csv(previous_path, keep_default_na=False, low_memory=False)
+        rebuilt_shards = set(built.loc[built.get("shard_path", "") != "", "shard_path"]) if "shard_path" in built else set()
+        previous = previous[(~previous.trial_id.isin(set(built.trial_id))) & (~previous.shard_path.isin(rebuilt_shards))]
+        # Preserve old rows for auditability, but never leave an incompatible
+        # shard eligible for a new loader/normalizer after code/config/split
+        # changes.  The HDF5 file remains on disk and can still be inspected.
+        merge_commit, merge_diff = git_provenance()
+        current_contract = {"preprocess_config_sha256": config["_config_sha256"],
+                            "source_lock_sha256": lock["source_lock_sha256"],
+                            "split_index_sha256": split_index["split_index_sha256"],
+                            "code_commit": merge_commit, "code_diff_hash": sha256_bytes(merge_diff.encode())}
+        for shard_path, indices in previous[previous.build_status == "included"].groupby("shard_path").groups.items():
+            compatible = False
+            path = ROOT / shard_path
+            if path.exists():
+                try:
+                    with h5py.File(path, "r") as old:
+                        compatible = all(str(old.attrs.get(key, "")) == str(value) for key, value in current_contract.items())
+                except OSError:
+                    compatible = False
+            if not compatible:
+                previous.loc[list(indices), "build_status"] = "stale_incompatible"
+                previous.loc[list(indices), "exclusion_reason"] = "stale_preprocessing_contract"
+        combined = pd.concat([previous, built], ignore_index=True, sort=False).sort_values(["dataset", "subject", "task", "trial_id"])
+    else:
+        combined = built
+    write_frame(combined, built_base, pd)
+    print(f"build wrote {sum(built.get('build_status', []) == 'included') if len(built) else 0} new trials; manifest contains {sum(combined.get('build_status', []) == 'included') if len(combined) else 0}")
     return 0
 
 
@@ -967,23 +1329,117 @@ def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int, allow_mix
     train_ids = set(split[(split.fold == fold) & (split.role == "train")].trial_id)
     if not train_ids: raise RuntimeError("selected split/fold contains no training trials")
     built_path = output_root(config) / "manifests" / "manifest_built.csv"
-    built = pd.read_csv(built_path, keep_default_na=False) if built_path.exists() else frame
+    built = pd.read_csv(built_path, keep_default_na=False, low_memory=False) if built_path.exists() else frame
     chosen = built[(built.trial_id.isin(train_ids)) & (built.build_status == "included")]
-    if not allow_mixed_production: chosen = chosen[chosen.neural_task != "mixed"]
-    count=None; mean=None; m2=None
-    for shard, entries in chosen.groupby("shard_path"):
+    if not len(chosen):
+        raise RuntimeError("no built train-fold trials are available for normalizer fitting")
+    lock = json.loads((output_root(config) / "source_lock.json").read_text())
+    split_index = json.loads((output_root(config) / "splits" / "assignment.json").read_text())
+    contract_fields = ("preprocess_config_sha256", "source_lock_sha256", "split_index_sha256", "code_commit", "code_diff_hash")
+    contracts: dict[str, set[str]] = {key: set() for key in contract_fields}
+    for shard in sorted(set(chosen.shard_path)):
         with h5py.File(ROOT / shard, "r") as h5:
-            if h5.attrs.get("eeg_unit") != "V": raise RuntimeError("normalizer refuses non-Volt EEG")
-            data=h5["eeg"]
-            for _, entry in entries.iterrows():
-                x=data[int(entry.shard_row)].astype("float64")
-                n=x.shape[1]; m=x.mean(axis=1); v=((x-m[:,None])**2).sum(axis=1)
-                if count is None: count=np.full(x.shape[0], n, dtype=np.int64); mean=m; m2=v
-                else:
-                    total=count+n; delta=m-mean; m2 += v + delta**2*count*n/total; mean += delta*n/total; count=total
-    result={"schema_version":config["schema_version"], "normalization_fit_role":"train_only", "protocol_split_csv":str(split_csv), "split_csv_sha256":sha256_file(split_csv), "fold":fold, "exclude_mixed_production":not allow_mixed_production, "count":count.tolist(), "mean":mean.tolist(), "std":np.sqrt(m2 / np.maximum(count-1,1)).tolist()}
-    target=output_root(config)/"normalizers"/f"{split_csv.stem}_fold-{fold}.json"; target.parent.mkdir(parents=True,exist_ok=True); target.write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
+            for key in contract_fields:
+                contracts[key].add(str(h5.attrs.get(key, "")))
+    expected = {
+        "preprocess_config_sha256": config["_config_sha256"],
+        "source_lock_sha256": lock["source_lock_sha256"],
+        "split_index_sha256": split_index["split_index_sha256"],
+    }
+    for key, value in expected.items():
+        if contracts[key] != {value}:
+            raise RuntimeError(f"normalizer refuses incompatible {key}: {sorted(contracts[key])} != {value}")
+    if bool(config.get("normalization", {}).get("require_single_preprocessing_contract", True)):
+        for key in ("code_commit", "code_diff_hash"):
+            if len(contracts[key]) != 1 or "" in contracts[key]:
+                raise RuntimeError(f"normalizer refuses mixed preprocessing {key}: {sorted(contracts[key])}")
+    maximum = int(config.get("normalization", {}).get("max_samples_per_channel", 200000))
+    dataset_results = {}
+    for dataset, dataset_rows in chosen.groupby("dataset"):
+        channels = config["sources"][dataset]["channel_order"]
+        samples: list[list[Any]] = [[] for _ in channels]
+        counts = np.zeros(len(channels), dtype=np.int64)
+        for shard, entries in dataset_rows.groupby("shard_path"):
+            with h5py.File(ROOT / shard, "r") as h5:
+                if h5.attrs.get("eeg_unit") != "V": raise RuntimeError("normalizer refuses non-Volt EEG")
+                for _, entry in entries.iterrows():
+                    index = int(float(entry.shard_row))
+                    valid = h5["eeg_valid_mask"][index].astype(bool)
+                    x = h5["eeg"][index][:, valid].astype("float64")
+                    if not np.isfinite(x).all():
+                        raise RuntimeError(f"normalizer encountered nonfinite EEG in {entry.trial_id}")
+                    for channel in range(len(channels)):
+                        remaining = maximum - counts[channel]
+                        if remaining <= 0 or x.shape[1] == 0:
+                            continue
+                        stride = max(1, math.ceil(x.shape[1] / remaining))
+                        take = x[channel, ::stride][:remaining]
+                        samples[channel].append(take)
+                        counts[channel] += len(take)
+        center = []
+        scale = []
+        for channel_samples in samples:
+            values = np.concatenate(channel_samples) if channel_samples else np.array([0.0])
+            median = float(np.median(values))
+            mad = float(np.median(np.abs(values - median))) * 1.4826
+            center.append(median)
+            scale.append(max(mad, 1e-9))
+        dataset_results[dataset] = {"channel_order": channels, "count": counts.tolist(), "center_median_v": center,
+                                    "scale_mad_v": scale, "max_samples_per_channel": maximum}
+    result={"schema_version":config["schema_version"], "normalization_fit_role":"train_only", "method":"dataset_channel_median_mad",
+            "protocol_split_csv":str(split_csv), "split_csv_sha256":sha256_file(split_csv), "fold":fold,
+            "preprocessing_contract": {key: next(iter(values)) for key, values in contracts.items()},
+            "datasets":dataset_results}
+    # The split filename already includes the fold (for example,
+    # joint_ood_fold-0.csv); avoid producing the ambiguous fold-0_fold-0 name.
+    target=output_root(config)/"normalizers"/f"{split_csv.stem}.json"; target.parent.mkdir(parents=True,exist_ok=True); target.write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
     print(target)
+    return 0
+
+
+def migrate_provenance(config: dict[str, Any]) -> int:
+    """Atomically narrow legacy broad code hashes without touching EEG arrays.
+
+    This migration is legal only when config/source/split hashes already match;
+    it records the previous code hash in every HDF5 file and updates manifest
+    checksums.  Any transform-contract mismatch still requires a real rebuild.
+    """
+    h5py, _, _ = require_build_runtime(); _, pd = runtime()
+    root = output_root(config); manifest_path = root / "manifests" / "manifest_built.csv"
+    frame = pd.read_csv(manifest_path, keep_default_na=False, low_memory=False)
+    lock = json.loads((root / "source_lock.json").read_text())
+    split_index = json.loads((root / "splits" / "assignment.json").read_text())
+    commit, diff = git_provenance(); code_hash = sha256_bytes(diff.encode())
+    expected = {"preprocess_config_sha256": config["_config_sha256"],
+                "source_lock_sha256": lock["source_lock_sha256"],
+                "split_index_sha256": split_index["split_index_sha256"]}
+    migrated = 0
+    for shard, indices in frame[frame.build_status == "included"].groupby("shard_path").groups.items():
+        path = ROOT / shard; partial = path.with_suffix(path.suffix + ".provenance-migrate.partial")
+        with h5py.File(path, "r") as source:
+            for key, value in expected.items():
+                if str(source.attrs.get(key, "")) != str(value):
+                    raise RuntimeError(f"provenance migration refuses transform-incompatible shard {shard}: {key}")
+            previous_hash = str(source.attrs.get("code_diff_hash", ""))
+        shutil.copyfile(path, partial)
+        try:
+            with h5py.File(partial, "r+") as target:
+                target.attrs["provenance_migrated_from_code_diff_hash"] = previous_hash
+                target.attrs["provenance_migration_reason"] = "narrow_hash_scope_no_transform_change"
+                target.attrs["code_commit"] = commit
+                target.attrs["code_diff_hash"] = code_hash
+                target.flush()
+            os.replace(partial, path)
+        finally:
+            if partial.exists(): partial.unlink()
+        checksum = sha256_file(path)
+        frame.loc[list(indices), "code_commit"] = commit
+        frame.loc[list(indices), "code_diff_hash"] = code_hash
+        frame.loc[list(indices), "shard_sha256"] = checksum
+        frame.loc[list(indices), "provenance_migration"] = "narrow_hash_scope_no_transform_change"
+        migrated += 1
+    write_frame(frame, root / "manifests" / "manifest_built", pd)
+    print(f"migrated provenance atomically for {migrated} included shards; EEG arrays were not rewritten")
     return 0
 
 
@@ -991,33 +1447,192 @@ def validate(config: dict[str, Any], strict: bool) -> int:
     h5py, _, np = require_build_runtime()
     _, pd = runtime()
     root=output_root(config); errors=[]
+    lock_path = root / "source_lock.json"
+    lock = json.loads(lock_path.read_text()) if lock_path.exists() else {}
+    current_commit, current_diff = git_provenance()
+    current_code_hash = sha256_bytes(current_diff.encode())
     split_index_path = root / "splits" / "assignment.json"
     expected_split_hash = json.loads(split_index_path.read_text())["split_index_sha256"] if split_index_path.exists() else ""
     built_path=root/"manifests"/"manifest_built.csv"
     if not built_path.exists(): raise RuntimeError("build first")
-    frame=pd.read_csv(built_path, keep_default_na=False)
+    frame=pd.read_csv(built_path, keep_default_na=False, low_memory=False)
+    observed_contracts: dict[str, set[str]] = {key: set() for key in ("preprocess_config_sha256", "source_lock_sha256", "split_index_sha256", "code_commit", "code_diff_hash")}
     for shard, rows in frame[frame.build_status == "included"].groupby("shard_path"):
         path=ROOT/shard
         if not path.exists(): errors.append(f"missing shard {shard}"); continue
         with h5py.File(path,"r") as h5:
             ds=rows.iloc[0].dataset; c=len(config["sources"][ds]["channel_order"]); t=config["harmonized"]["epoch"][ds]["total_samples_target"]
+            for key in observed_contracts:
+                observed_contracts[key].add(str(h5.attrs.get(key, "")))
             if h5.attrs.get("eeg_unit") != "V" or h5["eeg"].dtype != np.dtype("float32"): errors.append(f"unit/dtype {shard}")
             if h5["eeg"].shape[1:] != (c,t): errors.append(f"shape {shard}: {h5['eeg'].shape}")
-            for required in ("eeg_valid_mask", "clean_perception_mask", "audio_loss_mask", "tms_output_mask", "bad_channel_mask", "interpolated_channel_mask", "zero_filled_channel_mask", "channel_valid_mask"):
+            for required in ("channel_xyz", "eeg_valid_mask", "clean_perception_mask", "audio_loss_mask", "tms_output_mask", "bad_channel_mask", "interpolated_channel_mask", "zero_filled_channel_mask", "channel_valid_mask"):
                 if required not in h5: errors.append(f"missing {required} {shard}")
             if h5.attrs.get("channel_order_hash") != channel_order_hash(config["sources"][ds]["channel_order"]): errors.append(f"channel hash {shard}")
+            if h5.attrs.get("preprocess_config_sha256", "") != config["_config_sha256"]: errors.append(f"config hash {shard}")
+            if h5.attrs.get("source_lock_sha256", "") != lock.get("source_lock_sha256", ""): errors.append(f"source lock hash {shard}")
             if not expected_split_hash or h5.attrs.get("split_index_sha256", "") != expected_split_hash: errors.append(f"split hash {shard}")
+            if h5.attrs.get("code_commit", "") != current_commit or h5.attrs.get("code_diff_hash", "") != current_code_hash:
+                errors.append(f"preprocessing code provenance {shard}")
             if np.any(~np.isfinite(h5["eeg"][:])): errors.append(f"nonfinite {shard}")
-            for _, row in rows[rows.neural_task == "mixed"].iterrows():
-                mask=h5["clean_perception_mask"][int(row.shard_row)]
-                if mask.shape[0] != 384 or mask.sum()!=76 or not (mask[64:140].all() and not mask[:64].any() and not mask[140:].any()): errors.append(f"singlephoneme mask {row.trial_id}")
+            if h5["channel_xyz"].shape != (c, 3) or np.any(~np.isfinite(h5["channel_xyz"][:])): errors.append(f"channel xyz {shard}")
+            for _, row in rows.iterrows():
+                # CSV round-trips may promote this integer column to float when
+                # excluded build rows contain an empty shard_row.
+                index = int(float(row.shard_row))
+                valid = h5["eeg_valid_mask"][index].astype(bool)
+                if not valid.any() or (np.where(valid)[0][-1] + 1 != valid.sum()): errors.append(f"non-prefix time mask {row.trial_id}")
+                acoustic = h5["audio_loss_mask"][index].astype(bool)
+                if row.pairing_level != "verified_exact" and acoustic.any(): errors.append(f"weak pairing has acoustic loss {row.trial_id}")
+    if len(frame[frame.build_status == "included"]):
+        for key, values in observed_contracts.items():
+            if len(values) != 1 or "" in values:
+                errors.append(f"mixed shard preprocessing contract {key}: {sorted(values)}")
     for path in sorted((root/"splits").glob("*.csv")):
-        split=pd.read_csv(path)
-        for role_a, role_b, column in (("train","test","subject_group"),("train","test","audio_group"),("train","validation","subject_group"),("train","validation","audio_group")):
-            # Empty audio group represents label-only rows and is not a group.
-            a=set(split[(split.role==role_a)&(split[column]!="")][column]); b=set(split[(split.role==role_b)&(split[column]!="")][column])
-            if a & b: errors.append(f"split leakage {path.name} {column} {role_a}/{role_b}: {sorted(a & b)[:3]}")
-    report={"status":"pass" if not errors else "fail", "errors":errors, "created_at":time.time()}; (root/"qc"/"validate.json").write_text(json.dumps(report,indent=2)+"\n")
+        split=pd.read_csv(path, keep_default_na=False)
+        protocol = str(split.protocol.iloc[0]) if len(split) else ""
+        columns = ["subject_group"] if protocol == "subject_ood" else ["linguistic_content_group", "waveform_group"]
+        if protocol in {"joint_ood", "stage2_joint_ood"}: columns.insert(0, "subject_group")
+        for role_a, role_b in (("train","test"),("train","validation"),("validation","test")):
+            for column in columns:
+                a=set(split[(split.role==role_a)&(split[column]!="")][column]); b=set(split[(split.role==role_b)&(split[column]!="")][column])
+                if a & b: errors.append(f"split leakage {path.name} {column} {role_a}/{role_b}: {sorted(a & b)[:3]}")
+        if protocol == "stage2_joint_ood":
+            assignment_path = root / "splits" / "stage2_assignment.json"
+            if not assignment_path.exists():
+                errors.append("stage2 split is missing stage2_assignment.json")
+            else:
+                stage2_assignment = json.loads(assignment_path.read_text())
+                for dataset, registered in stage2_assignment.get("datasets", {}).items():
+                    dataset_rows = split[split.subject_group.str.startswith(f"{dataset}:")]
+                    for role in ("train", "validation", "test"):
+                        role_rows = dataset_rows[dataset_rows.role == role]
+                        subject_count = sum(value == role for value in registered.get("subjects", {}).values())
+                        for axis, content_key in (("audio", "contents"), ("label", "label_contents")):
+                            content_count = sum(value == role for value in registered.get(content_key, {}).values())
+                            expected = subject_count * content_count
+                            actual = role_rows[role_rows.supervision_axis == axis]
+                            cells = actual.groupby(["subject_group", "linguistic_content_group"]).size()
+                            if len(actual) != expected or (len(cells) and not cells.eq(1).all()):
+                                errors.append(
+                                    f"stage2 exact grid {dataset}/{axis}/{role}: {len(actual)} != {expected}"
+                                )
+    # Content-supervised rows must have a real target; zeros are never a legal
+    # fallback.  Label-only rows intentionally need no audio target.
+    target_path = root / "speech_targets" / "speech_targets.h5"
+    supervised = frame[(frame.build_status == "included") & frame.supervision_type.isin(["paired_audio", "weak_audio"])]
+    if len(supervised):
+        if not target_path.exists():
+            errors.append("missing speech target cache")
+        else:
+            with h5py.File(target_path, "r") as targets:
+                if targets.attrs.get("preprocess_config_sha256", "") != config["_config_sha256"]:
+                    errors.append("speech target config hash mismatch")
+                if targets.attrs.get("source_lock_sha256", "") != lock.get("source_lock_sha256", ""):
+                    errors.append("speech target source lock mismatch")
+                if targets.attrs.get("code_commit", "") != current_commit or targets.attrs.get("code_diff_hash", "") != current_code_hash:
+                    errors.append("speech target code provenance mismatch")
+                target_implementation = HERE / "cache_speech_targets.py"
+                if targets.attrs.get("target_code_sha256", "") != sha256_file(target_implementation):
+                    errors.append("speech target implementation hash mismatch")
+                missing_targets = []
+                for _, row in supervised.iterrows():
+                    audio_id = str(row.get("audio_id", "")) or (f"audio-{row.audio_sha256[:16]}-{row.audio_semantics}" if row.audio_sha256 else "")
+                    if not audio_id or audio_id not in targets:
+                        missing_targets.append(audio_id or f"trial:{row.trial_id}")
+                missing_targets = sorted(set(missing_targets))
+                if missing_targets:
+                    errors.append(f"missing speech targets: {missing_targets[:5]} (n={len(missing_targets)})")
+    normalizer_path = root / "normalizers" / "joint_ood_fold-0.json"
+    if normalizer_path.exists():
+        normalizer = json.loads(normalizer_path.read_text())
+        expected_normalizer = {
+            "preprocess_config_sha256": config["_config_sha256"],
+            "source_lock_sha256": lock.get("source_lock_sha256", ""),
+            "split_index_sha256": expected_split_hash,
+            "code_commit": current_commit,
+            "code_diff_hash": current_code_hash,
+        }
+        if normalizer.get("preprocessing_contract") != expected_normalizer:
+            errors.append("normalizer preprocessing contract mismatch")
+    # Deterministic 20-pair DS004940 review sheet.  Machine-verifiable fields
+    # are checked here; listening/transcript semantics remain explicitly human.
+    candidates = frame[(frame.dataset == "ds004940") & (frame.build_status == "included")].copy()
+    candidates["review_order"] = candidates.trial_id.map(
+        lambda value: sha256_bytes(f"pair-review|{config['split_seed']}|{value}".encode())
+    )
+    review_path = root/"qc"/"ds004940_pair_review_20.csv"
+    prior_human_status = {}
+    if review_path.exists():
+        prior = pd.read_csv(review_path, keep_default_na=False)
+        if {"trial_id", "human_listen_transcript_status"}.issubset(prior.columns):
+            prior_human_status = dict(zip(prior.trial_id, prior.human_listen_transcript_status))
+    review_rows = []
+    for _, row in candidates.sort_values("review_order").head(20).iterrows():
+        audio_path = ROOT / row.audio_path
+        event_path = ROOT / row.source_event_path
+        eeg_path = ROOT / row.source_eeg_path
+        audio_ok = audio_path.exists() and sha256_file(audio_path) == row.audio_sha256
+        event_ok = event_path.exists() and sha256_file(event_path) == row.source_event_sha256
+        mapping_ok = int(row.source_start_sample) <= int(row.source_zero_sample) < int(row.source_end_sample)
+        machine_pass = bool(audio_ok and event_ok and eeg_path.exists() and mapping_ok and row.pairing_level == "verified_exact")
+        if not machine_pass:
+            errors.append(f"DS004940 pair review failed {row.trial_id}")
+        review_rows.append({"trial_id":row.trial_id,"subject":row.subject,"task":row.task,"condition":row.condition,
+                            "stim_file":row.stim_file,"audio_path":row.audio_path,"audio_sha256":row.audio_sha256,
+                            "source_eeg_path":row.source_eeg_path,"event_onset_seconds":row.event_onset_seconds,
+                            "event_run_local_onset_seconds":row.event_run_local_onset_seconds,
+                            "stimulus_duration_seconds":row.stimulus_duration_seconds,"audio_hash_pass":audio_ok,
+                            "event_hash_pass":event_ok,"epoch_mapping_pass":mapping_ok,"machine_pair_review_pass":machine_pass,
+                            "human_listen_transcript_status":prior_human_status.get(row.trial_id,"pending")})
+    pd.DataFrame(review_rows).to_csv(review_path,index=False)
+    approved = {"pass", "passed", "verified", "approved"}
+    human_status = "pass" if review_rows and all(
+        str(row["human_listen_transcript_status"]).strip().lower() in approved for row in review_rows
+    ) else "pending"
+    evidence = config.get("evidence_policy", {})
+    presentation = evidence.get("ds006104_presentation_manifest")
+    if presentation:
+        presentation_path = ROOT / presentation["path"] if isinstance(presentation, dict) else ROOT / str(presentation)
+        expected_presentation_hash = presentation.get("sha256", "") if isinstance(presentation, dict) else ""
+        presentation_status = "pass" if presentation_path.exists() and (not expected_presentation_hash or sha256_file(presentation_path) == expected_presentation_hash) else "fail"
+    else:
+        presentation_status = "pending_content_only"
+    inventory = pd.read_csv(root / "manifests" / "manifest_all.csv", keep_default_na=False, low_memory=False)
+    s15_missing = int(((inventory.dataset == "ds006104") & (inventory.subject == "S15") &
+                       (inventory.exclusion_reason == "missing_official_aux_row")).sum())
+    s15_expected = int(evidence.get("ds006104_expected_missing_s15_trials", 0))
+    s15_aux = _existing_aux_event("S15", config)
+    s15_aux_valid = s15_aux.exists() and sha256_file(s15_aux) == EVENT_TABLE_SHA256["S15"]
+    if s15_missing == 0 and s15_aux_valid:
+        s15_status = "pinned_official_table_verified"
+    elif s15_missing == s15_expected:
+        s15_status = "excluded_as_registered"
+    else:
+        s15_status = "unexpected_count"
+    if s15_missing != s15_expected or (s15_expected == 0 and not s15_aux_valid):
+        errors.append(f"S15 explicit exclusion count {s15_missing} != {s15_expected}")
+    psd_path = root / "qc" / "preprocessing_psd.json"
+    psd_status = json.loads(psd_path.read_text()).get("status", "fail") if psd_path.exists() else "pending"
+    if strict and psd_status != "pass":
+        errors.append(f"preprocessing PSD QC is {psd_status}")
+    formal_ready = not errors and human_status == "pass" and psd_status == "pass"
+    report={"status":"pass" if not errors else "fail", "errors":errors,
+            "ds004940_machine_pair_review_count":len(review_rows),
+            "ds004940_human_listen_transcript_status":human_status,
+            "ds006104_presentation_provenance_status": presentation_status,
+            "ds006104_acoustic_supervision_enabled": presentation_status == "pass",
+            "ds006104_s15_auxiliary_status": s15_status,
+            "ds006104_s15_excluded_trials": s15_missing,
+            "ds006104_s15_auxiliary_sha256": sha256_file(s15_aux) if s15_aux_valid else "",
+            "preprocessing_psd_status": psd_status,
+            "formal_m0_ready": formal_ready,
+            "formal_m0_blockers": [name for name, passed in {
+                "machine_validation": not errors,
+                "ds004940_human_pair_review": human_status == "pass",
+                "preprocessing_psd_qc": psd_status == "pass",
+            }.items() if not passed],
+            "created_at":time.time()}; (root/"qc"/"validate.json").write_text(json.dumps(report,indent=2)+"\n")
     print(json.dumps(report,indent=2))
     return 2 if errors and strict else 0
 
@@ -1028,8 +1643,9 @@ def parser() -> argparse.ArgumentParser:
     a=sub.add_parser("audit"); a.add_argument("--strict",action="store_true"); a.add_argument("--fetch-aux",action="store_true",help="download pinned official DS006104 event tables")
     ab=sub.add_parser("build-audio-bank"); ab.add_argument("--resume", action="store_true")
     sub.add_parser("make-splits")
-    b=sub.add_parser("build"); b.add_argument("--dataset",choices=["all","ds004940","ds006104"],default="all"); b.add_argument("--subjects",default="all"); b.add_argument("--resume",action="store_true"); b.add_argument("--allow-audit-warnings",action="store_true")
+    b=sub.add_parser("build"); b.add_argument("--dataset",choices=["all","ds004940","ds006104"],default="all"); b.add_argument("--subjects",default="all"); b.add_argument("--tasks",default="all"); b.add_argument("--limit-trials-per-group",type=int); b.add_argument("--common-contents",type=int); b.add_argument("--content-ids"); b.add_argument("--tms-condition",choices=["any","off","on"],default="any"); b.add_argument("--split-role",choices=["any","train","validation","test"],default="any"); b.add_argument("--split-protocol",choices=["subject_ood","audio_ood","joint_ood","stage2_joint_ood"],default="joint_ood"); b.add_argument("--split-fold",type=int,default=0); b.add_argument("--resume",action="store_true"); b.add_argument("--allow-audit-warnings",action="store_true")
     n=sub.add_parser("fit-normalizer"); n.add_argument("--split-csv",type=Path,required=True); n.add_argument("--fold",type=int,required=True); n.add_argument("--allow-mixed-production",action="store_true")
+    sub.add_parser("migrate-provenance")
     v=sub.add_parser("validate"); v.add_argument("--strict",action="store_true")
     return p
 
@@ -1039,8 +1655,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command=="audit": return audit(config,args.strict,args.fetch_aux)
     if args.command=="build-audio-bank": return build_audio_bank(config,args.resume)
     if args.command=="make-splits": return make_splits(config)
-    if args.command=="build": return build(config,args.dataset,args.subjects,args.resume,args.allow_audit_warnings)
+    if args.command=="build": return build(config,args.dataset,args.subjects,args.tasks,args.limit_trials_per_group,args.common_contents,args.content_ids,args.tms_condition,args.split_role,args.split_protocol,args.split_fold,args.resume,args.allow_audit_warnings)
     if args.command=="fit-normalizer": return fit_normalizer(config,args.split_csv,args.fold,args.allow_mixed_production)
+    if args.command=="migrate-provenance": return migrate_provenance(config)
     return validate(config,args.strict)
 
 
