@@ -55,6 +55,7 @@ for mode in ds004940 ds006104 joint; do
   for seed in "${SEEDS[@]}"; do
     TRAIN_ARGS=(--config "$PILOT_CONFIG" --mode "$mode" --stage overfit --seed "$seed" --explore)
     if [[ -n "${EXPLORE_MAX_STEPS:-}" ]]; then TRAIN_ARGS+=(--max-steps "$EXPLORE_MAX_STEPS"); fi
+    if [[ -n "${CHECKPOINT_EVERY:-}" ]]; then TRAIN_ARGS+=(--checkpoint-every "$CHECKPOINT_EVERY"); fi
     joint_run "$PYTHON_BIN" app/train_joint.py "${TRAIN_ARGS[@]}"
     CHECKPOINT="$RUN_ROOT/explore/overfit/$mode/seed-$seed/checkpoint.pt"
     DATASETS=("$mode")
@@ -76,6 +77,7 @@ for mode in ds004940 ds006104 joint; do
   for seed in "${SEEDS[@]}"; do
     TRAIN_ARGS=(--config "$PILOT_CONFIG" --mode "$mode" --stage generalization --seed "$seed" --explore)
     if [[ -n "${EXPLORE_MAX_STEPS:-}" ]]; then TRAIN_ARGS+=(--max-steps "$EXPLORE_MAX_STEPS"); fi
+    if [[ -n "${CHECKPOINT_EVERY:-}" ]]; then TRAIN_ARGS+=(--checkpoint-every "$CHECKPOINT_EVERY"); fi
     joint_run "$PYTHON_BIN" app/train_joint.py "${TRAIN_ARGS[@]}"
     CHECKPOINT="$RUN_ROOT/explore/generalization/$mode/seed-$seed/checkpoint.pt"
     DATASETS=("$mode")

@@ -28,6 +28,9 @@ training:
   weight_decay: 0.01
   grad_clip: 1.0
   max_steps: 5000
+  # A small Mac may need to stop between sessions.  train_joint.py writes an
+  # atomic resumable state after this many completed optimizer steps.
+  checkpoint_interval_steps: 25
   seeds: [31, 47, 73]
   dataset_batch_ratio: [1, 1]
   label_only_batch_interval: 5

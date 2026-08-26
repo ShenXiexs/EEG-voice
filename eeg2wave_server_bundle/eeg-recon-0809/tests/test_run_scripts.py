@@ -2,9 +2,11 @@ import importlib.util
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
+import torch
 import yaml
 
 
@@ -16,6 +18,12 @@ m0 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m0)
 
 from prepare_training_data import load_config
+
+TRAIN_MODULE = ROOT / "app" / "train_joint.py"
+sys.path.insert(0, str(ROOT / "app" / "src"))
+train_spec = importlib.util.spec_from_file_location("train_joint", TRAIN_MODULE)
+train = importlib.util.module_from_spec(train_spec)
+train_spec.loader.exec_module(train)
 
 
 class TestRunScripts(unittest.TestCase):
@@ -53,6 +61,19 @@ class TestRunScripts(unittest.TestCase):
         self.assertIn("--explore", explore)
         self.assertIn("$RUN_ROOT/explore", explore)
         self.assertIn("--explore --materialize", explore)
+        self.assertIn("--checkpoint-every", explore)
+
+    def test_atomic_training_state_and_contract_mismatch_detection(self):
+        contract = {"mode": "joint", "seed": 31, "artifact_hashes": {"manifest": "abc"}}
+        self.assertEqual(train.contract_mismatches(contract, dict(contract)), [])
+        changed = dict(contract); changed["seed"] = 47
+        self.assertEqual(train.contract_mismatches(contract, changed), ["seed"])
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "training_state.pt"
+            train.atomic_torch_save({"completed_steps": 25, "resume_contract": contract}, target)
+            self.assertTrue(target.exists())
+            self.assertFalse(target.with_suffix(".pt.tmp").exists())
+            self.assertEqual(torch.load(target, map_location="cpu", weights_only=False)["completed_steps"], 25)
 
 
 if __name__ == "__main__":

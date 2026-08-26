@@ -115,7 +115,15 @@ EXPLORE_FROM=m0 REBUILD_M0=1 ./app/run_joint_explore.sh
 
 # M0 artifact、normalizer 和 speech target 已完成，但模型训练中断时继续
 EXPLORE_FROM=overfit ./app/run_joint_explore.sh
+
+# 训练每 10 个完整 optimizer step 保存一次；Ctrl-C 后重跑相同命令会自动续跑。
+EXPLORE_FROM=overfit CHECKPOINT_EVERY=10 ./app/run_joint_explore.sh
 ```
+
+每个 mode/stage/seed 都写入一个原子 `training_state.pt`，包含 model、optimizer、
+step 和随机状态。中断最多损失最近一个 checkpoint interval 内的工作；已完成的
+checkpoint 会自动跳过。若有意重新训练某个已完成 run，直接调用
+`app/train_joint.py` 并加 `--restart`。
 
 Explore outputs 永远隔离在：
 
