@@ -1141,7 +1141,8 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
           limit_trials_per_group: int | None, common_contents: int | None,
           content_ids: str | None,
           tms_condition: str, split_role_filter: str, split_protocol: str,
-          split_fold: int, resume: bool, allow_audit_warnings: bool) -> int:
+          split_fold: int, resume: bool, allow_audit_warnings: bool,
+          artifact_set: str = "built") -> int:
     h5py, mne, np = require_build_runtime()
     frame, pd = read_manifest(config)
     root = output_root(config)
@@ -1153,6 +1154,11 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
     if not split_index_path.exists():
         raise RuntimeError("make-splits first; HDF5 shards must pin a frozen split index")
     split_index = json.loads(split_index_path.read_text())
+    if not re.fullmatch(r"[a-z0-9_-]+", artifact_set):
+        raise ValueError("artifact_set must contain only lowercase letters, digits, '_' or '-'")
+    if artifact_set != "built" and split_role_filter == "any":
+        raise ValueError("a named artifact_set requires an explicit split role")
+    split_contract_hash = split_index["split_index_sha256"]
     requested = None if subjects == "all" else set(subjects.split(","))
     requested_tasks = None if tasks == "all" else {canonical_task_name(value) if dataset == "ds006104" else value for value in tasks.split(",")}
     selected = _rows_for_shards(frame, dataset, requested, requested_tasks)
@@ -1162,6 +1168,8 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
         split_frame = pd.read_csv(split_path, keep_default_na=False)
         allowed = set(split_frame[split_frame.role == split_role_filter].trial_id)
         selected = selected[selected.trial_id.isin(allowed)]
+        if artifact_set != "built":
+            split_contract_hash = sha256_file(split_path)
     if tms_condition != "any":
         if dataset != "ds006104":
             raise ValueError("--tms-condition is only valid for ds006104")
@@ -1201,10 +1209,11 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
         spec = config["sources"][ds]
         canonical = spec["channel_order"]
         target_len = config["harmonized"]["epoch"][ds]["total_samples_target"]
-        target = root / "shards" / ds / subject / f"task-{task}.h5"
+        shard_root = root / "shards" if artifact_set == "built" else root / "shards" / artifact_set
+        target = shard_root / ds / subject / f"task-{task}.h5"
         if target.exists() and resume:
             with h5py.File(target, "r") as previous:
-                if not resume_compatible(dict(previous.attrs), config_sha=config["_config_sha256"], source_lock_sha=lock["source_lock_sha256"], channel_hash=channel_order_hash(canonical), split_hash=split_index["split_index_sha256"]):
+                if not resume_compatible(dict(previous.attrs), config_sha=config["_config_sha256"], source_lock_sha=lock["source_lock_sha256"], channel_hash=channel_order_hash(canonical), split_hash=split_contract_hash):
                     raise RuntimeError(f"resume refuses incompatible shard {target}")
             continue
         # One recording is loaded/filter/resampled once.  DS006104 TMS intervals
@@ -1278,7 +1287,7 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
             continue
         arrays={"eeg": np.stack(eegs), "channel_xyz": shard_xyz, "eeg_valid_mask": np.stack(valids), "clean_perception_mask": np.stack(cleans), "audio_loss_mask": np.stack(audio_losses), "tms_output_mask": np.stack(tmsm), "bad_channel_mask":np.stack(bads), "interpolated_channel_mask":np.stack(interps), "zero_filled_channel_mask":np.stack(zeros), "channel_valid_mask":~np.stack(zeros)}
         commit, diff = git_provenance()
-        attrs={"schema_version": config["schema_version"], "preprocessing_profile": config.get("preprocessing_profile", "harmonized_v3"), "eeg_unit": "V", "eeg_dtype": "float32", "channel_order": canonical, "channel_order_hash": channel_order_hash(canonical), "preprocess_config_sha256":config["_config_sha256"], "source_lock_sha256":lock["source_lock_sha256"], "split_index_sha256":split_index["split_index_sha256"], "split_hash_required": True, "code_commit":commit, "code_diff_hash":sha256_bytes(diff.encode()), "audit_override_allow_warnings": bool(allow_audit_warnings), "tms_interpolation_algorithm": config["harmonized"]["tms"]["interpolation_algorithm"], "official_tms_code_sha256": config["harmonized"]["tms"]["source_code_sha256"]}
+        attrs={"schema_version": config["schema_version"], "preprocessing_profile": config.get("preprocessing_profile", "harmonized_v3"), "artifact_set": artifact_set, "eeg_unit": "V", "eeg_dtype": "float32", "channel_order": canonical, "channel_order_hash": channel_order_hash(canonical), "preprocess_config_sha256":config["_config_sha256"], "source_lock_sha256":lock["source_lock_sha256"], "split_index_sha256":split_contract_hash, "split_hash_required": True, "code_commit":commit, "code_diff_hash":sha256_bytes(diff.encode()), "audit_override_allow_warnings": bool(allow_audit_warnings), "tms_interpolation_algorithm": config["harmonized"]["tms"]["interpolation_algorithm"], "official_tms_code_sha256": config["harmonized"]["tms"]["source_code_sha256"]}
         provenance_keys = ("dataset", "subject", "task", "condition", "pairing_level", "supervision_type", "linguistic_content_id", "waveform_id", "phoneme_label", "audio_id")
         strings = {"trial_id": ids}
         for key in provenance_keys:
@@ -1288,8 +1297,12 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
             row.update({"shard_path":as_relative(target), "shard_row":index, "shard_sha256":checksum, "build_status":"included", "source_lock_sha256":lock["source_lock_sha256"], "preprocess_config_sha256":config["_config_sha256"], "split_index_sha256":split_index["split_index_sha256"], "code_commit":commit, "code_diff_hash":attrs["code_diff_hash"], "audit_override_allow_warnings":bool(allow_audit_warnings), "build_timestamp_utc":build_timestamp_utc, "bad_channel_count":int(bads[index].sum()), "interpolated_channel_count":int(interps[index].sum()), "zero_filled_channel_count":int(zeros[index].sum())})
             built_rows.append(row)
     built = pd.DataFrame(built_rows)
-    built_base = root / "manifests" / "manifest_built"
+    built_base = root / "manifests" / f"manifest_{artifact_set}"
     previous_path = built_base.with_suffix(".csv")
+    if previous_path.exists() and not len(built):
+        previous = pd.read_csv(previous_path, keep_default_na=False, low_memory=False)
+        print(f"build resumed with 0 new trials; manifest contains {sum(previous.build_status == 'included')}")
+        return 0
     if previous_path.exists() and len(built):
         previous = pd.read_csv(previous_path, keep_default_na=False, low_memory=False)
         rebuilt_shards = set(built.loc[built.get("shard_path", "") != "", "shard_path"]) if "shard_path" in built else set()
@@ -1322,13 +1335,16 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
     return 0
 
 
-def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int, allow_mixed_production: bool) -> int:
+def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int,
+                   allow_mixed_production: bool, manifest_kind: str = "built") -> int:
     h5py, _, np = require_build_runtime()
     frame, pd = read_manifest(config)
     split = pd.read_csv(split_csv)
     train_ids = set(split[(split.fold == fold) & (split.role == "train")].trial_id)
     if not train_ids: raise RuntimeError("selected split/fold contains no training trials")
-    built_path = output_root(config) / "manifests" / "manifest_built.csv"
+    if not re.fullmatch(r"[a-z0-9_-]+", manifest_kind):
+        raise ValueError("manifest_kind contains unsafe characters")
+    built_path = output_root(config) / "manifests" / f"manifest_{manifest_kind}.csv"
     built = pd.read_csv(built_path, keep_default_na=False, low_memory=False) if built_path.exists() else frame
     chosen = built[(built.trial_id.isin(train_ids)) & (built.build_status == "included")]
     if not len(chosen):
@@ -1341,10 +1357,12 @@ def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int, allow_mix
         with h5py.File(ROOT / shard, "r") as h5:
             for key in contract_fields:
                 contracts[key].add(str(h5.attrs.get(key, "")))
+    expected_split_hash = (split_index["split_index_sha256"] if manifest_kind == "built"
+                           else sha256_file(split_csv))
     expected = {
         "preprocess_config_sha256": config["_config_sha256"],
         "source_lock_sha256": lock["source_lock_sha256"],
-        "split_index_sha256": split_index["split_index_sha256"],
+        "split_index_sha256": expected_split_hash,
     }
     for key, value in expected.items():
         if contracts[key] != {value}:
@@ -1387,6 +1405,7 @@ def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int, allow_mix
         dataset_results[dataset] = {"channel_order": channels, "count": counts.tolist(), "center_median_v": center,
                                     "scale_mad_v": scale, "max_samples_per_channel": maximum}
     result={"schema_version":config["schema_version"], "normalization_fit_role":"train_only", "method":"dataset_channel_median_mad",
+            "manifest_kind": manifest_kind,
             "protocol_split_csv":str(split_csv), "split_csv_sha256":sha256_file(split_csv), "fold":fold,
             "preprocessing_contract": {key: next(iter(values)) for key, values in contracts.items()},
             "datasets":dataset_results}
@@ -1398,7 +1417,7 @@ def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int, allow_mix
 
 
 def migrate_provenance(config: dict[str, Any]) -> int:
-    """Atomically narrow legacy broad code hashes without touching EEG arrays.
+    """Atomically migrate metadata-only preprocessing provenance.
 
     This migration is legal only when config/source/split hashes already match;
     it records the previous code hash in every HDF5 file and updates manifest
@@ -1425,7 +1444,8 @@ def migrate_provenance(config: dict[str, Any]) -> int:
         try:
             with h5py.File(partial, "r+") as target:
                 target.attrs["provenance_migrated_from_code_diff_hash"] = previous_hash
-                target.attrs["provenance_migration_reason"] = "narrow_hash_scope_no_transform_change"
+                target.attrs["provenance_migration_reason"] = "artifact_namespace_metadata_only_no_array_change"
+                target.attrs["artifact_set"] = "built"
                 target.attrs["code_commit"] = commit
                 target.attrs["code_diff_hash"] = code_hash
                 target.flush()
@@ -1436,7 +1456,7 @@ def migrate_provenance(config: dict[str, Any]) -> int:
         frame.loc[list(indices), "code_commit"] = commit
         frame.loc[list(indices), "code_diff_hash"] = code_hash
         frame.loc[list(indices), "shard_sha256"] = checksum
-        frame.loc[list(indices), "provenance_migration"] = "narrow_hash_scope_no_transform_change"
+        frame.loc[list(indices), "provenance_migration"] = "artifact_namespace_metadata_only_no_array_change"
         migrated += 1
     write_frame(frame, root / "manifests" / "manifest_built", pd)
     print(f"migrated provenance atomically for {migrated} included shards; EEG arrays were not rewritten")
@@ -1643,8 +1663,8 @@ def parser() -> argparse.ArgumentParser:
     a=sub.add_parser("audit"); a.add_argument("--strict",action="store_true"); a.add_argument("--fetch-aux",action="store_true",help="download pinned official DS006104 event tables")
     ab=sub.add_parser("build-audio-bank"); ab.add_argument("--resume", action="store_true")
     sub.add_parser("make-splits")
-    b=sub.add_parser("build"); b.add_argument("--dataset",choices=["all","ds004940","ds006104"],default="all"); b.add_argument("--subjects",default="all"); b.add_argument("--tasks",default="all"); b.add_argument("--limit-trials-per-group",type=int); b.add_argument("--common-contents",type=int); b.add_argument("--content-ids"); b.add_argument("--tms-condition",choices=["any","off","on"],default="any"); b.add_argument("--split-role",choices=["any","train","validation","test"],default="any"); b.add_argument("--split-protocol",choices=["subject_ood","audio_ood","joint_ood","stage2_joint_ood"],default="joint_ood"); b.add_argument("--split-fold",type=int,default=0); b.add_argument("--resume",action="store_true"); b.add_argument("--allow-audit-warnings",action="store_true")
-    n=sub.add_parser("fit-normalizer"); n.add_argument("--split-csv",type=Path,required=True); n.add_argument("--fold",type=int,required=True); n.add_argument("--allow-mixed-production",action="store_true")
+    b=sub.add_parser("build"); b.add_argument("--dataset",choices=["all","ds004940","ds006104"],default="all"); b.add_argument("--subjects",default="all"); b.add_argument("--tasks",default="all"); b.add_argument("--limit-trials-per-group",type=int); b.add_argument("--common-contents",type=int); b.add_argument("--content-ids"); b.add_argument("--tms-condition",choices=["any","off","on"],default="any"); b.add_argument("--split-role",choices=["any","train","validation","test"],default="any"); b.add_argument("--split-protocol",choices=["subject_ood","audio_ood","joint_ood","stage2_joint_ood"],default="joint_ood"); b.add_argument("--split-fold",type=int,default=0); b.add_argument("--artifact-set",default="built"); b.add_argument("--resume",action="store_true"); b.add_argument("--allow-audit-warnings",action="store_true")
+    n=sub.add_parser("fit-normalizer"); n.add_argument("--split-csv",type=Path,required=True); n.add_argument("--fold",type=int,required=True); n.add_argument("--manifest-kind",default="built"); n.add_argument("--allow-mixed-production",action="store_true")
     sub.add_parser("migrate-provenance")
     v=sub.add_parser("validate"); v.add_argument("--strict",action="store_true")
     return p
@@ -1655,8 +1675,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command=="audit": return audit(config,args.strict,args.fetch_aux)
     if args.command=="build-audio-bank": return build_audio_bank(config,args.resume)
     if args.command=="make-splits": return make_splits(config)
-    if args.command=="build": return build(config,args.dataset,args.subjects,args.tasks,args.limit_trials_per_group,args.common_contents,args.content_ids,args.tms_condition,args.split_role,args.split_protocol,args.split_fold,args.resume,args.allow_audit_warnings)
-    if args.command=="fit-normalizer": return fit_normalizer(config,args.split_csv,args.fold,args.allow_mixed_production)
+    if args.command=="build": return build(config,args.dataset,args.subjects,args.tasks,args.limit_trials_per_group,args.common_contents,args.content_ids,args.tms_condition,args.split_role,args.split_protocol,args.split_fold,args.resume,args.allow_audit_warnings,args.artifact_set)
+    if args.command=="fit-normalizer": return fit_normalizer(config,args.split_csv,args.fold,args.allow_mixed_production,args.manifest_kind)
     if args.command=="migrate-provenance": return migrate_provenance(config)
     return validate(config,args.strict)
 

@@ -20,6 +20,7 @@ sys.path.insert(0, str(APP / "src"))
 
 from eeg2speech.data import (AlternatingBatchIterator, JointManifestDataset, auxiliary_indices,
                              homogeneous_collate, phoneme_vocabulary_from_manifest, pilot_indices)
+from eeg2speech.gates import require_registered_m0_gates
 from eeg2speech.losses import counterfactual_eeg, joint_content_loss
 from eeg2speech.model import JointEEGContentModel
 
@@ -43,22 +44,6 @@ def runtime_code_sha256() -> str:
     for path in paths:
         digest.update(str(path.relative_to(ROOT)).encode()); digest.update(sha256_file(path).encode())
     return digest.hexdigest()
-
-
-def require_registered_m0_gates(cfg: dict) -> None:
-    missing = []; failed = []
-    for seed in cfg["training"]["seeds"]:
-        for mode, datasets in {"ds004940":["ds004940"], "ds006104":["ds006104"],
-                               "joint":["ds004940","ds006104"]}.items():
-            root = ROOT / "outputs" / "joint_pilot_v1" / "pilot" / "overfit" / mode / f"seed-{seed}"
-            for dataset in datasets:
-                path = root / f"evaluation_{dataset}_train.json"
-                if not path.exists(): missing.append(str(path.relative_to(ROOT))); continue
-                payload = json.loads(path.read_text())
-                if payload.get("run_kind") != "pilot" or not payload.get("gate", {}).get("passed", False):
-                    failed.append(str(path.relative_to(ROOT)))
-    if missing or failed:
-        raise RuntimeError(f"Stage 2 is gated by all registered M0 runs; missing={missing}, failed={failed}")
 
 
 def device() -> torch.device:
@@ -155,12 +140,14 @@ def main() -> int:
     audit = json.loads((artifact_root / "qc" / "audit.json").read_text())
     if audit.get("included_counts", {}).get("ds004940") != 17489 or audit.get("included_counts", {}).get("ds006104") != 10888:
         raise RuntimeError("Stage 0 audit gate failed: expected 17,489 and 10,888 included trials")
-    if args.stage == "generalization" and not args.dry_run and bool(cfg["training"].get("stage2_requires_all_m0_gates", True)):
-        require_registered_m0_gates(cfg)
+    if args.stage == "generalization" and bool(cfg["training"].get("stage2_requires_all_m0_gates", True)):
+        require_registered_m0_gates(ROOT, cfg)
     split_protocol = cfg["split"]["protocol"] if args.stage == "overfit" else "stage2_joint_ood"
     split_path = artifact_root / "splits" / f"{split_protocol}_fold-{cfg['split']['fold']}.csv"
-    manifest_path = artifact_root / "manifests" / "manifest_built.csv"
-    target_path = artifact_root / "speech_targets" / "speech_targets.h5"
+    artifact_set = "built" if args.stage == "overfit" else "stage2"
+    manifest_path = artifact_root / "manifests" / f"manifest_{artifact_set}.csv"
+    target_name = "speech_targets" if args.stage == "overfit" else "speech_targets_stage2"
+    target_path = artifact_root / "speech_targets" / f"{target_name}.h5"
     normalizer_path = artifact_root / "normalizers" / f"{split_path.stem}.json"
     source_lock_path = artifact_root / "source_lock.json"
     validation_path = artifact_root / "qc" / "validate.json"

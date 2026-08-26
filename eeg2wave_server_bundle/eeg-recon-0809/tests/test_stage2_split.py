@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +14,7 @@ spec = importlib.util.spec_from_file_location("prepare_stage2_split", MODULE)
 stage2 = importlib.util.module_from_spec(spec); spec.loader.exec_module(stage2)
 
 from eeg2speech.data import _complete_grid
+from eeg2speech.gates import registered_m0_gate_status
 
 
 class TestStage2Split(unittest.TestCase):
@@ -45,6 +48,23 @@ class TestStage2Split(unittest.TestCase):
                             (merged.supervision_type=="label_only")]
             self.assertEqual(len(selected),subject_counts[role]*label_counts[role])
             self.assertTrue(selected.groupby(["subject","linguistic_content_id"]).size().eq(1).all())
+
+    def test_stage2_gate_requires_every_mode_dataset_and_seed(self):
+        config={"training":{"seeds":[31]}}
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            status=registered_m0_gate_status(root,config)
+            self.assertEqual(len(status["missing"]),4)
+            self.assertEqual(status["failed"],[])
+            for mode,datasets in {"ds004940":["ds004940"],"ds006104":["ds006104"],
+                                  "joint":["ds004940","ds006104"]}.items():
+                folder=root/"outputs/joint_pilot_v1/pilot/overfit"/mode/"seed-31"
+                folder.mkdir(parents=True,exist_ok=True)
+                for dataset in datasets:
+                    (folder/f"evaluation_{dataset}_train.json").write_text(
+                        json.dumps({"run_kind":"pilot","gate":{"passed":True}})
+                    )
+            self.assertEqual(registered_m0_gate_status(root,config),{"missing":[],"failed":[]})
 
 
 if __name__=="__main__": unittest.main()

@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import h5py
+import numpy as np
 import torch
 import pandas as pd
 
@@ -141,6 +143,24 @@ class TestJointPipeline(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,"speech-target cache"):
                 JointManifestDataset(root/"manifest.csv",root/"split.csv","train","ds004940",
                                      speech_targets=root/"absent.h5",normalizer_path=root/"absent.json")
+
+    def test_content_dataset_fails_closed_on_incomplete_target_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            pd.DataFrame([{"trial_id":"trial-1","dataset":"ds004940","subject":"s1","task":"task",
+                           "condition":"active","linguistic_content_id":"content-1","phoneme_label":"",
+                           "build_status":"included","supervision_type":"paired_audio","pairing_level":"verified_exact",
+                           "audio_id":"audio-bad","audio_sha256":"abc","audio_semantics":"presented_waveform",
+                           "preprocess_config_sha256":"config","shard_path":"missing.h5","shard_row":0}]).to_csv(root/"manifest.csv",index=False)
+            pd.DataFrame([{"trial_id":"trial-1","role":"train"}]).to_csv(root/"split.csv",index=False)
+            with h5py.File(root/"targets.h5","w") as target:
+                target.attrs["preprocess_config_sha256"]="config"
+                group=target.create_group("audio-bad")
+                group.create_dataset("content_mfcc",data=np.zeros((39,161),dtype=np.float32))
+                group.create_dataset("content_mask",data=np.ones(161,dtype=bool))
+            with self.assertRaisesRegex(RuntimeError,"missing log_mel"):
+                JointManifestDataset(root/"manifest.csv",root/"split.csv","train","ds004940",
+                                     speech_targets=root/"targets.h5",normalizer_path=root/"absent.json")
 
     def test_collate_rejects_cross_dataset_batch(self):
         with self.assertRaises(ValueError):

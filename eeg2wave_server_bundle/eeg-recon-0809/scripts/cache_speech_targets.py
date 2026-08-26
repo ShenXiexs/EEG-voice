@@ -158,8 +158,11 @@ def hubert_features(wave: np.ndarray, config: dict, runtime) -> tuple[np.ndarray
 
 
 def cache(config: dict, dataset: str, limit: int | None, include_hubert: bool,
-          allow_download: bool, manifest_kind: str = "built") -> Path:
+          allow_download: bool, manifest_kind: str = "built",
+          target_name: str = "speech_targets") -> Path:
     root = output_root(config)
+    if not all(character.isalnum() or character in "_-" for character in manifest_kind + target_name):
+        raise ValueError("manifest_kind and target_name must be safe artifact identifiers")
     manifest_path = root / "manifests" / f"manifest_{manifest_kind}.csv"
     if not manifest_path.exists():
         raise RuntimeError(f"requested manifest is missing: {manifest_path}")
@@ -171,7 +174,7 @@ def cache(config: dict, dataset: str, limit: int | None, include_hubert: bool,
     selected = selected.drop_duplicates(["audio_sha256", "audio_semantics"]).sort_values(["dataset", "audio_sha256"])
     if limit is not None:
         selected = selected.head(limit)
-    target = root / "speech_targets" / "speech_targets.h5"
+    target = root / "speech_targets" / f"{target_name}.h5"
     partial = target.with_suffix(".h5.partial")
     target.parent.mkdir(parents=True, exist_ok=True)
     if partial.exists():
@@ -225,8 +228,8 @@ def cache(config: dict, dataset: str, limit: int | None, include_hubert: bool,
                               "audio_sha256": row.audio_sha256, "mfcc_frames": mfcc.shape[1],
                               "acoustic_frames": acoustic.shape[1], "hubert_included": include_hubert})
     os.replace(partial, target)
-    pd.DataFrame(inventory).to_csv(target.parent / "speech_target_inventory.csv", index=False)
-    (target.parent / "speech_targets.sha256").write_text(sha256_file(target) + "\n")
+    pd.DataFrame(inventory).to_csv(target.parent / f"{target_name}_inventory.csv", index=False)
+    (target.parent / f"{target_name}.sha256").write_text(sha256_file(target) + "\n")
     print(f"cached {len(inventory)} speech targets at {target}")
     return target
 
@@ -236,7 +239,8 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "training_data_v3.yaml")
     parser.add_argument("--dataset", choices=["all", "ds004940", "ds006104"], default="all")
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--manifest", choices=["built", "all"], default="built")
+    parser.add_argument("--manifest", default="built")
+    parser.add_argument("--target-name", default="speech_targets")
     parser.add_argument("--include-hubert", action="store_true")
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--hubert-local-path", type=Path)
@@ -244,7 +248,8 @@ def main() -> int:
     config, _ = load_config(args.config)
     if args.hubert_local_path:
         config["audio"]["content"]["hubert_local_path"] = str(args.hubert_local_path.resolve())
-    cache(config, args.dataset, args.limit, args.include_hubert, args.allow_download, args.manifest)
+    cache(config, args.dataset, args.limit, args.include_hubert, args.allow_download,
+          args.manifest, args.target_name)
     return 0
 
 

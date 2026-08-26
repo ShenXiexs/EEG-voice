@@ -59,6 +59,61 @@ reconstruction 系统。DS004940 为精确 presented-WAV 配对；DS006104 的
 Words/phonemes 只按 `candidate_filename_timing` 使用。S15 官方 auxiliary 已
 从固定 commit 获取并通过预登记 SHA256，single-phoneme 仅提供 label supervision。
 
+### 推荐运行入口
+
+运行脚本沿用参考 bundle 的阶段化、日志化和 fail-closed 约定。它们自动选择
+`PYTHON_BIN`（优先项目 venv，其次 `/opt/anaconda3/envs/eegvoice`），日志写入
+`outputs/joint_pilot_v1/logs/`，并默认复用参考 bundle 中锁定的本地 HuBERT
+snapshot。可用同名环境变量覆盖这些路径。
+
+```bash
+cd /Users/samxie/Research/EEG-Voice/ref_github/speech_decoding/eeg2wave_server_bundle/eeg-recon-0809
+
+# 只读查看当前 gate / M0 / renderer / Stage-2 状态
+./app/run_joint_status.sh
+
+# 已构建 artifact 上的 forward/backward、renderer dry-run 和 5-step smoke
+# 不会计入正式 M0
+./app/run_joint_smoke.sh
+
+# 从审计、split、M0 artifact 开始；人工听音未通过时会安全地 exit 3
+./app/run_joint_pilot_all.sh
+
+# 人工逐条听音、核对转录并真实填写下列 CSV 后，再继续正式流程
+# artifacts/training_data/v3/qc/ds004940_pair_review_20.csv
+./app/run_joint_after_review.sh
+```
+
+也可以单独运行某一阶段：
+
+```bash
+./app/run_joint_stage0.sh
+./app/run_joint_audio_oracle.sh
+./app/run_joint_m0.sh ds006104   # DS006 content-only M0 不受 DS004 人工 gate 阻断
+./app/run_joint_m0.sh all        # 3 modes × 3 registered seeds
+./app/run_joint_stage2.sh        # 仅在全部 12 个 M0 evaluation gate 通过后执行
+```
+
+常用安全覆盖参数：
+
+```bash
+PYTHON_BIN=/absolute/path/to/python \
+HUBERT_LOCAL_PATH=/absolute/path/to/hubert-snapshot \
+./app/run_joint_stage0.sh
+
+# 仅用于重新构建已注册 M0 shards；默认是 provenance-compatible resume
+REBUILD_M0=1 ./app/run_joint_stage0.sh
+
+# 调试 runner 时可缩短步数，但此结果不能冒充预注册正式结果
+SEEDS="31" MAX_STEPS=20 ./app/run_joint_m0.sh ds006104
+```
+
+`run_joint_stage2.sh` 会先物化隔离的 `manifest_stage2.csv`、`shards/stage2/`、
+Stage-2 normalizer 和 `speech_targets_stage2.h5`，再运行 single-dataset/joint 的
+validation/test 评估与 paired comparison。Stage 2 不会覆盖 M0 artifacts。
+
+### 等价的底层命令（调试用）
+
 ```bash
 # 1. 审计与冻结 subject × linguistic-content split
 /opt/anaconda3/envs/eegvoice/bin/python scripts/prepare_training_data.py \
@@ -102,6 +157,18 @@ Words/phonemes 只按 `candidate_filename_timing` 使用。S15 官方 auxiliary 
 /opt/anaconda3/envs/eegvoice/bin/python scripts/prepare_stage2_split.py \
   --data-config configs/training_data_v3.yaml \
   --pilot-config configs/joint_pilot_v1.yaml
+
+# 查看 Stage-2 readiness；M0 或独立 artifact 未完成时返回非零状态。
+/opt/anaconda3/envs/eegvoice/bin/python scripts/prepare_stage2_split.py \
+  --data-config configs/training_data_v3.yaml \
+  --pilot-config configs/joint_pilot_v1.yaml --check-readiness
+
+# 仅在所有正式 M0 evaluation gate 通过后执行。Stage-2 使用独立的
+# manifest_stage2、shards/stage2 和 speech_targets_stage2，不覆盖 M0 artifacts。
+/opt/anaconda3/envs/eegvoice/bin/python scripts/prepare_stage2_split.py \
+  --data-config configs/training_data_v3.yaml \
+  --pilot-config configs/joint_pilot_v1.yaml --materialize \
+  --hubert-local-path /absolute/path/to/hubert-base-ls960-snapshot
 
 # 8. audio-only MFCC→log-mel/RMS/activity renderer 工程 gate
 /opt/anaconda3/envs/eegvoice/bin/python app/train_audio_renderer.py \

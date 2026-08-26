@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 MODULE = Path(__file__).parents[1] / "scripts" / "cache_speech_targets.py"
@@ -11,6 +12,12 @@ sys.path.insert(0, str(MODULE.parent))
 spec = importlib.util.spec_from_file_location("speech_targets", MODULE)
 speech_targets = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(speech_targets)
+
+APP_MODULE = Path(__file__).parents[1] / "app" / "train_audio_renderer.py"
+sys.path.insert(0, str(APP_MODULE.parent / "src"))
+app_spec = importlib.util.spec_from_file_location("train_audio_renderer", APP_MODULE)
+audio_renderer = importlib.util.module_from_spec(app_spec)
+app_spec.loader.exec_module(audio_renderer)
 
 
 class TestAudioTargets(unittest.TestCase):
@@ -36,6 +43,17 @@ class TestAudioTargets(unittest.TestCase):
         # Linear resampling after CMVN introduces a small endpoint-weighting
         # offset while preserving the intended utterance-scale normalization.
         self.assertLess(float(np.abs(mfcc.mean(axis=1)).max()), 5e-3)
+
+    def test_audio_renderer_holdout_is_content_disjoint(self):
+        frame = pd.DataFrame({
+            "linguistic_content_id": ["a", "a", "b", "b", "c", "c", "d", "d", "e", "e"]
+        })
+        train, validation = audio_renderer.content_holdout_indices(frame)
+        self.assertEqual(len(validation), 2)
+        self.assertFalse(
+            set(frame.iloc[train].linguistic_content_id)
+            & set(frame.iloc[validation].linguistic_content_id)
+        )
 
 
 if __name__ == "__main__":

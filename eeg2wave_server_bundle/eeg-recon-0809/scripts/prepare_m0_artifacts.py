@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Select and materialize the registered M0 grids without hard-coded IDs."""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import pandas as pd
+import yaml
+
+from prepare_training_data import (ROOT, build as build_eeg_shards, fit_normalizer,
+                                   load_config, output_root, validate, write_frame)
+from cache_speech_targets import cache as cache_speech_targets
+from eeg_preprocessing_qc import run as run_preprocessing_qc
+
+sys.path.insert(0, str(ROOT / "app" / "src"))
+from eeg2speech.data import _complete_grid
+
+
+def _tms_off(frame: pd.DataFrame) -> pd.Series:
+    return ~frame.tms_applied.astype(str).str.lower().isin({"true", "1", "yes"})
+
+
+def _grid(frame: pd.DataFrame, subjects: int, contents: int, namespace: str) -> pd.DataFrame:
+    selected = _complete_grid(frame, subjects, contents, namespace)
+    if selected.groupby(["subject", "linguistic_content_id"]).size().ne(1).any():
+        raise RuntimeError(f"{namespace}: selected M0 grid contains duplicate cells")
+    return selected
+
+
+def select_registered_grids(config: dict, pilot: dict) -> dict[str, pd.DataFrame]:
+    root = output_root(config)
+    manifest_path = root / "manifests" / "manifest_all.csv"
+    split_path = root / "splits" / f"{pilot['split']['protocol']}_fold-{pilot['split']['fold']}.csv"
+    if not manifest_path.exists() or not split_path.exists():
+        raise RuntimeError("audit and make-splits must run before M0 selection")
+    manifest = pd.read_csv(manifest_path, keep_default_na=False, low_memory=False)
+    split = pd.read_csv(split_path, keep_default_na=False)
+    train_ids = set(split[split.role == "train"].trial_id)
+    eligible = manifest[
+        manifest.trial_id.isin(train_ids)
+        & (manifest.build_status == "included")
+        & manifest.qc_pass.astype(str).str.lower().eq("true")
+    ].copy()
+    spec = pilot["pilot"]
+    subject_count = int(spec["overfit_subjects_per_dataset"])
+    content_count = int(spec["overfit_contents_per_dataset"])
+
+    ds004 = eligible[
+        (eligible.dataset == "ds004940")
+        & (eligible.task == str(spec["primary_ds004940_task"]))
+        & (eligible.supervision_type == "paired_audio")
+    ]
+    ds006 = eligible[
+        (eligible.dataset == "ds006104")
+        & eligible.supervision_type.isin(["paired_audio", "weak_audio"])
+    ]
+    label = eligible[
+        (eligible.dataset == "ds006104")
+        & (eligible.supervision_type == "label_only")
+    ]
+    if not bool(spec["primary_ds006104_tms"]):
+        ds006 = ds006[_tms_off(ds006)]
+        label = label[_tms_off(label)]
+
+    grids = {
+        "ds004940": _grid(ds004, subject_count, content_count, "M0|ds004940"),
+        "ds006104": _grid(ds006, subject_count, content_count, "M0|ds006104"),
+    }
+    # single-phoneme has six registered content labels, so its auxiliary grid
+    # is deliberately 5 x min(6, configured maximum) rather than padded to 50.
+    label_content_count = min(
+        int(label.linguistic_content_id.nunique()),
+        int(spec["label_only_max_overfit_pairs"]) // subject_count,
+    )
+    if label_content_count <= 0:
+        raise RuntimeError("M0 label-only selection has no complete content grid")
+    grids["ds006104_label_only"] = _grid(
+        label, subject_count, label_content_count, "M0|ds006104|label-only"
+    )
+    expected = int(spec["overfit_pairs_per_dataset"])
+    for name in ("ds004940", "ds006104"):
+        if len(grids[name]) != expected:
+            raise RuntimeError(f"{name}: selected {len(grids[name])} M0 pairs, expected {expected}")
+    return grids
+
+
+def _selection_payload(grids: dict[str, pd.DataFrame]) -> dict:
+    return {
+        name: {
+            "pairs": int(len(frame)),
+            "subjects": sorted(frame.subject.astype(str).unique().tolist()),
+            "contents": sorted(frame.linguistic_content_id.astype(str).unique().tolist()),
+            "tasks": sorted(frame.task.astype(str).unique().tolist()),
+            "tms_applied": sorted(frame.tms_applied.astype(str).unique().tolist()),
+        }
+        for name, frame in grids.items()
+    }
+
+
+def _curate_built_manifest(config: dict, grids: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Make the M0 manifest exact while retaining superseded rows as audit evidence."""
+    path = output_root(config) / "manifests" / "manifest_built.csv"
+    frame = pd.read_csv(path, keep_default_na=False, low_memory=False)
+    desired = pd.Series(False, index=frame.index)
+    for name, grid in grids.items():
+        dataset = "ds006104" if name.startswith("ds006104") else "ds004940"
+        supervision = {"label_only"} if name.endswith("label_only") else {"paired_audio", "weak_audio"}
+        selected = (
+            (frame.dataset == dataset)
+            & frame.supervision_type.isin(supervision)
+            & frame.subject.isin(set(grid.subject.astype(str)))
+            & frame.linguistic_content_id.isin(set(grid.linguistic_content_id.astype(str)))
+            & frame.task.isin(set(grid.task.astype(str)))
+        )
+        if dataset == "ds006104":
+            selected &= _tms_off(frame)
+        desired |= selected
+    stale = (frame.build_status == "included") & ~desired
+    frame.loc[stale, "build_status"] = "excluded"
+    frame.loc[stale, "exclusion_reason"] = "outside_registered_m0_artifact"
+
+    included = frame[(frame.build_status == "included") & desired]
+    expected = {name: len(grid) for name, grid in grids.items()}
+    partitions = {
+        "ds004940": included[(included.dataset == "ds004940") & (included.supervision_type == "paired_audio")],
+        "ds006104": included[(included.dataset == "ds006104") & included.supervision_type.isin(["paired_audio", "weak_audio"])],
+        "ds006104_label_only": included[(included.dataset == "ds006104") & (included.supervision_type == "label_only")],
+    }
+    for name, selected in partitions.items():
+        cells = selected.groupby(["subject", "linguistic_content_id"]).size()
+        if len(selected) != expected[name] or len(cells) != expected[name] or not cells.eq(1).all():
+            raise RuntimeError(
+                f"{name}: built artifact has {len(selected)} rows/{len(cells)} cells, expected {expected[name]}"
+            )
+    write_frame(frame, output_root(config) / "manifests" / "manifest_built", pd)
+    return included
+
+
+def materialize(config: dict, pilot: dict, grids: dict[str, pd.DataFrame],
+                hubert_local_path: Path, rebuild: bool) -> dict:
+    if not hubert_local_path.exists():
+        raise RuntimeError(f"local HuBERT model is missing: {hubert_local_path}")
+    protocol = str(pilot["split"]["protocol"])
+    fold = int(pilot["split"]["fold"])
+
+    calls = (
+        ("ds004940", grids["ds004940"], ",".join(sorted(grids["ds004940"].task.unique())), "any"),
+        ("ds006104", grids["ds006104"], ",".join(sorted(grids["ds006104"].task.unique())), "off"),
+        ("ds006104", grids["ds006104_label_only"],
+         ",".join(sorted(grids["ds006104_label_only"].task.unique())), "off"),
+    )
+    for dataset, frame, tasks, tms_condition in calls:
+        build_eeg_shards(
+            config,
+            dataset,
+            ",".join(sorted(frame.subject.astype(str).unique())),
+            tasks,
+            None,
+            None,
+            ",".join(sorted(frame.linguistic_content_id.astype(str).unique())),
+            tms_condition,
+            "train",
+            protocol,
+            fold,
+            not rebuild,
+            False,
+            "built",
+        )
+
+    _curate_built_manifest(config, grids)
+    split_path = output_root(config) / "splits" / f"{protocol}_fold-{fold}.csv"
+    fit_normalizer(config, split_path, fold, False, "built")
+    config["audio"]["content"]["hubert_local_path"] = str(hubert_local_path.resolve())
+    cache_speech_targets(config, "all", None, True, False, "built", "speech_targets")
+    psd = run_preprocessing_qc(config)
+    if psd["status"] != "pass":
+        raise RuntimeError("preprocessing PSD gate failed")
+    if validate(config, True) != 0:
+        raise RuntimeError("strict Stage-0 validation failed")
+
+    payload = {"status": "pass", "artifact_set": "built", "selection": _selection_payload(grids)}
+    target = output_root(config) / "qc" / "m0_artifacts.json"
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return payload
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-config", type=Path, default=ROOT / "configs" / "training_data_v3.yaml")
+    parser.add_argument("--pilot-config", type=Path, default=ROOT / "configs" / "joint_pilot_v1.yaml")
+    parser.add_argument("--hubert-local-path", type=Path)
+    parser.add_argument("--check-only", action="store_true", help="print the deterministic grids without writing artifacts")
+    parser.add_argument("--rebuild", action="store_true", help="rewrite the selected M0 shards instead of resuming compatible files")
+    args = parser.parse_args()
+    config, _ = load_config(args.data_config)
+    pilot = yaml.safe_load(args.pilot_config.read_text())
+    grids = select_registered_grids(config, pilot)
+    if args.check_only:
+        print(json.dumps({"status": "pass", "selection": _selection_payload(grids)}, indent=2, sort_keys=True))
+        return 0
+    if args.hubert_local_path is None:
+        parser.error("artifact materialization requires --hubert-local-path; implicit model download is forbidden")
+    print(json.dumps(materialize(config, pilot, grids, args.hubert_local_path, args.rebuild), indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)

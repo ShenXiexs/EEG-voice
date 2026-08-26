@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 APP = Path(__file__).resolve().parent
 ROOT = APP.parent
@@ -27,6 +27,25 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def content_holdout_indices(frame, validation_fraction: float = 0.2) -> tuple[list[int], list[int]]:
+    """Create a deterministic content-disjoint audio-only renderer split."""
+    contents = sorted(
+        set(frame.linguistic_content_id.astype(str)),
+        key=lambda value: hashlib.sha256(f"audio-renderer|{value}".encode()).hexdigest(),
+    )
+    if len(contents) < 2:
+        raise RuntimeError("audio renderer needs at least two linguistic contents for its oracle split")
+    validation_count = max(1, min(len(contents) - 1, int(round(len(contents) * validation_fraction))))
+    validation_contents = set(contents[-validation_count:])
+    train_indices = frame.index[~frame.linguistic_content_id.isin(validation_contents)].astype(int).tolist()
+    validation_indices = frame.index[frame.linguistic_content_id.isin(validation_contents)].astype(int).tolist()
+    if not train_indices or not validation_indices:
+        raise RuntimeError("audio renderer content holdout produced an empty role")
+    if set(frame.iloc[train_indices].linguistic_content_id) & set(frame.iloc[validation_indices].linguistic_content_id):
+        raise RuntimeError("audio renderer content holdout leaked linguistic content")
+    return train_indices, validation_indices
 
 
 def renderer_loss(state, batch, cfg: dict) -> tuple[torch.Tensor, dict[str, float]]:
@@ -79,7 +98,11 @@ def main() -> int:
                                  float(cfg["loss"]["weak_content_weight"]),
                                  supervision_types={"paired_audio"}, phoneme_vocabulary=vocabulary)
     renderer_cfg = cfg["audio_renderer"]
-    train_loader = DataLoader(train, batch_size=int(renderer_cfg["batch_size"]), shuffle=True, collate_fn=homogeneous_collate)
+    train_indices, validation_indices = content_holdout_indices(train.frame)
+    train_loader = DataLoader(Subset(train, train_indices), batch_size=int(renderer_cfg["batch_size"]),
+                              shuffle=True, collate_fn=homogeneous_collate)
+    validation_loader = DataLoader(Subset(train, validation_indices), batch_size=int(renderer_cfg["batch_size"]),
+                                   shuffle=False, collate_fn=homogeneous_collate)
     device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     model_config = {key: renderer_cfg[key] for key in ("hidden_dimension", "layers", "dropout")}
     model = AudioMFCCRenderer(**model_config).to(device)
@@ -89,10 +112,6 @@ def main() -> int:
     if args.dry_run:
         finite = bool(torch.isfinite(loss)) and all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in model.parameters())
         print(json.dumps({"status": "pass" if finite else "fail", "metrics": metrics}, indent=2)); train.close(); return 0 if finite else 2
-    validation = JointManifestDataset(manifest, split, "validation", "ds004940", targets, normalizer,
-                                      float(cfg["loss"]["weak_content_weight"]),
-                                      supervision_types={"paired_audio"}, phoneme_vocabulary=vocabulary)
-    validation_loader = DataLoader(validation, batch_size=int(renderer_cfg["batch_size"]), shuffle=False, collate_fn=homogeneous_collate)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(renderer_cfg["learning_rate"]))
     model.zero_grad(set_to_none=True)
     iterator = iter(train_loader); history = []
@@ -105,7 +124,7 @@ def main() -> int:
         if not torch.isfinite(loss): raise RuntimeError(f"nonfinite renderer loss at step {step}")
         loss.backward(); optimizer.step()
         if step == 1 or step % 100 == 0: history.append({"step": step, **metrics})
-    train_template = torch.stack([train[index]["acoustic_log_mel"] for index in range(len(train))]).mean(0, keepdim=True)
+    train_template = torch.stack([train[index]["acoustic_log_mel"] for index in train_indices]).mean(0, keepdim=True)
     validation_metrics = evaluate(model, validation_loader, device, train_template)
     checks = {
         "log_mel": validation_metrics["log_mel_improvement"] >= float(renderer_cfg["gate_log_mel_improvement_min"]),
@@ -115,12 +134,17 @@ def main() -> int:
     artifact_hashes = {path.name: sha256_file(path) for path in required}
     output = ROOT / "outputs" / "joint_pilot_v1" / "audio_renderer"
     output.mkdir(parents=True, exist_ok=True)
+    split_summary = {"protocol": "m0_train_fold_linguistic_content_holdout",
+                     "train_pairs": len(train_indices), "validation_pairs": len(validation_indices),
+                     "train_contents": int(train.frame.iloc[train_indices].linguistic_content_id.nunique()),
+                     "validation_contents": int(train.frame.iloc[validation_indices].linguistic_content_id.nunique())}
     torch.save({"model": model.state_dict(), "model_config": model_config, "artifact_hashes": artifact_hashes,
-                "gate": checks, "validation": validation_metrics}, output / "checkpoint.pt")
+                "gate": checks, "validation": validation_metrics, "split": split_summary}, output / "checkpoint.pt")
     (output / "metrics.json").write_text(json.dumps({"history": history, "validation": validation_metrics,
+                                                       "split": split_summary,
                                                        "gate": {"checks": checks, "passed": all(checks.values())}}, indent=2) + "\n")
-    print(json.dumps({"validation": validation_metrics, "gate": checks}, indent=2))
-    train.close(); validation.close()
+    print(json.dumps({"validation": validation_metrics, "split": split_summary, "gate": checks}, indent=2))
+    train.close()
     return 0 if all(checks.values()) else 2
 
 

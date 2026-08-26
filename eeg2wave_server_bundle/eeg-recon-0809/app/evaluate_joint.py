@@ -77,25 +77,63 @@ def content_retrieval(prediction: torch.Tensor, target: torch.Tensor, labels: li
     return {"r1": float((first == 1).float().mean()), "mrr": float((1.0 / first.float()).mean())}
 
 
-def template_metrics(prediction: torch.Tensor, target: torch.Tensor, labels: list[str]) -> dict[str, float | bool | None]:
-    global_template = target.mean(0, keepdim=True).expand_as(target)
-    same_content = torch.empty_like(target)
-    for label in sorted(set(labels)):
-        selected = torch.tensor([value == label for value in labels], dtype=torch.bool)
-        same_content[selected] = target[selected].mean(0, keepdim=True)
+def template_metrics(prediction: torch.Tensor, target: torch.Tensor, labels: list[str],
+                     audio_ids: list[str], global_reference: torch.Tensor,
+                     global_reference_source: str = "train_fold_mean") -> dict[str, float | bool | int | str | None]:
+    if global_reference.shape != target.shape[1:]:
+        raise ValueError(f"global template shape {tuple(global_reference.shape)} != target {tuple(target.shape[1:])}")
+    global_template = global_reference.unsqueeze(0).expand_as(target)
     error = float((prediction - target).abs().mean())
     global_error = float((global_template - target).abs().mean())
-    same_error = float((same_content - target).abs().mean())
-    # With repeated presented WAVs, the same-content template is often exactly
-    # the target and therefore cannot be a denominator.  Report this rather
-    # than manufacturing a pass/fail claim.
+    # Same-content is a diagnostic only when another independently recorded
+    # realization exists.  Never include the current waveform in its own
+    # template, even when that waveform is repeated across subjects.
+    same_errors = []
+    same_prediction_errors = []
+    for index, (label, audio_id) in enumerate(zip(labels, audio_ids)):
+        candidates = [other for other, (other_label, other_audio) in enumerate(zip(labels, audio_ids))
+                      if other_label == label and other_audio != audio_id]
+        if not candidates:
+            continue
+        reference = target[candidates].mean(0)
+        same_errors.append(float((reference - target[index]).abs().mean()))
+        same_prediction_errors.append(float((prediction[index] - target[index]).abs().mean()))
+    same_error = float(np.mean(same_errors)) if same_errors else None
+    same_prediction_error = float(np.mean(same_prediction_errors)) if same_prediction_errors else None
     return {
         "dataset_mean_template_mfcc_l1": global_error,
         "dataset_mean_template_improvement": float(1.0 - error / max(global_error, 1e-8)),
+        "dataset_mean_template_source": global_reference_source,
         "same_content_template_mfcc_l1": same_error,
-        "same_content_template_gate_applicable": bool(same_error > 1e-8),
-        "same_content_template_improvement": float(1.0 - error / same_error) if same_error > 1e-8 else None,
+        "same_content_template_pairs": len(same_errors),
+        "same_content_template_gate_applicable": bool(same_error is not None and same_error > 1e-8),
+        "same_content_template_improvement": (
+            float(1.0 - same_prediction_error / same_error)
+            if same_error is not None and same_error > 1e-8 else None
+        ),
     }
+
+
+def training_target_reference(manifest: Path, split: Path, dataset_name: str, targets: Path,
+                              normalizer: Path, cfg: dict, vocabulary: dict[str, int],
+                              stage: str) -> tuple[torch.Tensor, int]:
+    dataset = JointManifestDataset(manifest, split, "train", dataset_name, targets, normalizer,
+                                   float(cfg["loss"]["weak_content_weight"]),
+                                   supervision_types={"paired_audio", "weak_audio"},
+                                   phoneme_vocabulary=vocabulary)
+    indices = pilot_indices(dataset, cfg, stage, "train")
+    values = []
+    for index in indices:
+        row = dataset.frame.iloc[index]
+        audio_id = dataset._audio_id(row)
+        if dataset.targets is None or audio_id not in dataset.targets:
+            dataset.close()
+            raise RuntimeError(f"train-fold baseline is missing target {audio_id}")
+        values.append(torch.from_numpy(dataset.targets[audio_id]["content_mfcc"][:].astype("float32")))
+    dataset.close()
+    if not values:
+        raise RuntimeError("train-fold baseline has zero targets")
+    return torch.stack(values).mean(0), len(values)
 
 
 def registered_collapse_check(templates: dict, gate: dict) -> tuple[str, bool]:
@@ -204,6 +242,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.compare_single and args.compare_joint:
         result = compare_results(args.compare_single, args.compare_joint)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result, indent=2))
         return 0
     if not args.checkpoint or not args.dataset:
@@ -217,8 +258,10 @@ def main() -> int:
     split_protocol = payload.get("split_protocol", cfg["split"]["protocol"] if payload.get("stage") == "overfit" else "stage2_joint_ood")
     split = artifact_root / "splits" / f"{split_protocol}_fold-{cfg['split']['fold']}.csv"
     normalizer = artifact_root / "normalizers" / f"{split.stem}.json"
-    manifest = artifact_root / "manifests" / "manifest_built.csv"
-    targets = artifact_root / "speech_targets" / "speech_targets.h5"
+    artifact_set = "built" if payload.get("stage") == "overfit" else "stage2"
+    manifest = artifact_root / "manifests" / f"manifest_{artifact_set}.csv"
+    target_name = "speech_targets" if artifact_set == "built" else "speech_targets_stage2"
+    targets = artifact_root / "speech_targets" / f"{target_name}.h5"
     sources = artifact_root / "source_lock.json"
     expected_hashes = payload.get("artifact_hashes", {})
     current_hashes = {path.name: _sha256(path) for path in (sources, split, manifest, targets, normalizer)}
@@ -242,7 +285,7 @@ def main() -> int:
     model.load_state_dict(payload["model"]); model.eval()
     label_only_metrics = (evaluate_label_only(model, manifest, split, args.role, targets, normalizer, cfg, vocabulary, target_device)
                           if args.dataset == "ds006104" else {"status": "not_applicable", "pairs": 0})
-    predictions=[]; target_values=[]; subjects=[]; contents=[]; tasks=[]; conditions=[]; tms_conditions=[]
+    predictions=[]; target_values=[]; subjects=[]; contents=[]; audio_ids=[]; tasks=[]; conditions=[]; tms_conditions=[]
     target_mels=[]; target_rms=[]; target_activities=[]; exact_flags=[]
     eeg_globals=[]; hubert_eeg_local=[]; hubert_audio_local=[]; hubert_eeg_global=[]; hubert_audio_global=[]; hubert_labels=[]
     control_errors=defaultdict(list)
@@ -255,6 +298,7 @@ def main() -> int:
                 predictions.append(state.mfcc[eligible].cpu()); target_values.append(tensor["content_mfcc"][eligible].cpu())
                 selected_indices = eligible.nonzero(as_tuple=False).flatten().tolist()
                 subjects.extend(batch["subject"][i] for i in selected_indices); contents.extend(batch["linguistic_content_id"][i] for i in selected_indices)
+                audio_ids.extend(batch["audio_id"][i] for i in selected_indices)
                 tasks.extend(batch["task"][i] for i in selected_indices); conditions.extend(batch["condition"][i] for i in selected_indices)
                 tms_conditions.extend("TMS1" if bool(batch["tms_applied"][i]) else "TMS0" for i in selected_indices)
                 target_mels.append(tensor["acoustic_log_mel"][eligible].cpu()); target_rms.append(tensor["acoustic_rms"][eligible].cpu())
@@ -289,7 +333,15 @@ def main() -> int:
         retrieval={"r1":float("nan"),"mrr":float("nan")}; wrong=delta=float("nan")
     subject_values=defaultdict(list)
     for subject,value in zip(subjects,control_errors["correct"]): subject_values[subject].append(value)
-    templates = template_metrics(prediction,target,contents) if len(prediction) else {}
+    if len(prediction):
+        train_reference, train_reference_pairs = training_target_reference(
+            manifest, split, args.dataset, targets, normalizer, cfg, vocabulary,
+            payload.get("stage", "generalization"),
+        )
+        templates = template_metrics(prediction, target, contents, audio_ids, train_reference)
+        templates["dataset_mean_template_train_pairs"] = train_reference_pairs
+    else:
+        templates = {}
     control_means = {key:float(np.mean(value)) for key,value in control_errors.items()}
     hubert_metrics = {"pairs": 0, "local_cosine": float("nan"), "global_retrieval": {"r1": float("nan"), "mrr": float("nan")}}
     if hubert_eeg_local:
@@ -328,7 +380,7 @@ def main() -> int:
             "templates":templates,
             "gate":{"checks":checks,"passed":bool(checks) and all(checks.values()),
                     "registered_collapse_baseline": cfg["gates"]["overfit"].get("collapse_baseline", "dataset_mean"),
-                    "note":"same-content template remains diagnostic only when repeated trials share an identical target waveform"},
+                    "note":"same-content is diagnostic only and uses leave-one-realization-out when independent audio IDs exist"},
             "run_kind":payload.get("run_kind","unknown"),
             "scientific_interpretation":"engineering_only" if payload.get("run_kind") == "smoke" else "registered_pilot",
             "reconstruction": reconstruction}

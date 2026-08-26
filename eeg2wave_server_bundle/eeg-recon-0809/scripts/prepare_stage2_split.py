@@ -12,7 +12,12 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from prepare_training_data import ROOT, load_config, output_root, sha256_bytes, stable_json
+from prepare_training_data import (ROOT, build as build_eeg_shards, fit_normalizer,
+                                   load_config, output_root, sha256_bytes, stable_json)
+
+sys.path.insert(0, str(ROOT / "app" / "src"))
+from eeg2speech.gates import registered_m0_gate_status, require_registered_m0_gates
+from cache_speech_targets import cache as cache_speech_targets
 
 
 def stable(value: str) -> str:
@@ -132,11 +137,67 @@ def build(data_config: Path, pilot_config: Path) -> Path:
     (root/"qc"/"stage2_split.json").write_text(json.dumps(report,indent=2)+"\n"); print(json.dumps(report,indent=2)); return target
 
 
+def artifact_status(config: dict, pilot: dict) -> dict:
+    root = output_root(config)
+    split_path = root / "splits" / "stage2_joint_ood_fold-0.csv"
+    manifest_path = root / "manifests" / "manifest_stage2.csv"
+    normalizer_path = root / "normalizers" / "stage2_joint_ood_fold-0.json"
+    target_path = root / "speech_targets" / "speech_targets_stage2.h5"
+    missing_paths = [str(path) for path in (split_path, manifest_path, normalizer_path, target_path) if not path.exists()]
+    missing_trials: list[str] = []
+    unexpected_trials: list[str] = []
+    if split_path.exists() and manifest_path.exists():
+        split = pd.read_csv(split_path, keep_default_na=False)
+        expected = set(split[split.role.isin(["train", "validation", "test"])].trial_id)
+        manifest = pd.read_csv(manifest_path, keep_default_na=False, low_memory=False)
+        actual = set(manifest[manifest.build_status == "included"].trial_id)
+        missing_trials = sorted(expected - actual)
+        unexpected_trials = sorted(actual - expected)
+    gates = registered_m0_gate_status(ROOT, pilot)
+    ready = not missing_paths and not missing_trials and not unexpected_trials and not gates["missing"] and not gates["failed"]
+    return {"status": "pass" if ready else "blocked", "m0_gates": gates,
+            "missing_paths": missing_paths, "missing_trials": missing_trials,
+            "unexpected_trials": unexpected_trials}
+
+
+def materialize(config: dict, pilot: dict, hubert_local_path: Path) -> dict:
+    """Build Stage-2 artifacts without overwriting the frozen M0 artifact set."""
+    require_registered_m0_gates(ROOT, pilot)
+    split_path = output_root(config) / "splits" / "stage2_joint_ood_fold-0.csv"
+    for role in ("train", "validation", "test"):
+        for dataset in ("ds004940", "ds006104"):
+            build_eeg_shards(
+                config, dataset, "all", "all", None, None, None, "any", role,
+                "stage2_joint_ood", 0, True, False, "stage2",
+            )
+    fit_normalizer(config, split_path, 0, False, "stage2")
+    config["audio"]["content"]["hubert_local_path"] = str(hubert_local_path.resolve())
+    cache_speech_targets(config, "all", None, True, False, "stage2", "speech_targets_stage2")
+    status = artifact_status(config, pilot)
+    target = output_root(config) / "qc" / "stage2_artifacts.json"
+    target.write_text(json.dumps(status, indent=2) + "\n")
+    if status["status"] != "pass":
+        raise RuntimeError(f"Stage2 artifact materialization did not pass readiness: {status}")
+    return status
+
+
 def main() -> int:
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-config",type=Path,default=ROOT/"configs"/"training_data_v3.yaml")
     parser.add_argument("--pilot-config",type=Path,default=ROOT/"configs"/"joint_pilot_v1.yaml")
-    args=parser.parse_args(); build(args.data_config,args.pilot_config); return 0
+    parser.add_argument("--materialize",action="store_true",help="after all M0 gates pass, build isolated Stage-2 shards/normalizer/targets")
+    parser.add_argument("--hubert-local-path",type=Path)
+    parser.add_argument("--check-readiness",action="store_true")
+    args=parser.parse_args(); build(args.data_config,args.pilot_config)
+    config,_=load_config(args.data_config); pilot=yaml.safe_load(args.pilot_config.read_text())
+    if args.materialize:
+        if args.hubert_local_path is None:
+            parser.error("--materialize requires --hubert-local-path; implicit model download is forbidden")
+        print(json.dumps(materialize(config,pilot,args.hubert_local_path),indent=2))
+    if args.check_readiness:
+        status=artifact_status(config,pilot); print(json.dumps(status,indent=2))
+        return 0 if status["status"]=="pass" else 2
+    return 0
 
 
 if __name__=="__main__": raise SystemExit(main())

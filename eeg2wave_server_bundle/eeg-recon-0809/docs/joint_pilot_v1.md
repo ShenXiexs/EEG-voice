@@ -1,5 +1,30 @@
 # Joint EEG→speech-content pilot v1
 
+## Shell entry points
+
+The executable entry points under `app/` are deliberately staged:
+
+- `run_joint_status.sh`: read the current gate state without training.
+- `run_joint_stage0.sh`: audit, freeze splits, select/materialize exact M0 grids,
+  fit the train-fold normalizer, cache local HuBERT targets, run PSD QC, and
+  stop with exit code 3 if human pair review is pending.
+- `run_joint_smoke.sh`: engineering-only joint dry-run and five-step smoke.
+- `run_joint_audio_oracle.sh`: separately gated MFCC-to-acoustic renderer.
+- `run_joint_m0.sh`: registered 50-pair single/joint M0 runs and evaluations.
+- `run_joint_stage2.sh`: isolated Stage-2 materialization, single/joint training,
+  validation/test evaluation, and paired comparison; all registered M0 gates
+  are checked before any Stage-2 shard is built.
+- `run_joint_after_review.sh`: audio oracle → all M0 → Stage 2, only after the
+  Stage-0 human gate passes.
+- `run_joint_pilot_all.sh`: start-to-finish entry that pauses safely at the
+  human evidence gate rather than manufacturing an approval.
+
+All scripts use `app/lib/joint_pilot_common.sh` for interpreter/model discovery,
+dependency checks, UTC logs, and gate checks. `scripts/prepare_m0_artifacts.py`
+selects grids from the frozen manifest/split instead of embedding subject or
+content IDs in shell code. Smoke artifacts live under `outputs/.../smoke` and
+cannot satisfy registered M0 gates under `outputs/.../pilot`.
+
 ## Stable interface
 
 每个 batch 只包含一个 dataset，并返回 EEG `[B,C,T]`、电极坐标
@@ -26,7 +51,9 @@ log-mel/RMS/activity target。联合训练使用 dataset-homogeneous batch；主
    ≥50%，正确 EEG 优于 zero/time/channel shuffle。
 4. M1：只有三个 M0 mode × 三个 seed 全部通过才运行。独立
    `stage2_joint_ood` split 精确实现 4/1/1 subjects 和 28/6/6 contents；任何
-   subject/content 交叉象限均排除。
+   subject/content 交叉象限均排除。M1 materialization 写入独立的
+   `manifest_stage2.csv`、`shards/stage2/`、`speech_targets_stage2.h5` 和
+   Stage-2 normalizer，不覆盖或使 M0 checkpoint 失效。
 
 `--smoke-model` 使用 48-dim 1-layer 网络，只证明数据、loss、梯度和
 optimizer 接口可运行。它的 retrieval 或 control 数值不得用于研究结论。

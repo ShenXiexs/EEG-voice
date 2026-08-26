@@ -164,6 +164,18 @@ class JointManifestDataset(Dataset):
             missing = sorted({self._audio_id(row) for _, row in content_rows.iterrows() if self._audio_id(row) not in self.targets})
             if missing:
                 raise RuntimeError(f"content-supervised rows are missing speech targets: {missing[:5]} (n={len(missing)})")
+            for audio_id in sorted({self._audio_id(row) for _, row in content_rows.iterrows()}):
+                group = self.targets[audio_id]
+                for required in ("content_mfcc", "content_mask", "log_mel", "rms", "activity"):
+                    if required not in group:
+                        raise RuntimeError(f"speech target {audio_id} is missing {required}")
+                mfcc = group["content_mfcc"][:]
+                mask = group["content_mask"][:].astype(bool)
+                if mfcc.shape != (39, 161) or mask.shape != (161,) or not mask.any() or not np.isfinite(mfcc).all():
+                    raise RuntimeError(f"speech target {audio_id} has an invalid MFCC contract")
+                if bool(self.targets.attrs.get("hubert_included", False)):
+                    if "hubert_local" not in group or group["hubert_local"].shape != (96, 768):
+                        raise RuntimeError(f"speech target {audio_id} has an invalid HuBERT contract")
         if normalizer_path is None or not normalizer_path.exists():
             raise RuntimeError("an existing train-fold normalizer is required")
         normalizer_payload = json.loads(normalizer_path.read_text())
