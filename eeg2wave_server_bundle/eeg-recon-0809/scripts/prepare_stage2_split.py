@@ -137,12 +137,19 @@ def build(data_config: Path, pilot_config: Path) -> Path:
     (root/"qc"/"stage2_split.json").write_text(json.dumps(report,indent=2)+"\n"); print(json.dumps(report,indent=2)); return target
 
 
-def artifact_status(config: dict, pilot: dict) -> dict:
+def artifact_status(config: dict, pilot: dict, artifact_set: str = "stage2",
+                    bypass_m0_gates: bool = False) -> dict:
     root = output_root(config)
     split_path = root / "splits" / "stage2_joint_ood_fold-0.csv"
-    manifest_path = root / "manifests" / "manifest_stage2.csv"
-    normalizer_path = root / "normalizers" / "stage2_joint_ood_fold-0.json"
-    target_path = root / "speech_targets" / "speech_targets_stage2.h5"
+    if artifact_set not in {"stage2", "explore_stage2"}:
+        raise ValueError(f"unsupported Stage-2 artifact set: {artifact_set}")
+    manifest_path = root / "manifests" / f"manifest_{artifact_set}.csv"
+    normalizer_path = root / "normalizers" / (
+        "stage2_joint_ood_fold-0.json" if artifact_set == "stage2" else "explore_stage2_joint_ood_fold-0.json"
+    )
+    target_path = root / "speech_targets" / (
+        "speech_targets_stage2.h5" if artifact_set == "stage2" else "speech_targets_explore_stage2.h5"
+    )
     missing_paths = [str(path) for path in (split_path, manifest_path, normalizer_path, target_path) if not path.exists()]
     missing_trials: list[str] = []
     unexpected_trials: list[str] = []
@@ -154,27 +161,36 @@ def artifact_status(config: dict, pilot: dict) -> dict:
         missing_trials = sorted(expected - actual)
         unexpected_trials = sorted(actual - expected)
     gates = registered_m0_gate_status(ROOT, pilot)
-    ready = not missing_paths and not missing_trials and not unexpected_trials and not gates["missing"] and not gates["failed"]
+    ready = not missing_paths and not missing_trials and not unexpected_trials and (
+        bypass_m0_gates or (not gates["missing"] and not gates["failed"])
+    )
     return {"status": "pass" if ready else "blocked", "m0_gates": gates,
+            "m0_gates_bypassed_for_exploration": bypass_m0_gates,
+            "artifact_set": artifact_set,
             "missing_paths": missing_paths, "missing_trials": missing_trials,
             "unexpected_trials": unexpected_trials}
 
 
-def materialize(config: dict, pilot: dict, hubert_local_path: Path) -> dict:
-    """Build Stage-2 artifacts without overwriting the frozen M0 artifact set."""
-    require_registered_m0_gates(ROOT, pilot)
+def materialize(config: dict, pilot: dict, hubert_local_path: Path,
+                explore: bool = False, rebuild: bool = False) -> dict:
+    """Build isolated Stage-2 artifacts; exploration never touches registered paths."""
+    if not explore:
+        require_registered_m0_gates(ROOT, pilot)
+    artifact_set = "explore_stage2" if explore else "stage2"
+    target_name = "speech_targets_explore_stage2" if explore else "speech_targets_stage2"
+    normalizer_name = "explore_stage2_joint_ood_fold-0" if explore else "stage2_joint_ood_fold-0"
     split_path = output_root(config) / "splits" / "stage2_joint_ood_fold-0.csv"
     for role in ("train", "validation", "test"):
         for dataset in ("ds004940", "ds006104"):
             build_eeg_shards(
                 config, dataset, "all", "all", None, None, None, "any", role,
-                "stage2_joint_ood", 0, True, False, "stage2",
+                "stage2_joint_ood", 0, not rebuild, False, artifact_set,
             )
-    fit_normalizer(config, split_path, 0, False, "stage2")
+    fit_normalizer(config, split_path, 0, False, artifact_set, normalizer_name)
     config["audio"]["content"]["hubert_local_path"] = str(hubert_local_path.resolve())
-    cache_speech_targets(config, "all", None, True, False, "stage2", "speech_targets_stage2")
-    status = artifact_status(config, pilot)
-    target = output_root(config) / "qc" / "stage2_artifacts.json"
+    cache_speech_targets(config, "all", None, True, False, artifact_set, target_name)
+    status = artifact_status(config, pilot, artifact_set, bypass_m0_gates=explore)
+    target = output_root(config) / "qc" / ("explore_stage2_artifacts.json" if explore else "stage2_artifacts.json")
     target.write_text(json.dumps(status, indent=2) + "\n")
     if status["status"] != "pass":
         raise RuntimeError(f"Stage2 artifact materialization did not pass readiness: {status}")
@@ -186,6 +202,8 @@ def main() -> int:
     parser.add_argument("--data-config",type=Path,default=ROOT/"configs"/"training_data_v3.yaml")
     parser.add_argument("--pilot-config",type=Path,default=ROOT/"configs"/"joint_pilot_v1.yaml")
     parser.add_argument("--materialize",action="store_true",help="after all M0 gates pass, build isolated Stage-2 shards/normalizer/targets")
+    parser.add_argument("--explore",action="store_true",help="bypass M0 scientific gates and write only explore_stage2 artifacts")
+    parser.add_argument("--rebuild",action="store_true",help="rewrite the selected Stage-2 artifact shards")
     parser.add_argument("--hubert-local-path",type=Path)
     parser.add_argument("--check-readiness",action="store_true")
     args=parser.parse_args(); build(args.data_config,args.pilot_config)
@@ -193,9 +211,9 @@ def main() -> int:
     if args.materialize:
         if args.hubert_local_path is None:
             parser.error("--materialize requires --hubert-local-path; implicit model download is forbidden")
-        print(json.dumps(materialize(config,pilot,args.hubert_local_path),indent=2))
+        print(json.dumps(materialize(config,pilot,args.hubert_local_path,args.explore,args.rebuild),indent=2))
     if args.check_readiness:
-        status=artifact_status(config,pilot); print(json.dumps(status,indent=2))
+        status=artifact_status(config,pilot,"explore_stage2" if args.explore else "stage2",args.explore); print(json.dumps(status,indent=2))
         return 0 if status["status"]=="pass" else 2
     return 0
 

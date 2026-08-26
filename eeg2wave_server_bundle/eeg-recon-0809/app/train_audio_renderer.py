@@ -85,14 +85,19 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "joint_pilot_v1.yaml")
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--explore", action="store_true",
+                        help="record an exploratory renderer run without enforcing its scientific gate")
     args = parser.parse_args()
     cfg = yaml.safe_load(args.config.read_text())
     data_cfg = yaml.safe_load((args.config.parent / cfg["data_config"]).resolve().read_text())
     artifact_root = ROOT / data_cfg["output_root"]
-    manifest = artifact_root / "manifests" / "manifest_built.csv"
+    artifact_set = "explore_m0" if args.explore else "built"
+    manifest = artifact_root / "manifests" / f"manifest_{artifact_set}.csv"
     split = artifact_root / "splits" / f"{cfg['split']['protocol']}_fold-{cfg['split']['fold']}.csv"
-    targets = artifact_root / "speech_targets" / "speech_targets.h5"
-    normalizer = artifact_root / "normalizers" / f"{split.stem}.json"
+    targets = artifact_root / "speech_targets" / ("speech_targets_explore_m0.h5" if args.explore else "speech_targets.h5")
+    normalizer = artifact_root / "normalizers" / (
+        f"explore_m0_{split.stem}.json" if args.explore else f"{split.stem}.json"
+    )
     vocabulary = phoneme_vocabulary_from_manifest(manifest)
     train = JointManifestDataset(manifest, split, "train", "ds004940", targets, normalizer,
                                  float(cfg["loss"]["weak_content_weight"]),
@@ -132,20 +137,25 @@ def main() -> int:
     }
     required = [manifest, split, targets, normalizer, artifact_root / "source_lock.json"]
     artifact_hashes = {path.name: sha256_file(path) for path in required}
-    output = ROOT / "outputs" / "joint_pilot_v1" / "audio_renderer"
+    output = ROOT / "outputs" / "joint_pilot_v1" / ("audio_renderer_explore" if args.explore else "audio_renderer")
     output.mkdir(parents=True, exist_ok=True)
     split_summary = {"protocol": "m0_train_fold_linguistic_content_holdout",
                      "train_pairs": len(train_indices), "validation_pairs": len(validation_indices),
                      "train_contents": int(train.frame.iloc[train_indices].linguistic_content_id.nunique()),
                      "validation_contents": int(train.frame.iloc[validation_indices].linguistic_content_id.nunique())}
+    interpretation = "exploratory_only_not_registered" if args.explore else "registered_audio_oracle"
     torch.save({"model": model.state_dict(), "model_config": model_config, "artifact_hashes": artifact_hashes,
-                "gate": checks, "validation": validation_metrics, "split": split_summary}, output / "checkpoint.pt")
+                "gate": checks, "validation": validation_metrics, "split": split_summary,
+                "run_kind": "explore" if args.explore else "pilot", "interpretation": interpretation}, output / "checkpoint.pt")
     (output / "metrics.json").write_text(json.dumps({"history": history, "validation": validation_metrics,
                                                        "split": split_summary,
+                                                       "run_kind": "explore" if args.explore else "pilot",
+                                                       "interpretation": interpretation,
                                                        "gate": {"checks": checks, "passed": all(checks.values())}}, indent=2) + "\n")
-    print(json.dumps({"validation": validation_metrics, "split": split_summary, "gate": checks}, indent=2))
+    print(json.dumps({"validation": validation_metrics, "split": split_summary, "gate": checks,
+                      "interpretation": interpretation}, indent=2))
     train.close()
-    return 0 if all(checks.values()) else 2
+    return 0 if args.explore or all(checks.values()) else 2
 
 
 if __name__ == "__main__":

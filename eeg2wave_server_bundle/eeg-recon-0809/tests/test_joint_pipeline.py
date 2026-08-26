@@ -13,7 +13,7 @@ ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "app/src"))
 
 from eeg2speech.data import AlternatingBatchIterator, JointManifestDataset, homogeneous_collate, pilot_indices
-from eeg2speech.losses import counterfactual_eeg, joint_content_loss, masked_mfcc_loss
+from eeg2speech.losses import counterfactual_eeg, joint_content_loss, masked_mfcc_loss, soft_dtw_token_loss
 from eeg2speech.model import AudioMFCCRenderer, JointEEGContentModel
 
 
@@ -76,6 +76,15 @@ class TestJointPipeline(unittest.TestCase):
         exact = masked_mfcc_loss(prediction, target, mask, torch.ones(2))[0]
         weak = masked_mfcc_loss(prediction, target, mask, torch.full((2,), 0.35))[0]
         self.assertAlmostEqual(float(weak / exact), 0.35, places=5)
+
+    def test_local_alignment_has_finite_gradients_for_nearly_opposite_tokens(self):
+        left = torch.randn(2, 96, 24, requires_grad=True)
+        right = -left.detach() + 1e-4 * torch.randn(2, 96, 24)
+        mask = torch.ones(2, 96, dtype=torch.bool)
+        value = soft_dtw_token_loss(left, right, mask, mask).mean()
+        value.backward()
+        self.assertTrue(torch.isfinite(value))
+        self.assertTrue(torch.isfinite(left.grad).all())
 
     def test_padding_values_are_inert(self):
         eeg, xyz, channel_mask, time_mask, dataset_id = self._inputs(8, 128, 0)

@@ -70,7 +70,9 @@ class DatasetInputAdapter(nn.Module):
         self.bias = nn.Parameter(torch.zeros(datasets))
 
     def forward(self, eeg: torch.Tensor, dataset_id: torch.Tensor) -> torch.Tensor:
-        gain = self.log_gain[dataset_id].exp().view(-1, 1, 1)
+        # Keep the affine adapter expressive while preventing an accidental
+        # optimizer excursion from overflowing exp() and corrupting EEG tokens.
+        gain = self.log_gain[dataset_id].clamp(-5.0, 5.0).exp().view(-1, 1, 1)
         bias = self.bias[dataset_id].view(-1, 1, 1)
         return eeg * gain + bias
 

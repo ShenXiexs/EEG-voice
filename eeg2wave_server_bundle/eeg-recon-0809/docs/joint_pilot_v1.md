@@ -18,12 +18,20 @@ The executable entry points under `app/` are deliberately staged:
   Stage-0 human gate passes.
 - `run_joint_pilot_all.sh`: start-to-finish entry that pauses safely at the
   human evidence gate rather than manufacturing an approval.
+- `run_joint_explore.sh`: complete end-to-end exploratory run. It bypasses
+  scientific gates only, labels every result as exploratory, and writes
+  separate `explore_stage2` artifacts plus `outputs/.../explore` checkpoints.
 
 All scripts use `app/lib/joint_pilot_common.sh` for interpreter/model discovery,
 dependency checks, UTC logs, and gate checks. `scripts/prepare_m0_artifacts.py`
 selects grids from the frozen manifest/split instead of embedding subject or
 content IDs in shell code. Smoke artifacts live under `outputs/.../smoke` and
 cannot satisfy registered M0 gates under `outputs/.../pilot`.
+
+Explore mode retains raw-data QC, source/target/normalizer hashes, finite-value
+checks and leakage-safe split construction. It bypasses only the human approval,
+M0 pass criteria, and registered-M0 prerequisite for Stage 2. Its metrics are
+diagnostic, not evidence for Q1/Q2/Q3.
 
 ## Stable interface
 

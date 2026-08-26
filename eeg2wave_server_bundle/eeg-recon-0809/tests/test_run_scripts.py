@@ -48,6 +48,12 @@ class TestRunScripts(unittest.TestCase):
         self.assertIn("human_listen_transcript_status=pass only after real human verification", stage0)
         self.assertNotIn("human_listen_transcript_status=pass\"", complete)
 
+    def test_explore_runner_is_explicitly_isolated_from_registered_outputs(self):
+        explore = (ROOT / "app/run_joint_explore.sh").read_text()
+        self.assertIn("--explore", explore)
+        self.assertIn("$RUN_ROOT/explore", explore)
+        self.assertIn("--explore --materialize", explore)
+
 
 if __name__ == "__main__":
     unittest.main()

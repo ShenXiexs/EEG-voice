@@ -94,6 +94,46 @@ cd /Users/samxie/Research/EEG-Voice/ref_github/speech_decoding/eeg2wave_server_b
 ./app/run_joint_stage2.sh        # 仅在全部 12 个 M0 evaluation gate 通过后执行
 ```
 
+### Explore mode（不通过 scientific gate 也完整运行）
+
+`explore` 用于检查端到端可运行性、损失曲线和潜在负迁移，不替代 preregistered
+pilot。它仍保留数据完整性、source lock、target/normalizer provenance、NaN 和
+shape 检查；它只绕过人工 pair-review、M0 成功标准及 Stage-2 的 M0 先决条件。
+
+```bash
+# 完整探索流程：audio oracle、M0 三模式、独立 explore Stage 2、single-vs-joint 评估
+./app/run_joint_explore.sh
+
+# 先用最小预算验证完整 runner；仍会构建 explore Stage-2 EEG artifacts
+EXPLORE_SEEDS="31" EXPLORE_MAX_STEPS=20 ./app/run_joint_explore.sh
+
+# 需要重建既有 exploration artifacts（而非 resume）时使用
+REBUILD_M0=1 REBUILD_EXPLORE=1 ./app/run_joint_explore.sh
+
+# audit/split 已完成但 M0 artifact 构建中断时，从 M0 继续
+EXPLORE_FROM=m0 REBUILD_M0=1 ./app/run_joint_explore.sh
+
+# M0 artifact、normalizer 和 speech target 已完成，但模型训练中断时继续
+EXPLORE_FROM=overfit ./app/run_joint_explore.sh
+```
+
+Explore outputs 永远隔离在：
+
+```text
+outputs/joint_pilot_v1/explore/
+artifacts/training_data/v3/manifests/manifest_explore_m0.csv
+artifacts/training_data/v3/shards/explore_m0/
+artifacts/training_data/v3/normalizers/explore_m0_joint_ood_fold-0.json
+artifacts/training_data/v3/speech_targets/speech_targets_explore_m0.h5
+artifacts/training_data/v3/manifests/manifest_explore_stage2.csv
+artifacts/training_data/v3/shards/explore_stage2/
+artifacts/training_data/v3/normalizers/explore_stage2_joint_ood_fold-0.json
+artifacts/training_data/v3/speech_targets/speech_targets_explore_stage2.h5
+```
+
+因此 explore 的 checkpoint、metrics 和 comparison 文件不能被 M0 registry 或
+`run_joint_stage2.sh` 当作正式实验结果使用。
+
 常用安全覆盖参数：
 
 ```bash

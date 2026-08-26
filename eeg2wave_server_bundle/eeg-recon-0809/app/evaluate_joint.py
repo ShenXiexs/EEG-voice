@@ -257,11 +257,12 @@ def main() -> int:
     artifact_root = ROOT / data_cfg["output_root"]
     split_protocol = payload.get("split_protocol", cfg["split"]["protocol"] if payload.get("stage") == "overfit" else "stage2_joint_ood")
     split = artifact_root / "splits" / f"{split_protocol}_fold-{cfg['split']['fold']}.csv"
-    normalizer = artifact_root / "normalizers" / f"{split.stem}.json"
-    artifact_set = "built" if payload.get("stage") == "overfit" else "stage2"
+    artifact_set = payload.get("artifact_set") or ("built" if payload.get("stage") == "overfit" else "stage2")
     manifest = artifact_root / "manifests" / f"manifest_{artifact_set}.csv"
-    target_name = "speech_targets" if artifact_set == "built" else "speech_targets_stage2"
+    target_name = payload.get("target_name") or ("speech_targets" if artifact_set == "built" else "speech_targets_stage2")
     targets = artifact_root / "speech_targets" / f"{target_name}.h5"
+    normalizer_name = payload.get("normalizer_name") or split.stem
+    normalizer = artifact_root / "normalizers" / f"{normalizer_name}.json"
     sources = artifact_root / "source_lock.json"
     expected_hashes = payload.get("artifact_hashes", {})
     current_hashes = {path.name: _sha256(path) for path in (sources, split, manifest, targets, normalizer)}
@@ -382,7 +383,10 @@ def main() -> int:
                     "registered_collapse_baseline": cfg["gates"]["overfit"].get("collapse_baseline", "dataset_mean"),
                     "note":"same-content is diagnostic only and uses leave-one-realization-out when independent audio IDs exist"},
             "run_kind":payload.get("run_kind","unknown"),
-            "scientific_interpretation":"engineering_only" if payload.get("run_kind") == "smoke" else "registered_pilot",
+            "scientific_interpretation":(
+                "engineering_only" if payload.get("run_kind") == "smoke"
+                else ("exploratory_only_not_registered" if payload.get("run_kind") == "explore" else "registered_pilot")
+            ),
             "reconstruction": reconstruction}
     output = args.output or args.checkpoint.parent / f"evaluation_{args.dataset}_{args.role}.json"
     output.parent.mkdir(parents=True,exist_ok=True); output.write_text(json.dumps(result,indent=2)+"\n")

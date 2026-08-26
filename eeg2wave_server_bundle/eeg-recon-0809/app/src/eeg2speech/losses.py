@@ -32,8 +32,16 @@ def masked_mfcc_loss(prediction: torch.Tensor, target: torch.Tensor, mask: torch
 
 def soft_dtw_token_loss(left: torch.Tensor, right: torch.Tensor, left_mask: torch.Tensor,
                         right_mask: torch.Tensor, window_fraction: float = 0.20,
-                        temperature: float = 0.07) -> torch.Tensor:
-    left, right = F.normalize(left, dim=-1), F.normalize(right, dim=-1)
+                        temperature: float = 0.15) -> torch.Tensor:
+    """Numerically stable, banded local temporal alignment.
+
+    This preserves the intended diagonal/SoftDTW-style local matching while
+    avoiding Sinkhorn's alternating divisions over a near-zero kernel. Those
+    divisions were unstable on MPS and could poison the optimizer after a few
+    updates. Each valid EEG token attends only to valid audio tokens in its
+    temporal band through a stable softmax.
+    """
+    left, right = F.normalize(left, dim=-1, eps=1e-6), F.normalize(right, dim=-1, eps=1e-6)
     if right.shape[1] != left.shape[1]:
         right = F.interpolate(right.transpose(1, 2), size=left.shape[1], mode="linear", align_corners=False).transpose(1, 2)
         right_mask = F.interpolate(right_mask.float().unsqueeze(1), size=left.shape[1], mode="nearest").squeeze(1).bool()
@@ -42,19 +50,15 @@ def soft_dtw_token_loss(left: torch.Tensor, right: torch.Tensor, left_mask: torc
     grid = torch.arange(steps, device=left.device)
     allowed = (grid[:, None] - grid[None, :]).abs() <= radius
     valid = allowed.unsqueeze(0) & left_mask[:, :, None] & right_mask[:, None, :]
-    cost = 1.0 - torch.einsum("btd,bsd->bts", left, right)
-    kernel = torch.exp(-cost / max(temperature, 1e-4)) * valid.to(cost.dtype)
-    row_mass = left_mask.to(cost.dtype); row_mass = row_mass / row_mass.sum(1, keepdim=True).clamp_min(1)
-    col_mass = right_mask.to(cost.dtype); col_mass = col_mass / col_mass.sum(1, keepdim=True).clamp_min(1)
-    u, v = torch.ones_like(row_mass), torch.ones_like(col_mass)
-    for _ in range(8):
-        u = row_mass / torch.bmm(kernel, v.unsqueeze(-1)).squeeze(-1).clamp_min(1e-8)
-        v = col_mass / torch.bmm(kernel.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1).clamp_min(1e-8)
-    transport = u[:, :, None] * kernel * v[:, None, :]
-    transport = transport / transport.sum((1, 2), keepdim=True).clamp_min(1e-8)
+    cost = (1.0 - torch.einsum("btd,bsd->bts", left, right)).clamp(0.0, 2.0)
+    logits = (-cost / max(temperature, 1e-4)).masked_fill(~valid, -1e4)
+    alignment = torch.softmax(logits, dim=-1) * valid.to(cost.dtype)
+    alignment = torch.nan_to_num(alignment, nan=0.0, posinf=0.0, neginf=0.0)
     relative = grid.to(cost.dtype) / max(steps - 1, 1)
     monotonic = (relative[:, None] - relative[None, :]).abs().unsqueeze(0)
-    return ((cost + 0.10 * monotonic) * transport).sum((1, 2))
+    row_valid = valid.any(-1) & left_mask
+    per_row = ((cost + 0.10 * monotonic) * alignment).sum(-1)
+    return (per_row * row_valid.to(cost.dtype)).sum(1) / row_valid.sum(1).clamp_min(1)
 
 
 def _multi_positive(logits: torch.Tensor, positive: torch.Tensor) -> torch.Tensor:
@@ -65,7 +69,10 @@ def _multi_positive(logits: torch.Tensor, positive: torch.Tensor) -> torch.Tenso
 
 def global_clip_loss(left: torch.Tensor, right: torch.Tensor, labels: Iterable[str], scale: torch.Tensor,
                      sample_weight: torch.Tensor | None = None) -> torch.Tensor:
-    logits = F.normalize(left, dim=-1) @ F.normalize(right, dim=-1).T * scale.exp().clamp(max=100)
+    # Clamp before exp: clamping an already-infinite exp can still yield a
+    # nonfinite backward path on some accelerators.
+    logit_scale = scale.clamp(max=math.log(100.0)).exp()
+    logits = F.normalize(left, dim=-1, eps=1e-6) @ F.normalize(right, dim=-1, eps=1e-6).T * logit_scale
     names = [str(value).strip().lower() for value in labels]
     positive = torch.tensor([[a == b for b in names] for a in names], dtype=torch.bool, device=logits.device)
     weight = torch.ones(len(names), device=logits.device, dtype=logits.dtype) if sample_weight is None else sample_weight.to(logits.dtype)

@@ -126,6 +126,8 @@ def main() -> int:
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke-model", action="store_true", help="use a 48-dim/1-layer engineering smoke model")
+    parser.add_argument("--explore", action="store_true",
+                        help="bypass scientific gates and write only outputs/.../explore artifacts")
     args = parser.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text())
@@ -140,24 +142,35 @@ def main() -> int:
     audit = json.loads((artifact_root / "qc" / "audit.json").read_text())
     if audit.get("included_counts", {}).get("ds004940") != 17489 or audit.get("included_counts", {}).get("ds006104") != 10888:
         raise RuntimeError("Stage 0 audit gate failed: expected 17,489 and 10,888 included trials")
-    if args.stage == "generalization" and bool(cfg["training"].get("stage2_requires_all_m0_gates", True)):
+    if args.stage == "generalization" and not args.explore and bool(cfg["training"].get("stage2_requires_all_m0_gates", True)):
         require_registered_m0_gates(ROOT, cfg)
     split_protocol = cfg["split"]["protocol"] if args.stage == "overfit" else "stage2_joint_ood"
     split_path = artifact_root / "splits" / f"{split_protocol}_fold-{cfg['split']['fold']}.csv"
-    artifact_set = "built" if args.stage == "overfit" else "stage2"
+    artifact_set = ("explore_m0" if args.explore else "built") if args.stage == "overfit" else (
+        "explore_stage2" if args.explore else "stage2"
+    )
     manifest_path = artifact_root / "manifests" / f"manifest_{artifact_set}.csv"
-    target_name = "speech_targets" if args.stage == "overfit" else "speech_targets_stage2"
+    target_name = ("speech_targets_explore_m0" if args.explore else "speech_targets") if args.stage == "overfit" else (
+        "speech_targets_explore_stage2" if args.explore else "speech_targets_stage2"
+    )
     target_path = artifact_root / "speech_targets" / f"{target_name}.h5"
-    normalizer_path = artifact_root / "normalizers" / f"{split_path.stem}.json"
+    normalizer_name = (
+        f"explore_m0_{split_path.stem}" if args.stage == "overfit" and args.explore
+        else (split_path.stem if args.stage == "overfit" or not args.explore else "explore_stage2_joint_ood_fold-0")
+    )
+    normalizer_path = artifact_root / "normalizers" / f"{normalizer_name}.json"
     source_lock_path = artifact_root / "source_lock.json"
     validation_path = artifact_root / "qc" / "validate.json"
-    for required in (split_path, manifest_path, target_path, normalizer_path, source_lock_path, validation_path):
+    required_paths = [split_path, manifest_path, target_path, normalizer_path, source_lock_path]
+    if not args.explore:
+        required_paths.append(validation_path)
+    for required in required_paths:
         if not required.exists():
             raise RuntimeError(f"required gated artifact is missing: {required}")
-    validation = json.loads(validation_path.read_text())
-    if validation.get("status") != "pass":
+    validation = json.loads(validation_path.read_text()) if validation_path.exists() else {}
+    if not args.explore and validation.get("status") != "pass":
         raise RuntimeError("Stage 0 validation gate is not passing")
-    if args.stage == "overfit" and not args.dry_run and not args.smoke_model:
+    if args.stage == "overfit" and not args.dry_run and not args.smoke_model and not args.explore:
         blockers = list(validation.get("formal_m0_blockers", []))
         if args.mode == "ds006104":
             blockers = [value for value in blockers if value != "ds004940_human_pair_review"]
@@ -244,9 +257,15 @@ def main() -> int:
         state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
         loss, metrics = joint_content_loss(state, batch, model, cfg["loss"])
         if not torch.isfinite(loss):
-            raise RuntimeError(f"nonfinite loss at step {step}")
+            raise RuntimeError(f"nonfinite loss at step {step} ({name}); metrics={metrics}")
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["training"]["grad_clip"]))
+        nonfinite_gradients = [name for name, parameter in model.named_parameters()
+                               if parameter.grad is not None and not torch.isfinite(parameter.grad).all()]
+        if nonfinite_gradients:
+            raise RuntimeError(f"nonfinite gradients at step {step} ({name}): {nonfinite_gradients[:8]}; metrics={metrics}")
+        gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["training"]["grad_clip"]))
+        if not torch.isfinite(gradient_norm):
+            raise RuntimeError(f"nonfinite gradient norm at step {step} ({name}); metrics={metrics}")
         optimizer.step()
         if name not in seen_batch_sources or step % 100 == 0:
             seen_batch_sources.add(name)
@@ -264,17 +283,20 @@ def main() -> int:
                 break
 
     controls = {name: evaluate_batch(model, next(iter(loaders[name])), device()) for name in names}
-    run_kind = "smoke" if args.smoke_model else "pilot"
+    run_kind = "smoke" if args.smoke_model else ("explore" if args.explore else "pilot")
     checkpoint_dir = ROOT / "outputs" / "joint_pilot_v1" / run_kind / args.stage / args.mode / f"seed-{args.seed}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     torch.save({"model": model.state_dict(), "model_config": cfg["model"], "pilot_config": cfg,
                 "mode": args.mode, "stage": args.stage, "seed": args.seed, "run_kind": run_kind,
                 "split_protocol": split_protocol,
+                "artifact_set": artifact_set, "target_name": target_name, "normalizer_name": normalizer_name,
                 "selections": selections, "source_lock_sha256": source_lock["source_lock_sha256"],
                 "preprocess_config_sha256": source_lock["config_sha256"],
                 "runtime_code_sha256": runtime_code_sha256(), "phoneme_vocabulary": vocabulary,
                 "artifact_hashes": artifact_hashes}, checkpoint_dir / "checkpoint.pt")
-    interpretation = "engineering_only_no_scientific_gate_claim" if args.smoke_model else "evaluate_against_registered_pilot_gates"
+    interpretation = ("engineering_only_no_scientific_gate_claim" if args.smoke_model
+                      else ("exploratory_only_gates_bypassed_not_registered" if args.explore
+                            else "evaluate_against_registered_pilot_gates"))
     (checkpoint_dir / "metrics.json").write_text(json.dumps({"run_kind": run_kind, "interpretation": interpretation,
                                                               "selections": selections, "history": history,
                                                               "controls": controls, "steps_completed": step,

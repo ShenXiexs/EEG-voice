@@ -100,9 +100,9 @@ def _selection_payload(grids: dict[str, pd.DataFrame]) -> dict:
     }
 
 
-def _curate_built_manifest(config: dict, grids: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Make the M0 manifest exact while retaining superseded rows as audit evidence."""
-    path = output_root(config) / "manifests" / "manifest_built.csv"
+def _curate_m0_manifest(config: dict, grids: dict[str, pd.DataFrame], artifact_set: str) -> pd.DataFrame:
+    """Make an M0 manifest exact while retaining superseded rows as audit evidence."""
+    path = output_root(config) / "manifests" / f"manifest_{artifact_set}.csv"
     frame = pd.read_csv(path, keep_default_na=False, low_memory=False)
     desired = pd.Series(False, index=frame.index)
     for name, grid in grids.items():
@@ -135,16 +135,22 @@ def _curate_built_manifest(config: dict, grids: dict[str, pd.DataFrame]) -> pd.D
             raise RuntimeError(
                 f"{name}: built artifact has {len(selected)} rows/{len(cells)} cells, expected {expected[name]}"
             )
-    write_frame(frame, output_root(config) / "manifests" / "manifest_built", pd)
+    write_frame(frame, output_root(config) / "manifests" / f"manifest_{artifact_set}", pd)
     return included
 
 
 def materialize(config: dict, pilot: dict, grids: dict[str, pd.DataFrame],
-                hubert_local_path: Path, rebuild: bool) -> dict:
+                hubert_local_path: Path, rebuild: bool, artifact_set: str = "built") -> dict:
     if not hubert_local_path.exists():
         raise RuntimeError(f"local HuBERT model is missing: {hubert_local_path}")
+    if artifact_set not in {"built", "explore_m0"}:
+        raise ValueError("M0 artifact_set must be built or explore_m0")
     protocol = str(pilot["split"]["protocol"])
     fold = int(pilot["split"]["fold"])
+    target_name = "speech_targets" if artifact_set == "built" else "speech_targets_explore_m0"
+    normalizer_name = split_path_name = f"{protocol}_fold-{fold}"
+    if artifact_set != "built":
+        normalizer_name = f"explore_m0_{split_path_name}"
 
     calls = (
         ("ds004940", grids["ds004940"], ",".join(sorted(grids["ds004940"].task.unique())), "any"),
@@ -167,22 +173,24 @@ def materialize(config: dict, pilot: dict, grids: dict[str, pd.DataFrame],
             fold,
             not rebuild,
             False,
-            "built",
+            artifact_set,
         )
 
-    _curate_built_manifest(config, grids)
+    _curate_m0_manifest(config, grids, artifact_set)
     split_path = output_root(config) / "splits" / f"{protocol}_fold-{fold}.csv"
-    fit_normalizer(config, split_path, fold, False, "built")
+    fit_normalizer(config, split_path, fold, False, artifact_set, normalizer_name)
     config["audio"]["content"]["hubert_local_path"] = str(hubert_local_path.resolve())
-    cache_speech_targets(config, "all", None, True, False, "built", "speech_targets")
-    psd = run_preprocessing_qc(config)
-    if psd["status"] != "pass":
-        raise RuntimeError("preprocessing PSD gate failed")
-    if validate(config, True) != 0:
-        raise RuntimeError("strict Stage-0 validation failed")
+    cache_speech_targets(config, "all", None, True, False, artifact_set, target_name)
+    if artifact_set == "built":
+        psd = run_preprocessing_qc(config)
+        if psd["status"] != "pass":
+            raise RuntimeError("preprocessing PSD gate failed")
+        if validate(config, True) != 0:
+            raise RuntimeError("strict Stage-0 validation failed")
 
-    payload = {"status": "pass", "artifact_set": "built", "selection": _selection_payload(grids)}
-    target = output_root(config) / "qc" / "m0_artifacts.json"
+    payload = {"status": "pass", "artifact_set": artifact_set, "target_name": target_name,
+               "normalizer_name": normalizer_name, "selection": _selection_payload(grids)}
+    target = output_root(config) / "qc" / ("m0_artifacts.json" if artifact_set == "built" else "explore_m0_artifacts.json")
     target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return payload
 
@@ -194,6 +202,8 @@ def main() -> int:
     parser.add_argument("--hubert-local-path", type=Path)
     parser.add_argument("--check-only", action="store_true", help="print the deterministic grids without writing artifacts")
     parser.add_argument("--rebuild", action="store_true", help="rewrite the selected M0 shards instead of resuming compatible files")
+    parser.add_argument("--artifact-set", choices=["built", "explore_m0"], default="built",
+                        help="explore_m0 is fully isolated from registered M0 artifacts")
     args = parser.parse_args()
     config, _ = load_config(args.data_config)
     pilot = yaml.safe_load(args.pilot_config.read_text())
@@ -203,7 +213,7 @@ def main() -> int:
         return 0
     if args.hubert_local_path is None:
         parser.error("artifact materialization requires --hubert-local-path; implicit model download is forbidden")
-    print(json.dumps(materialize(config, pilot, grids, args.hubert_local_path, args.rebuild), indent=2))
+    print(json.dumps(materialize(config, pilot, grids, args.hubert_local_path, args.rebuild, args.artifact_set), indent=2))
     return 0
 
 

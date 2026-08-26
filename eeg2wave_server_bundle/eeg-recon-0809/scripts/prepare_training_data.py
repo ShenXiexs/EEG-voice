@@ -1313,7 +1313,11 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
         merge_commit, merge_diff = git_provenance()
         current_contract = {"preprocess_config_sha256": config["_config_sha256"],
                             "source_lock_sha256": lock["source_lock_sha256"],
-                            "split_index_sha256": split_index["split_index_sha256"],
+                            # Named artifact sets pin their role-specific CSV
+                            # rather than the global split-index JSON. Comparing
+                            # against the latter marked every prior named shard
+                            # stale when a second dataset/task was merged.
+                            "split_index_sha256": split_contract_hash,
                             "code_commit": merge_commit, "code_diff_hash": sha256_bytes(merge_diff.encode())}
         for shard_path, indices in previous[previous.build_status == "included"].groupby("shard_path").groups.items():
             compatible = False
@@ -1336,7 +1340,8 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
 
 
 def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int,
-                   allow_mixed_production: bool, manifest_kind: str = "built") -> int:
+                   allow_mixed_production: bool, manifest_kind: str = "built",
+                   normalizer_name: str | None = None) -> int:
     h5py, _, np = require_build_runtime()
     frame, pd = read_manifest(config)
     split = pd.read_csv(split_csv)
@@ -1344,6 +1349,8 @@ def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int,
     if not train_ids: raise RuntimeError("selected split/fold contains no training trials")
     if not re.fullmatch(r"[a-z0-9_-]+", manifest_kind):
         raise ValueError("manifest_kind contains unsafe characters")
+    if normalizer_name is not None and not re.fullmatch(r"[a-z0-9_-]+", normalizer_name):
+        raise ValueError("normalizer_name contains unsafe characters")
     built_path = output_root(config) / "manifests" / f"manifest_{manifest_kind}.csv"
     built = pd.read_csv(built_path, keep_default_na=False, low_memory=False) if built_path.exists() else frame
     chosen = built[(built.trial_id.isin(train_ids)) & (built.build_status == "included")]
@@ -1411,7 +1418,8 @@ def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int,
             "datasets":dataset_results}
     # The split filename already includes the fold (for example,
     # joint_ood_fold-0.csv); avoid producing the ambiguous fold-0_fold-0 name.
-    target=output_root(config)/"normalizers"/f"{split_csv.stem}.json"; target.parent.mkdir(parents=True,exist_ok=True); target.write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
+    target_name = normalizer_name or split_csv.stem
+    target=output_root(config)/"normalizers"/f"{target_name}.json"; target.parent.mkdir(parents=True,exist_ok=True); target.write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
     print(target)
     return 0
 
@@ -1664,7 +1672,7 @@ def parser() -> argparse.ArgumentParser:
     ab=sub.add_parser("build-audio-bank"); ab.add_argument("--resume", action="store_true")
     sub.add_parser("make-splits")
     b=sub.add_parser("build"); b.add_argument("--dataset",choices=["all","ds004940","ds006104"],default="all"); b.add_argument("--subjects",default="all"); b.add_argument("--tasks",default="all"); b.add_argument("--limit-trials-per-group",type=int); b.add_argument("--common-contents",type=int); b.add_argument("--content-ids"); b.add_argument("--tms-condition",choices=["any","off","on"],default="any"); b.add_argument("--split-role",choices=["any","train","validation","test"],default="any"); b.add_argument("--split-protocol",choices=["subject_ood","audio_ood","joint_ood","stage2_joint_ood"],default="joint_ood"); b.add_argument("--split-fold",type=int,default=0); b.add_argument("--artifact-set",default="built"); b.add_argument("--resume",action="store_true"); b.add_argument("--allow-audit-warnings",action="store_true")
-    n=sub.add_parser("fit-normalizer"); n.add_argument("--split-csv",type=Path,required=True); n.add_argument("--fold",type=int,required=True); n.add_argument("--manifest-kind",default="built"); n.add_argument("--allow-mixed-production",action="store_true")
+    n=sub.add_parser("fit-normalizer"); n.add_argument("--split-csv",type=Path,required=True); n.add_argument("--fold",type=int,required=True); n.add_argument("--manifest-kind",default="built"); n.add_argument("--normalizer-name"); n.add_argument("--allow-mixed-production",action="store_true")
     sub.add_parser("migrate-provenance")
     v=sub.add_parser("validate"); v.add_argument("--strict",action="store_true")
     return p
@@ -1676,7 +1684,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command=="build-audio-bank": return build_audio_bank(config,args.resume)
     if args.command=="make-splits": return make_splits(config)
     if args.command=="build": return build(config,args.dataset,args.subjects,args.tasks,args.limit_trials_per_group,args.common_contents,args.content_ids,args.tms_condition,args.split_role,args.split_protocol,args.split_fold,args.resume,args.allow_audit_warnings,args.artifact_set)
-    if args.command=="fit-normalizer": return fit_normalizer(config,args.split_csv,args.fold,args.allow_mixed_production,args.manifest_kind)
+    if args.command=="fit-normalizer": return fit_normalizer(config,args.split_csv,args.fold,args.allow_mixed_production,args.manifest_kind,args.normalizer_name)
     if args.command=="migrate-provenance": return migrate_provenance(config)
     return validate(config,args.strict)
 
