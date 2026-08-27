@@ -13,7 +13,8 @@ import pandas as pd
 import yaml
 
 from prepare_training_data import (ROOT, build as build_eeg_shards, fit_normalizer,
-                                   load_config, output_root, sha256_bytes, stable_json)
+                                   load_config, output_root, require_build_runtime, sha256_bytes,
+                                   stable_json)
 
 sys.path.insert(0, str(ROOT / "app" / "src"))
 from eeg2speech.gates import registered_m0_gate_status, require_registered_m0_gates
@@ -49,6 +50,30 @@ def assign(values: list[str], counts: dict[str, int], namespace: str) -> dict[st
     return result
 
 
+def declared_channel_qc_mask(frame: pd.DataFrame, config: dict) -> pd.Series:
+    """Reject rows that the locked sidecar already proves cannot be interpolated.
+
+    The shard builder rejects a recording once the union of missing and declared
+    bad canonical EEG channels exceeds the configured maximum fraction. Stage-2
+    subject selection must apply the declared-bad part of that same rule before
+    it freezes a subject×content grid; otherwise an apparently valid grid can
+    later lose every cell from one subject during EEG preprocessing. Raw-file-
+    only channel failures remain fail-closed in the shard builder.
+    """
+    maximum = float(config["harmonized"]["interpolation"]["max_bad_fraction"])
+    allowed: list[bool] = []
+    for _, row in frame.iterrows():
+        canonical = set(config["sources"][str(row.dataset)]["channel_order"])
+        try:
+            declared = set(json.loads(str(row.get("bad_channels", "[]"))))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            allowed.append(False)
+            continue
+        affected = len(canonical & {str(value) for value in declared}) / max(len(canonical), 1)
+        allowed.append(affected <= maximum)
+    return pd.Series(allowed, index=frame.index, dtype=bool)
+
+
 def build(data_config: Path, pilot_config: Path) -> Path:
     config, _ = load_config(data_config); pilot = yaml.safe_load(pilot_config.read_text())
     root = output_root(config); frame = pd.read_csv(root / "manifests" / "manifest_all.csv", keep_default_na=False, low_memory=False)
@@ -58,8 +83,23 @@ def build(data_config: Path, pilot_config: Path) -> Path:
     records=[]; assignment={"algorithm":"exact-stage2-subject-content-v2-one-trial-per-cell","datasets":{},
                             "source_lock_sha256":lock["source_lock_sha256"],"preprocess_config_sha256":config["_config_sha256"]}
     eligible = frame[(frame.build_status == "included") & (frame.qc_pass.astype(str).str.lower() == "true")]
+    declared_qc = declared_channel_qc_mask(eligible, config)
+    selection_eligible = eligible[declared_qc].copy()
+    rejected_declared_qc = eligible[~declared_qc].copy()
+    assignment["preprocessing_eligibility"] = {
+        "rule": "declared_canonical_bad_fraction_lte_configured_max",
+        "max_bad_fraction": float(config["harmonized"]["interpolation"]["max_bad_fraction"]),
+        "excluded_trials_by_dataset": {
+            dataset: int((rejected_declared_qc.dataset == dataset).sum())
+            for dataset in ("ds004940", "ds006104")
+        },
+        "excluded_subjects_by_dataset": {
+            dataset: sorted(rejected_declared_qc[rejected_declared_qc.dataset == dataset].subject.astype(str).unique().tolist())
+            for dataset in ("ds004940", "ds006104")
+        },
+    }
     for dataset in ("ds004940","ds006104"):
-        content = eligible[(eligible.dataset==dataset)&eligible.supervision_type.isin(["paired_audio","weak_audio"])].copy()
+        content = selection_eligible[(selection_eligible.dataset==dataset)&selection_eligible.supervision_type.isin(["paired_audio","weak_audio"])].copy()
         if dataset == "ds004940" and p.get("primary_ds004940_task"): content=content[content.task==p["primary_ds004940_task"]]
         if dataset == "ds006104" and not bool(p["primary_ds006104_tms"]):
             content=content[~content.tms_applied.astype(str).str.lower().isin(["true","1","yes"])]
@@ -74,10 +114,13 @@ def build(data_config: Path, pilot_config: Path) -> Path:
         for _,row in dataset_rows.iterrows():
             subject_role=subject_roles.get(str(row.subject)); group=str(row.linguistic_content_id)
             group_role=(label_roles if row.supervision_type=="label_only" else content_roles).get(group)
+            preproc_eligible = bool(declared_qc.get(row.name, False))
             primary_condition = not (dataset == "ds004940" and p.get("primary_ds004940_task") and row.task != p["primary_ds004940_task"])
             if dataset == "ds006104" and not bool(p["primary_ds006104_tms"]):
                 primary_condition = primary_condition and str(row.tms_applied).lower() not in {"true","1","yes"}
-            if not primary_condition:
+            if not preproc_eligible:
+                role,reason="excluded","declared_bad_channel_fraction_exceeds_max"
+            elif not primary_condition:
                 role,reason="excluded","outside_registered_primary_condition"
             elif subject_role is None or group_role is None:
                 role,reason="excluded","outside_registered_stage2_groups"
@@ -171,6 +214,27 @@ def artifact_status(config: dict, pilot: dict, artifact_set: str = "stage2",
             "unexpected_trials": unexpected_trials}
 
 
+def named_artifact_split_is_stale(config: dict, artifact_set: str, split_path: Path) -> bool:
+    """Whether a named artifact's existing HDF5 shards pin an older split CSV."""
+    manifest_path = output_root(config) / "manifests" / f"manifest_{artifact_set}.csv"
+    if not manifest_path.exists():
+        return False
+    manifest = pd.read_csv(manifest_path, keep_default_na=False, low_memory=False)
+    paths = sorted({str(path) for path in manifest.loc[manifest.build_status == "included", "shard_path"] if str(path)})
+    if not paths:
+        return False
+    expected = sha256_bytes(split_path.read_bytes())
+    h5py, _, _ = require_build_runtime()
+    for relative in paths:
+        path = ROOT / relative
+        if not path.exists():
+            return True
+        with h5py.File(path, "r") as shard:
+            if str(shard.attrs.get("split_index_sha256", "")) != expected:
+                return True
+    return False
+
+
 def materialize(config: dict, pilot: dict, hubert_local_path: Path,
                 explore: bool = False, rebuild: bool = False) -> dict:
     """Build isolated Stage-2 artifacts; exploration never touches registered paths."""
@@ -180,16 +244,21 @@ def materialize(config: dict, pilot: dict, hubert_local_path: Path,
     target_name = "speech_targets_explore_stage2" if explore else "speech_targets_stage2"
     normalizer_name = "explore_stage2_joint_ood_fold-0" if explore else "stage2_joint_ood_fold-0"
     split_path = output_root(config) / "splits" / "stage2_joint_ood_fold-0.csv"
+    split_contract_rebuild = named_artifact_split_is_stale(config, artifact_set, split_path)
+    effective_rebuild = rebuild or split_contract_rebuild
+    if split_contract_rebuild and not rebuild:
+        print("Stage2 split changed since existing named shards; rebuilding selected shards to preserve provenance.")
     for role in ("train", "validation", "test"):
         for dataset in ("ds004940", "ds006104"):
             build_eeg_shards(
                 config, dataset, "all", "all", None, None, None, "any", role,
-                "stage2_joint_ood", 0, not rebuild, False, artifact_set,
+                "stage2_joint_ood", 0, not effective_rebuild, False, artifact_set,
             )
     fit_normalizer(config, split_path, 0, False, artifact_set, normalizer_name)
     config["audio"]["content"]["hubert_local_path"] = str(hubert_local_path.resolve())
     cache_speech_targets(config, "all", None, True, False, artifact_set, target_name)
     status = artifact_status(config, pilot, artifact_set, bypass_m0_gates=explore)
+    status["rebuild_due_to_split_contract"] = split_contract_rebuild
     target = output_root(config) / "qc" / ("explore_stage2_artifacts.json" if explore else "stage2_artifacts.json")
     target.write_text(json.dumps(status, indent=2) + "\n")
     if status["status"] != "pass":

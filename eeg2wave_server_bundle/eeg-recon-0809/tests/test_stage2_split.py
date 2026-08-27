@@ -18,6 +18,22 @@ from eeg2speech.gates import registered_m0_gate_status
 
 
 class TestStage2Split(unittest.TestCase):
+    def test_declared_bad_channel_qc_is_applied_before_subject_selection(self):
+        frame = pd.DataFrame([
+            {"dataset": "ds004940", "bad_channels": '["A1", "A2"]'},
+            {"dataset": "ds004940", "bad_channels": '["A1", "A2", "A3"]'},
+            {"dataset": "ds006104", "bad_channels": "not-json"},
+        ])
+        config = {
+            "sources": {
+                "ds004940": {"channel_order": ["A1", "A2", "A3", "A4", "A5",
+                                                 "A6", "A7", "A8", "A9", "A10"]},
+                "ds006104": {"channel_order": ["C1", "C2", "C3", "C4"]},
+            },
+            "harmonized": {"interpolation": {"max_bad_fraction": 0.20}},
+        }
+        self.assertEqual(stage2.declared_channel_qc_mask(frame, config).tolist(), [True, False, False])
+
     def test_exact_assignment_counts(self):
         values=[f"g{i}" for i in range(40)]
         assigned=stage2.assign(values,{"train":28,"validation":6,"test":6},"test")
