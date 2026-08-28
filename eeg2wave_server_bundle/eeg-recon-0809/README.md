@@ -138,22 +138,60 @@ EXPLORE_8H_MAX_STEPS=2400 CHECKPOINT_EVERY=50 ./app/run_joint_explore_8h.sh
 ```
 
 这套实验使用独立的 `explore_stage2_8h_v1` 数据 artifacts 和
-`outputs/joint_pilot_v1/explore_8h_v1/` 结果目录，不读取旧实验的完成 checkpoint。
+`outputs/joint_pilot_v1/explore_8h_v1_corrected/` 结果目录，不读取旧实验的完成 checkpoint。
 所有训练、validation/test 评估完成后，runner 自动生成以下可复现对比图的 PNG 与
 PDF 版本：MFCC single-vs-joint、EEG counterfactual controls、content retrieval
-以及训练检索曲线。图、作图源 JSON 的 SHA256 和 subject-bootstrap 汇总保存在：
+以及训练检索曲线。它还会从第一个 seed 导出每个 dataset/role 最多 3 个**逐 trial
+音频对照包**：源 WAV、target-log-mel oracle、single/joint/zero/time/channel-control
+的诊断 WAV，以及 `energy_envelope_comparison`、`mel_comparison`、`mfcc_comparison`
+图。图、作图源 JSON 的 SHA256 和 subject-bootstrap 汇总保存在：
 
 ```text
-outputs/joint_pilot_v1/explore_8h_v1/generalization/figures/
+outputs/joint_pilot_v1/explore_8h_v1_corrected/generalization/figures/
 ```
 
 只需基于既有评估结果重新生成图片时运行：
 
 ```bash
 /opt/anaconda3/envs/eegvoice/bin/python app/plot_joint_comparison.py \
-  --input-root outputs/joint_pilot_v1/explore_8h_v1 \
+  --input-root outputs/joint_pilot_v1/explore_8h_v1_corrected \
   --seeds 31,47,73 --formats png,pdf --dpi 300
 ```
+
+已有 checkpoint 时，只生成参考项目同语义的逐 trial 音频/能量图，不重新训练：
+
+```bash
+# 用户已完成的第一套 8h exploratory 输出
+./app/run_joint_audio_pair_comparisons.sh \
+  outputs/joint_pilot_v1/explore_8h_v1
+
+# 指定新 run 的 root；默认 seed-31、两个 dataset、validation/test 各 3 个 pair。
+./app/run_joint_audio_pair_comparisons.sh \
+  outputs/joint_pilot_v1/explore_8h_v1_corrected
+```
+
+产物在：
+
+```text
+outputs/joint_pilot_v1/<experiment>/generalization/audio_pair_comparisons/
+  seed-31/<dataset>/<role>/<trial-id>/
+    00_source_reference_16k.wav
+    01_target_logmel_griffinlim_oracle.wav
+    02_single_eeg_mfcc_griffinlim.wav
+    03_joint_eeg_mfcc_griffinlim.wav
+    04_joint_zero_eeg_griffinlim.wav
+    05_joint_time_shuffled_eeg_griffinlim.wav
+    06_joint_channel_shuffled_eeg_griffinlim.wav
+    energy_envelope_comparison.png
+    mel_comparison.png
+    mfcc_comparison.png
+    metadata.json
+```
+
+当前项目还没有可验证的 neural vocoder，因此 `01`--`06` 是 renderer 预测的
+Slaney log-mel 经固定随机种子 Griffin--Lim 得到的**诊断 listening WAV**；它们不
+能作为 waveform 重建质量或主实验指标。DS006104 的 `candidate_filename_timing`
+pair 也在 metadata 中明确标为 candidate reference，而不是 verified acoustic pair。
 
 每个 mode/stage/seed 都写入一个原子 `training_state.pt`，包含 model、optimizer、
 step 和随机状态。中断最多损失最近一个 checkpoint interval 内的工作；已完成的

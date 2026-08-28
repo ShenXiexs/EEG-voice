@@ -3,10 +3,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# The shared helper supplies a default pilot config when sourced. Resolve this
+# runner's config before sourcing it, otherwise the helper's older default
+# silently wins and the 4/3/3 Stage-2 split is never used.
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -z "${PILOT_CONFIG+x}" ]]; then
+  PILOT_CONFIG="$PROJECT_ROOT/configs/joint_explore_8h_v1.yaml"
+fi
 source "$SCRIPT_DIR/lib/joint_pilot_common.sh"
 
-PILOT_CONFIG="${PILOT_CONFIG:-$PROJECT_ROOT/configs/joint_explore_8h_v1.yaml}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-explore_8h_v1}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-explore_8h_v1_corrected}"
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$RUN_ROOT/$EXPERIMENT_NAME}"
 MAX_STEPS="${EXPLORE_8H_MAX_STEPS:-2400}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-50}"
@@ -79,6 +85,23 @@ done
 SEED_CSV="$(IFS=,; echo "${SEEDS[*]}")"
 joint_run "$PYTHON_BIN" app/plot_joint_comparison.py --input-root "$EXPERIMENT_ROOT" \
   --seeds "$SEED_CSV" --formats png,pdf --dpi 300
+
+# Qualitative listening/energy bundles follow the reference project's pair
+# exports.  This only runs after every checkpoint and metric figure is present.
+# It can be disabled for a training-only overnight run with EXPORT_AUDIO_PAIRS=0.
+if [[ "${EXPORT_AUDIO_PAIRS:-1}" == "1" ]]; then
+  RENDERER_CHECKPOINT="${RENDERER_CHECKPOINT:-$RUN_ROOT/audio_renderer_explore/checkpoint.pt}"
+  AUDIO_PAIR_SEEDS="${AUDIO_PAIR_SEEDS:-${SEEDS[0]}}"
+  AUDIO_PAIR_MAX_PAIRS="${AUDIO_PAIR_MAX_PAIRS:-3}"
+  GRIFFIN_LIM_ITERATIONS="${GRIFFIN_LIM_ITERATIONS:-32}"
+  [[ -f "$RENDERER_CHECKPOINT" ]] || { echo "Missing audio renderer checkpoint: $RENDERER_CHECKPOINT" >&2; exit 2; }
+  joint_run "$PYTHON_BIN" app/export_audio_pair_comparisons.py \
+    --experiment-root "$EXPERIMENT_ROOT" \
+    --renderer-checkpoint "$RENDERER_CHECKPOINT" \
+    --seeds "$AUDIO_PAIR_SEEDS" \
+    --max-pairs "$AUDIO_PAIR_MAX_PAIRS" \
+    --griffin-lim-iterations "$GRIFFIN_LIM_ITERATIONS"
+fi
 
 echo "Explore 8h run complete. Outputs are exploratory, not registered evidence."
 echo "results=$EXPERIMENT_ROOT/generalization"

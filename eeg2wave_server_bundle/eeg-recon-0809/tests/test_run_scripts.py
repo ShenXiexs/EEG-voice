@@ -72,7 +72,11 @@ class TestRunScripts(unittest.TestCase):
         self.assertIn("--checkpoint-every", explore)
         self.assertIn("--output-root", explore)
         self.assertIn("plot_joint_comparison.py", explore)
+        self.assertIn("export_audio_pair_comparisons.py", explore)
+        self.assertIn("EXPORT_AUDIO_PAIRS", explore)
         self.assertNotIn("--stage overfit", explore)
+        self.assertIn('PILOT_CONFIG="$PROJECT_ROOT/configs/joint_explore_8h_v1.yaml"', explore)
+        self.assertIn("explore_8h_v1_corrected", explore)
 
     def test_atomic_training_state_and_contract_mismatch_detection(self):
         contract = {"mode": "joint", "seed": 31, "artifact_hashes": {"manifest": "abc"}}
