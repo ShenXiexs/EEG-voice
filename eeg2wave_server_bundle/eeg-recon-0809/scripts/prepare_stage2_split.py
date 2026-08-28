@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze the exact 4/1/1-subject x 28/6/6-content Stage-2 split."""
+"""Freeze an exact subject x content Stage-2 split from the pilot config."""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +19,37 @@ from prepare_training_data import (ROOT, build as build_eeg_shards, fit_normaliz
 sys.path.insert(0, str(ROOT / "app" / "src"))
 from eeg2speech.gates import registered_m0_gate_status, require_registered_m0_gates
 from cache_speech_targets import cache as cache_speech_targets
+
+
+def stage2_names(pilot: dict, explore: bool) -> dict[str, str]:
+    """Resolve isolated Stage-2 artifact names with backward-compatible defaults."""
+    spec = pilot.get("stage2", {})
+    protocol = str(spec.get("protocol", "stage2_joint_ood"))
+    if explore:
+        artifact_set = str(spec.get("explore_artifact_set", "explore_stage2"))
+        target_name = str(spec.get("explore_target_name", "speech_targets_explore_stage2"))
+        normalizer_name = str(spec.get("explore_normalizer_name", "explore_stage2_joint_ood_fold-0"))
+    else:
+        artifact_set = str(spec.get("artifact_set", "stage2"))
+        target_name = str(spec.get("target_name", "speech_targets_stage2"))
+        normalizer_name = str(spec.get("normalizer_name", "stage2_joint_ood_fold-0"))
+    values = {
+        "protocol": protocol,
+        "artifact_set": artifact_set,
+        "target_name": target_name,
+        "normalizer_name": normalizer_name,
+        "assignment_name": str(spec.get(
+            "assignment_name", "stage2_assignment" if protocol == "stage2_joint_ood" else f"{protocol}_assignment"
+        )),
+        "split_report_name": str(spec.get(
+            "split_report_name", "stage2_split" if protocol == "stage2_joint_ood" else f"{protocol}_split"
+        )),
+    }
+    import re
+    for key, value in values.items():
+        if not re.fullmatch(r"[a-z0-9_-]+", value):
+            raise ValueError(f"unsafe Stage-2 {key}: {value!r}")
+    return values
 
 
 def stable(value: str) -> str:
@@ -76,6 +107,8 @@ def declared_channel_qc_mask(frame: pd.DataFrame, config: dict) -> pd.Series:
 
 def build(data_config: Path, pilot_config: Path) -> Path:
     config, _ = load_config(data_config); pilot = yaml.safe_load(pilot_config.read_text())
+    names = stage2_names(pilot, explore=True)
+    protocol = names["protocol"]
     root = output_root(config); frame = pd.read_csv(root / "manifests" / "manifest_all.csv", keep_default_na=False, low_memory=False)
     lock = json.loads((root / "source_lock.json").read_text()); p = pilot["pilot"]
     subject_counts = {key:int(value) for key,value in p["generalization_subjects_by_role"].items()}
@@ -128,7 +161,7 @@ def build(data_config: Path, pilot_config: Path) -> Path:
                 role,reason="excluded","stage2_cross_quadrant"
             else:
                 role,reason=subject_role,""
-            records.append({"trial_id":row.trial_id,"protocol":"stage2_joint_ood","fold":0,"role":role,
+            records.append({"trial_id":row.trial_id,"protocol":protocol,"fold":0,"role":role,
                             "exclusion_reason":reason,"subject_group":f"{dataset}:{row.subject}",
                             "subject_fold":"","subject_group_trial_weight":"","subject_sort_position":"",
                             "audio_group":group,"linguistic_content_group":group,
@@ -172,27 +205,24 @@ def build(data_config: Path, pilot_config: Path) -> Path:
                 if len(label) != expected_label or label.groupby(["subject_group", "linguistic_content_group"]).size().ne(1).any():
                     raise RuntimeError(f"Stage2 {dataset} {role} label grid is {len(label)}, expected {expected_label}")
     prehash=sha256_bytes(result.to_csv(index=False).encode()); result["split_csv_sha256"]=prehash
-    target=root/"splits"/"stage2_joint_ood_fold-0.csv"; result.to_csv(target,index=False)
+    target=root/"splits"/f"{protocol}_fold-0.csv"; result.to_csv(target,index=False)
     assignment["split_csv_sha256"]=sha256_bytes(target.read_bytes()); assignment["assignment_sha256"]=sha256_bytes(stable_json(assignment))
-    (root/"splits"/"stage2_assignment.json").write_text(json.dumps(assignment,indent=2,sort_keys=True)+"\n")
+    (root/"splits"/f"{names['assignment_name']}.json").write_text(json.dumps(assignment,indent=2,sort_keys=True)+"\n")
     summary=result.groupby([result.trial_id.str.split("-").str[0],"supervision_axis","role"]).size().to_dict()
     report={"status":"pass","split":str(target),"counts":{"|".join(key):int(value) for key,value in summary.items()},"assignment_sha256":assignment["assignment_sha256"]}
-    (root/"qc"/"stage2_split.json").write_text(json.dumps(report,indent=2)+"\n"); print(json.dumps(report,indent=2)); return target
+    (root/"qc"/f"{names['split_report_name']}.json").write_text(json.dumps(report,indent=2)+"\n"); print(json.dumps(report,indent=2)); return target
 
 
 def artifact_status(config: dict, pilot: dict, artifact_set: str = "stage2",
                     bypass_m0_gates: bool = False) -> dict:
     root = output_root(config)
-    split_path = root / "splits" / "stage2_joint_ood_fold-0.csv"
-    if artifact_set not in {"stage2", "explore_stage2"}:
+    expected = stage2_names(pilot, explore=bypass_m0_gates)
+    split_path = root / "splits" / f"{expected['protocol']}_fold-0.csv"
+    if artifact_set != expected["artifact_set"]:
         raise ValueError(f"unsupported Stage-2 artifact set: {artifact_set}")
     manifest_path = root / "manifests" / f"manifest_{artifact_set}.csv"
-    normalizer_path = root / "normalizers" / (
-        "stage2_joint_ood_fold-0.json" if artifact_set == "stage2" else "explore_stage2_joint_ood_fold-0.json"
-    )
-    target_path = root / "speech_targets" / (
-        "speech_targets_stage2.h5" if artifact_set == "stage2" else "speech_targets_explore_stage2.h5"
-    )
+    normalizer_path = root / "normalizers" / f"{expected['normalizer_name']}.json"
+    target_path = root / "speech_targets" / f"{expected['target_name']}.h5"
     missing_paths = [str(path) for path in (split_path, manifest_path, normalizer_path, target_path) if not path.exists()]
     missing_trials: list[str] = []
     unexpected_trials: list[str] = []
@@ -240,10 +270,12 @@ def materialize(config: dict, pilot: dict, hubert_local_path: Path,
     """Build isolated Stage-2 artifacts; exploration never touches registered paths."""
     if not explore:
         require_registered_m0_gates(ROOT, pilot)
-    artifact_set = "explore_stage2" if explore else "stage2"
-    target_name = "speech_targets_explore_stage2" if explore else "speech_targets_stage2"
-    normalizer_name = "explore_stage2_joint_ood_fold-0" if explore else "stage2_joint_ood_fold-0"
-    split_path = output_root(config) / "splits" / "stage2_joint_ood_fold-0.csv"
+    names = stage2_names(pilot, explore)
+    artifact_set = names["artifact_set"]
+    target_name = names["target_name"]
+    normalizer_name = names["normalizer_name"]
+    protocol = names["protocol"]
+    split_path = output_root(config) / "splits" / f"{protocol}_fold-0.csv"
     split_contract_rebuild = named_artifact_split_is_stale(config, artifact_set, split_path)
     effective_rebuild = rebuild or split_contract_rebuild
     if split_contract_rebuild and not rebuild:
@@ -252,14 +284,14 @@ def materialize(config: dict, pilot: dict, hubert_local_path: Path,
         for dataset in ("ds004940", "ds006104"):
             build_eeg_shards(
                 config, dataset, "all", "all", None, None, None, "any", role,
-                "stage2_joint_ood", 0, not effective_rebuild, False, artifact_set,
+                protocol, 0, not effective_rebuild, False, artifact_set,
             )
     fit_normalizer(config, split_path, 0, False, artifact_set, normalizer_name)
     config["audio"]["content"]["hubert_local_path"] = str(hubert_local_path.resolve())
     cache_speech_targets(config, "all", None, True, False, artifact_set, target_name)
     status = artifact_status(config, pilot, artifact_set, bypass_m0_gates=explore)
     status["rebuild_due_to_split_contract"] = split_contract_rebuild
-    target = output_root(config) / "qc" / ("explore_stage2_artifacts.json" if explore else "stage2_artifacts.json")
+    target = output_root(config) / "qc" / f"{artifact_set}_artifacts.json"
     target.write_text(json.dumps(status, indent=2) + "\n")
     if status["status"] != "pass":
         raise RuntimeError(f"Stage2 artifact materialization did not pass readiness: {status}")
@@ -282,7 +314,8 @@ def main() -> int:
             parser.error("--materialize requires --hubert-local-path; implicit model download is forbidden")
         print(json.dumps(materialize(config,pilot,args.hubert_local_path,args.explore,args.rebuild),indent=2))
     if args.check_readiness:
-        status=artifact_status(config,pilot,"explore_stage2" if args.explore else "stage2",args.explore); print(json.dumps(status,indent=2))
+        names=stage2_names(pilot,args.explore)
+        status=artifact_status(config,pilot,names["artifact_set"],args.explore); print(json.dumps(status,indent=2))
         return 0 if status["status"]=="pass" else 2
     return 0
 

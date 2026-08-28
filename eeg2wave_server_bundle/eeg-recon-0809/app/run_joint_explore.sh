@@ -51,6 +51,10 @@ if [[ "${EXPLORE_FROM:-start}" != "overfit" ]]; then
 fi
 
 IFS=' ' read -r -a SEEDS <<< "${EXPLORE_SEEDS:-$(pilot_seeds)}"
+STAGE2_MAX_STEPS="${EXPLORE_STAGE2_MAX_STEPS:-${EXPLORE_MAX_STEPS:-}}"
+if [[ -n "$STAGE2_MAX_STEPS" ]]; then
+  echo "Explore Stage-2 per-run step budget: $STAGE2_MAX_STEPS"
+fi
 for mode in ds004940 ds006104 joint; do
   for seed in "${SEEDS[@]}"; do
     TRAIN_ARGS=(--config "$PILOT_CONFIG" --mode "$mode" --stage overfit --seed "$seed" --explore)
@@ -76,7 +80,7 @@ joint_run "$PYTHON_BIN" scripts/prepare_stage2_split.py --data-config "$DATA_CON
 for mode in ds004940 ds006104 joint; do
   for seed in "${SEEDS[@]}"; do
     TRAIN_ARGS=(--config "$PILOT_CONFIG" --mode "$mode" --stage generalization --seed "$seed" --explore)
-    if [[ -n "${EXPLORE_MAX_STEPS:-}" ]]; then TRAIN_ARGS+=(--max-steps "$EXPLORE_MAX_STEPS"); fi
+    if [[ -n "$STAGE2_MAX_STEPS" ]]; then TRAIN_ARGS+=(--max-steps "$STAGE2_MAX_STEPS"); fi
     if [[ -n "${CHECKPOINT_EVERY:-}" ]]; then TRAIN_ARGS+=(--checkpoint-every "$CHECKPOINT_EVERY"); fi
     joint_run "$PYTHON_BIN" app/train_joint.py "${TRAIN_ARGS[@]}"
     CHECKPOINT="$RUN_ROOT/explore/generalization/$mode/seed-$seed/checkpoint.pt"

@@ -118,6 +118,41 @@ EXPLORE_FROM=overfit ./app/run_joint_explore.sh
 
 # 训练每 10 个完整 optimizer step 保存一次；Ctrl-C 后重跑相同命令会自动续跑。
 EXPLORE_FROM=overfit CHECKPOINT_EVERY=10 ./app/run_joint_explore.sh
+
+# 只限制尚未开始的 Stage 2 run；M0 和当前已完成/续跑的 Stage 2 checkpoint 不受影响。
+EXPLORE_FROM=overfit EXPLORE_STAGE2_MAX_STEPS=2700 CHECKPOINT_EVERY=50 ./app/run_joint_explore.sh
+```
+
+如果需要在普通 Mac 上用一个晚上完成一套新的、相互隔离的 Stage-2 比较实验，使用
+8 小时 runner。它只运行本问题真正需要比较的 3 种模式
+（DS004940-only、DS006104-only、joint）× 3 seeds，不重复 M0；默认每个 run
+2,400 optimizer steps。预估训练约 5.5 小时，并为预处理、评估和制图保留约
+2 小时。实际速度取决于机器与当前负载。
+
+```bash
+# 首次运行；Ctrl-C 后原样重跑即从最近 checkpoint 继续
+./app/run_joint_explore_8h.sh
+
+# 明确写出默认预算；可在更慢机器上继续调低 EXPLORE_8H_MAX_STEPS
+EXPLORE_8H_MAX_STEPS=2400 CHECKPOINT_EVERY=50 ./app/run_joint_explore_8h.sh
+```
+
+这套实验使用独立的 `explore_stage2_8h_v1` 数据 artifacts 和
+`outputs/joint_pilot_v1/explore_8h_v1/` 结果目录，不读取旧实验的完成 checkpoint。
+所有训练、validation/test 评估完成后，runner 自动生成以下可复现对比图的 PNG 与
+PDF 版本：MFCC single-vs-joint、EEG counterfactual controls、content retrieval
+以及训练检索曲线。图、作图源 JSON 的 SHA256 和 subject-bootstrap 汇总保存在：
+
+```text
+outputs/joint_pilot_v1/explore_8h_v1/generalization/figures/
+```
+
+只需基于既有评估结果重新生成图片时运行：
+
+```bash
+/opt/anaconda3/envs/eegvoice/bin/python app/plot_joint_comparison.py \
+  --input-root outputs/joint_pilot_v1/explore_8h_v1 \
+  --seeds 31,47,73 --formats png,pdf --dpi 300
 ```
 
 每个 mode/stage/seed 都写入一个原子 `training_state.pt`，包含 model、optimizer、

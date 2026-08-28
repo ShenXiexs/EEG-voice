@@ -48,6 +48,15 @@ def runtime_code_sha256() -> str:
     return digest.hexdigest()
 
 
+def model_code_sha256() -> str:
+    """Fingerprint model/data/loss semantics, excluding training control flow."""
+    digest = hashlib.sha256()
+    paths = sorted((APP / "src").rglob("*.py"), key=lambda path: str(path))
+    for path in paths:
+        digest.update(str(path.relative_to(ROOT)).encode()); digest.update(sha256_file(path).encode())
+    return digest.hexdigest()
+
+
 def stable_sha256(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -77,14 +86,52 @@ def resume_contract(*, args: argparse.Namespace, cfg: dict, artifact_hashes: dic
         "target_name": target_name, "normalizer_name": normalizer_name,
         "model_config_sha256": stable_sha256(cfg["model"]),
         "pilot_config_sha256": sha256_file(args.config),
-        "runtime_code_sha256": runtime_code_sha256(),
+        "model_code_sha256": model_code_sha256(),
         "source_lock_sha256": source_lock["source_lock_sha256"],
         "artifact_hashes": artifact_hashes,
     }
 
 
-def contract_mismatches(saved: dict, current: dict) -> list[str]:
-    return [key for key in sorted(set(saved) | set(current)) if saved.get(key) != current.get(key)]
+def contract_mismatches(saved: dict, current: dict, *, allow_legacy_explore_control_upgrade: bool = False) -> list[str]:
+    """Compare semantic checkpoint inputs without invalidating control-plane upgrades.
+
+    Checkpoints created before resumability existed used one hash for both the
+    model and train_joint.py.  A change to checkpoint cadence then made every
+    completed exploratory run look incompatible.  Legacy explore artifacts may
+    migrate only if every non-code input remains identical. Formal pilot runs
+    stay strict until they have the model-only fingerprint.
+    """
+    code_keys = {"runtime_code_sha256", "model_code_sha256"}
+    changed = [key for key in sorted((set(saved) | set(current)) - code_keys)
+               if saved.get(key) != current.get(key)]
+    if changed:
+        return changed
+    saved_model = saved.get("model_code_sha256")
+    if saved_model:
+        return ([] if saved_model == current.get("model_code_sha256") else ["model_code_sha256"])
+    # A code-less contract is useful in focused unit tests and is not a
+    # persisted legacy checkpoint.  Only a saved runtime fingerprint denotes
+    # the pre-migration checkpoint format handled below.
+    if "runtime_code_sha256" not in saved:
+        return []
+    if allow_legacy_explore_control_upgrade and saved.get("run_kind") == "explore":
+        return []
+    return ["legacy_runtime_code_sha256"]
+
+
+def resume_maximum_steps(requested: int, state: dict) -> tuple[int, bool]:
+    """Do not truncate an already-started run when a later budget is smaller.
+
+    A lower max-steps value is a budget for future runs. A partial checkpoint
+    must retain its original finish line, otherwise the runner could label an
+    incomplete model as completed merely because its new budget is below the
+    saved step count.
+    """
+    completed = int(state.get("completed_steps", 0))
+    original = int(state.get("maximum_steps", requested))
+    if completed < 0 or original < completed:
+        raise RuntimeError(f"partial checkpoint has invalid completed_steps={completed} / maximum_steps={original}")
+    return (original, True) if completed > requested else (requested, False)
 
 
 def device() -> torch.device:
@@ -171,6 +218,8 @@ def main() -> int:
                         help="bypass scientific gates and write only outputs/.../explore artifacts")
     parser.add_argument("--checkpoint-every", type=int,
                         help="write an atomic resumable state after this many optimizer steps")
+    parser.add_argument("--output-root", type=Path,
+                        help="isolated checkpoint root; defaults to outputs/joint_pilot_v1/<run-kind>")
     parser.add_argument("--restart", action="store_true",
                         help="ignore a compatible partial/final checkpoint and train this run from step 1")
     args = parser.parse_args()
@@ -189,20 +238,34 @@ def main() -> int:
         raise RuntimeError("Stage 0 audit gate failed: expected 17,489 and 10,888 included trials")
     if args.stage == "generalization" and not args.explore and bool(cfg["training"].get("stage2_requires_all_m0_gates", True)):
         require_registered_m0_gates(ROOT, cfg)
-    split_protocol = cfg["split"]["protocol"] if args.stage == "overfit" else "stage2_joint_ood"
+    stage2 = cfg.get("stage2", {})
+    split_protocol = cfg["split"]["protocol"] if args.stage == "overfit" else str(
+        stage2.get("protocol", "stage2_joint_ood")
+    )
     split_path = artifact_root / "splits" / f"{split_protocol}_fold-{cfg['split']['fold']}.csv"
-    artifact_set = ("explore_m0" if args.explore else "built") if args.stage == "overfit" else (
-        "explore_stage2" if args.explore else "stage2"
-    )
+    if args.stage == "overfit":
+        artifact_set = "explore_m0" if args.explore else "built"
+    else:
+        artifact_set = str(stage2.get(
+            "explore_artifact_set" if args.explore else "artifact_set",
+            "explore_stage2" if args.explore else "stage2",
+        ))
     manifest_path = artifact_root / "manifests" / f"manifest_{artifact_set}.csv"
-    target_name = ("speech_targets_explore_m0" if args.explore else "speech_targets") if args.stage == "overfit" else (
-        "speech_targets_explore_stage2" if args.explore else "speech_targets_stage2"
-    )
+    if args.stage == "overfit":
+        target_name = "speech_targets_explore_m0" if args.explore else "speech_targets"
+    else:
+        target_name = str(stage2.get(
+            "explore_target_name" if args.explore else "target_name",
+            "speech_targets_explore_stage2" if args.explore else "speech_targets_stage2",
+        ))
     target_path = artifact_root / "speech_targets" / f"{target_name}.h5"
-    normalizer_name = (
-        f"explore_m0_{split_path.stem}" if args.stage == "overfit" and args.explore
-        else (split_path.stem if args.stage == "overfit" or not args.explore else "explore_stage2_joint_ood_fold-0")
-    )
+    if args.stage == "overfit":
+        normalizer_name = f"explore_m0_{split_path.stem}" if args.explore else split_path.stem
+    else:
+        normalizer_name = str(stage2.get(
+            "explore_normalizer_name" if args.explore else "normalizer_name",
+            "explore_stage2_joint_ood_fold-0" if args.explore else "stage2_joint_ood_fold-0",
+        ))
     normalizer_path = artifact_root / "normalizers" / f"{normalizer_name}.json"
     source_lock_path = artifact_root / "source_lock.json"
     validation_path = artifact_root / "qc" / "validate.json"
@@ -225,7 +288,8 @@ def main() -> int:
     artifact_hashes = {path.name: sha256_file(path) for path in
                        (source_lock_path, split_path, manifest_path, target_path, normalizer_path)}
     run_kind = "smoke" if args.smoke_model else ("explore" if args.explore else "pilot")
-    checkpoint_dir = ROOT / "outputs" / "joint_pilot_v1" / run_kind / args.stage / args.mode / f"seed-{args.seed}"
+    checkpoint_root = resolve(args.output_root, ROOT) if args.output_root else ROOT / "outputs" / "joint_pilot_v1" / run_kind
+    checkpoint_dir = checkpoint_root / args.stage / args.mode / f"seed-{args.seed}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     state_path = checkpoint_dir / "training_state.pt"
     final_checkpoint_path = checkpoint_dir / "checkpoint.pt"
@@ -237,7 +301,9 @@ def main() -> int:
         completed = torch.load(final_checkpoint_path, map_location="cpu", weights_only=False)
         saved_contract = completed.get("resume_contract")
         if saved_contract:
-            changed = contract_mismatches(saved_contract, current_contract)
+            changed = contract_mismatches(
+                saved_contract, current_contract, allow_legacy_explore_control_upgrade=args.explore,
+            )
             if changed:
                 raise RuntimeError("existing completed checkpoint is incompatible with this run: "
                                    f"{changed}; use --restart to deliberately replace it")
@@ -335,13 +401,15 @@ def main() -> int:
 
     if state_path.exists() and not args.restart:
         previous = torch.load(state_path, map_location="cpu", weights_only=False)
-        changed = contract_mismatches(previous.get("resume_contract", {}), current_contract)
+        changed = contract_mismatches(
+            previous.get("resume_contract", {}), current_contract,
+            allow_legacy_explore_control_upgrade=args.explore,
+        )
         if changed:
             raise RuntimeError("partial checkpoint is incompatible with this run: "
                                f"{changed}; use --restart to deliberately discard its progress")
+        maximum, preserved_original_maximum = resume_maximum_steps(maximum, previous)
         completed_steps = int(previous.get("completed_steps", 0))
-        if completed_steps < 0 or completed_steps > maximum:
-            raise RuntimeError(f"partial checkpoint has invalid completed_steps={completed_steps} for max_steps={maximum}")
         model.load_state_dict(previous["model"])
         optimizer.load_state_dict(previous["optimizer"])
         optimizer_to(optimizer, device())
@@ -359,7 +427,8 @@ def main() -> int:
         if torch.cuda.is_available() and previous.get("cuda_rng_state_all") is not None:
             torch.cuda.set_rng_state_all(previous["cuda_rng_state_all"])
         print(json.dumps({"status": "resumed", "state": str(state_path),
-                          "completed_steps": completed_steps, "maximum_steps": maximum}))
+                          "completed_steps": completed_steps, "maximum_steps": maximum,
+                          "original_maximum_preserved": preserved_original_maximum}))
 
     stop_requested: list[int | None] = [None]
 
@@ -432,7 +501,8 @@ def main() -> int:
         "artifact_set": artifact_set, "target_name": target_name, "normalizer_name": normalizer_name,
         "selections": selections, "source_lock_sha256": source_lock["source_lock_sha256"],
         "preprocess_config_sha256": source_lock["config_sha256"],
-        "runtime_code_sha256": runtime_code_sha256(), "phoneme_vocabulary": vocabulary,
+        "runtime_code_sha256": runtime_code_sha256(), "model_code_sha256": model_code_sha256(),
+        "phoneme_vocabulary": vocabulary,
         "artifact_hashes": artifact_hashes, "resume_contract": current_contract,
         "steps_completed": completed_steps,
     }

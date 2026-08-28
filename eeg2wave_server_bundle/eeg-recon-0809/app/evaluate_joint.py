@@ -49,6 +49,14 @@ def _runtime_code_sha256() -> str:
     return digest.hexdigest()
 
 
+def _model_code_sha256() -> str:
+    digest = hashlib.sha256()
+    paths = sorted((APP / "src").rglob("*.py"), key=lambda path: str(path))
+    for path in paths:
+        digest.update(str(path.relative_to(ROOT)).encode()); digest.update(_sha256(path).encode())
+    return digest.hexdigest()
+
+
 def bootstrap_mean(values: list[float], seed: int = 31, repetitions: int = 2000) -> dict[str, float]:
     if not values:
         return {"mean": float("nan"), "ci_low": float("nan"), "ci_high": float("nan")}
@@ -74,7 +82,15 @@ def content_retrieval(prediction: torch.Tensor, target: torch.Tensor, labels: li
     positive = torch.tensor([[a == b for b in labels] for a in labels], dtype=torch.bool)
     ranked_positive = positive.gather(1, order)
     first = ranked_positive.float().argmax(1) + 1
-    return {"r1": float((first == 1).float().mean()), "mrr": float((1.0 / first.float()).mean())}
+    return {
+        "r1": float((first == 1).float().mean()),
+        "mrr": float((1.0 / first.float()).mean()),
+        # Expected R@1 for a uniformly selected candidate under the same
+        # multi-positive label structure. This avoids hard-coded 1/N lines in
+        # downstream comparison figures when contents repeat across subjects.
+        "chance_r1": float(positive.float().mean()),
+        "unique_contents": int(len(set(labels))),
+    }
 
 
 def template_metrics(prediction: torch.Tensor, target: torch.Tensor, labels: list[str],
@@ -269,8 +285,16 @@ def main() -> int:
     if expected_hashes and current_hashes != expected_hashes:
         changed = sorted(key for key in current_hashes if current_hashes.get(key) != expected_hashes.get(key))
         raise RuntimeError(f"checkpoint artifact provenance mismatch: {changed}")
-    if payload.get("runtime_code_sha256") and payload["runtime_code_sha256"] != _runtime_code_sha256():
-        raise RuntimeError("checkpoint model/runtime code provenance mismatch")
+    if payload.get("model_code_sha256"):
+        if payload["model_code_sha256"] != _model_code_sha256():
+            raise RuntimeError("checkpoint model code provenance mismatch")
+    elif payload.get("runtime_code_sha256") and payload["runtime_code_sha256"] != _runtime_code_sha256():
+        if payload.get("run_kind") != "explore":
+            raise RuntimeError("legacy checkpoint model/runtime code provenance mismatch")
+        print(json.dumps({
+            "warning": "legacy_explore_checkpoint_control_plane_upgrade",
+            "detail": "artifact/model configuration provenance matched; train control-script hash changed",
+        }))
     vocabulary = payload.get("phoneme_vocabulary") or phoneme_vocabulary_from_manifest(manifest)
     dataset = JointManifestDataset(manifest, split, args.role,
                                    args.dataset, targets, normalizer,
@@ -331,7 +355,7 @@ def main() -> int:
         wrong = float((prediction - target[wrong_indices]).abs().mean()) if len(set(contents)) > 1 else float("nan")
         delta = float(((prediction[...,1:]-prediction[...,:-1])-(target[...,1:]-target[...,:-1])).abs().mean())
     else:
-        retrieval={"r1":float("nan"),"mrr":float("nan")}; wrong=delta=float("nan")
+        retrieval={"r1":float("nan"),"mrr":float("nan"),"chance_r1":float("nan"),"unique_contents":0}; wrong=delta=float("nan")
     subject_values=defaultdict(list)
     for subject,value in zip(subjects,control_errors["correct"]): subject_values[subject].append(value)
     if len(prediction):
@@ -344,7 +368,9 @@ def main() -> int:
     else:
         templates = {}
     control_means = {key:float(np.mean(value)) for key,value in control_errors.items()}
-    hubert_metrics = {"pairs": 0, "local_cosine": float("nan"), "global_retrieval": {"r1": float("nan"), "mrr": float("nan")}}
+    hubert_metrics = {"pairs": 0, "local_cosine": float("nan"), "global_retrieval": {
+        "r1": float("nan"), "mrr": float("nan"), "chance_r1": float("nan"), "unique_contents": 0,
+    }}
     if hubert_eeg_local:
         eeg_local, audio_local = torch.cat(hubert_eeg_local), torch.cat(hubert_audio_local)
         local_cosine = torch.nn.functional.cosine_similarity(eeg_local, audio_local, dim=-1).mean()

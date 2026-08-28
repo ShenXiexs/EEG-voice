@@ -13,6 +13,14 @@ evaluate=importlib.util.module_from_spec(spec); spec.loader.exec_module(evaluate
 
 
 class TestEvaluationContracts(unittest.TestCase):
+    def test_retrieval_reports_multi_positive_chance(self):
+        prediction=torch.eye(4)
+        target=torch.eye(4)
+        result=evaluate.content_retrieval(prediction,target,["a","a","b","b"])
+        self.assertEqual(result["r1"],1.0)
+        self.assertEqual(result["unique_contents"],2)
+        self.assertEqual(result["chance_r1"],0.5)
+
     def test_registered_dataset_mean_gate_does_not_require_degenerate_same_content(self):
         target=torch.stack([torch.zeros(2,3),torch.zeros(2,3),torch.ones(2,3),torch.ones(2,3)])
         prediction=target.clone()

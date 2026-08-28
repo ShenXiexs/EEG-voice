@@ -62,6 +62,17 @@ class TestRunScripts(unittest.TestCase):
         self.assertIn("$RUN_ROOT/explore", explore)
         self.assertIn("--explore --materialize", explore)
         self.assertIn("--checkpoint-every", explore)
+        self.assertIn("EXPLORE_STAGE2_MAX_STEPS", explore)
+
+    def test_eight_hour_runner_is_isolated_resumable_and_renders_figures(self):
+        explore = (ROOT / "app/run_joint_explore_8h.sh").read_text()
+        self.assertIn("joint_explore_8h_v1.yaml", explore)
+        self.assertIn("explore_8h_v1", explore)
+        self.assertIn("EXPLORE_8H_MAX_STEPS", explore)
+        self.assertIn("--checkpoint-every", explore)
+        self.assertIn("--output-root", explore)
+        self.assertIn("plot_joint_comparison.py", explore)
+        self.assertNotIn("--stage overfit", explore)
 
     def test_atomic_training_state_and_contract_mismatch_detection(self):
         contract = {"mode": "joint", "seed": 31, "artifact_hashes": {"manifest": "abc"}}
@@ -74,6 +85,26 @@ class TestRunScripts(unittest.TestCase):
             self.assertTrue(target.exists())
             self.assertFalse(target.with_suffix(".pt.tmp").exists())
             self.assertEqual(torch.load(target, map_location="cpu", weights_only=False)["completed_steps"], 25)
+
+    def test_legacy_explore_contract_allows_only_control_plane_upgrade(self):
+        legacy = {"mode": "joint", "run_kind": "explore", "artifact_hashes": {"manifest": "abc"},
+                  "runtime_code_sha256": "old-control-and-model-code"}
+        migrated = {"mode": "joint", "run_kind": "explore", "artifact_hashes": {"manifest": "abc"},
+                    "model_code_sha256": "model-code"}
+        self.assertEqual(train.contract_mismatches(
+            legacy, migrated, allow_legacy_explore_control_upgrade=True,
+        ), [])
+        changed_artifact = dict(migrated); changed_artifact["artifact_hashes"] = {"manifest": "changed"}
+        self.assertEqual(train.contract_mismatches(
+            legacy, changed_artifact, allow_legacy_explore_control_upgrade=True,
+        ), ["artifact_hashes"])
+        self.assertEqual(train.contract_mismatches(legacy, migrated), ["legacy_runtime_code_sha256"])
+
+    def test_resume_keeps_original_finish_line_when_new_budget_is_smaller(self):
+        self.assertEqual(train.resume_maximum_steps(2700, {"completed_steps": 4050, "maximum_steps": 5000}), (5000, True))
+        self.assertEqual(train.resume_maximum_steps(5000, {"completed_steps": 2500, "maximum_steps": 2700}), (5000, False))
+        with self.assertRaisesRegex(RuntimeError, "invalid completed_steps"):
+            train.resume_maximum_steps(5000, {"completed_steps": 8, "maximum_steps": 7})
 
 
 if __name__ == "__main__":

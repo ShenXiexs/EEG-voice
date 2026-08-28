@@ -18,6 +18,16 @@ from eeg2speech.gates import registered_m0_gate_status
 
 
 class TestStage2Split(unittest.TestCase):
+    def test_custom_explore_names_are_isolated(self):
+        pilot={"stage2":{"protocol":"stage2_joint_ood_explore_8h_v1",
+                         "explore_artifact_set":"explore_stage2_8h_v1",
+                         "explore_target_name":"speech_targets_explore_stage2_8h_v1",
+                         "explore_normalizer_name":"explore_stage2_8h_v1_joint_ood_fold-0"}}
+        names=stage2.stage2_names(pilot,True)
+        self.assertEqual(names["protocol"],"stage2_joint_ood_explore_8h_v1")
+        self.assertEqual(names["artifact_set"],"explore_stage2_8h_v1")
+        self.assertNotEqual(names["artifact_set"],"explore_stage2")
+
     def test_declared_bad_channel_qc_is_applied_before_subject_selection(self):
         frame = pd.DataFrame([
             {"dataset": "ds004940", "bad_channels": '["A1", "A2"]'},
