@@ -40,6 +40,11 @@ class TestAudioPairExport(unittest.TestCase):
         self.assertIn("time_shuffle", exporter.WAV_NAMES)
         self.assertIn("channel_shuffle", exporter.WAV_NAMES)
 
+    def test_single_only_layout_does_not_claim_a_joint_model(self):
+        self.assertEqual(exporter.SINGLE_ONLY_WAV_NAMES["single"], "02_ds004940_eeg_mfcc_griffinlim.wav")
+        self.assertNotIn("joint", " ".join(exporter.SINGLE_ONLY_WAV_NAMES.values()))
+        self.assertEqual(exporter.SINGLE_ONLY_DISPLAY["single"], "DS004940 EEG")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,13 @@ WAV_NAMES = {
     "time_shuffle": "05_joint_time_shuffled_eeg_griffinlim.wav",
     "channel_shuffle": "06_joint_channel_shuffled_eeg_griffinlim.wav",
 }
+SINGLE_ONLY_WAV_NAMES = {
+    "target": "01_target_logmel_griffinlim_oracle.wav",
+    "single": "02_ds004940_eeg_mfcc_griffinlim.wav",
+    "zero": "03_zero_eeg_griffinlim.wav",
+    "time_shuffle": "04_time_shuffled_eeg_griffinlim.wav",
+    "channel_shuffle": "05_channel_shuffled_eeg_griffinlim.wav",
+}
 DISPLAY = {
     "target": "Target log-mel oracle",
     "single": "Single-dataset EEG",
@@ -57,6 +64,13 @@ DISPLAY = {
     "zero": "Joint zero EEG",
     "time_shuffle": "Joint time-shuffled EEG",
     "channel_shuffle": "Joint channel-shuffled EEG",
+}
+SINGLE_ONLY_DISPLAY = {
+    "target": "Target log-mel oracle",
+    "single": "DS004940 EEG",
+    "zero": "Zero EEG",
+    "time_shuffle": "Time-shuffled EEG",
+    "channel_shuffle": "Channel-shuffled EEG",
 }
 
 
@@ -165,21 +179,22 @@ def _plot_matrix_rows(output: Path, stem: str, rows: list[tuple[str, np.ndarray]
 
 
 def _plot_energy(output: Path, target_rms: np.ndarray, target_activity: np.ndarray,
-                 renderer_states: dict[str, RendererState]) -> None:
+                 renderer_states: dict[str, RendererState], display: dict[str, str]) -> None:
     figure, axes = plt.subplots(2, 1, figsize=(7.2, 4.9), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     x = np.linspace(0.0, 1.0, MEL_FRAMES)
     axes[0].plot(x, target_rms, color="#222222", linewidth=1.7, label="Target waveform RMS")
-    style = {"single": COLORS["single"], "joint": COLORS["joint"], "zero": COLORS["zero"],
-             "time_shuffle": COLORS["time_shuffle"], "channel_shuffle": COLORS["channel_shuffle"]}
+    colors = {"single": COLORS["single"], "joint": COLORS["joint"], "zero": COLORS["zero"],
+              "time_shuffle": COLORS["time_shuffle"], "channel_shuffle": COLORS["channel_shuffle"]}
+    style = {key: colors[key] for key in renderer_states if key in colors}
     for key, color in style.items():
         axes[0].plot(x, renderer_states[key].rms.squeeze().detach().cpu().numpy(), color=color,
-                     linewidth=1.15, alpha=0.95, label=DISPLAY[key])
+                     linewidth=1.15, alpha=0.95, label=display[key])
     axes[0].set_ylabel("frame RMS")
     axes[0].legend(loc="upper right", ncol=2, frameon=False)
     axes[1].step(x, target_activity.astype(float), where="mid", color="#222222", linewidth=1.7, label="Target activity")
     for key, color in style.items():
         axes[1].plot(x, torch.sigmoid(renderer_states[key].activity_logits.squeeze()).detach().cpu().numpy(),
-                     color=color, linewidth=1.15, alpha=0.95, label=DISPLAY[key])
+                     color=color, linewidth=1.15, alpha=0.95, label=display[key])
     axes[1].set_ylabel("activity")
     axes[1].set_xlabel("relative acoustic time")
     axes[1].set_ylim(-0.05, 1.05)
@@ -187,14 +202,15 @@ def _plot_energy(output: Path, target_rms: np.ndarray, target_activity: np.ndarr
 
 
 def _plot_bundle(output: Path, batch: dict[str, Any], predicted: dict[str, torch.Tensor],
-                 renderer_states: dict[str, RendererState]) -> None:
+                 renderer_states: dict[str, RendererState], *, single_only: bool) -> None:
     target_mel = batch["acoustic_log_mel"][0].detach().cpu().numpy()
     target_mfcc = batch["content_mfcc"][0].detach().cpu().numpy()
-    primary = ("target", "single", "joint", "zero")
-    _plot_matrix_rows(output, "mel_comparison", [(DISPLAY[key], target_mel if key == "target" else renderer_states[key].log_mel.squeeze().detach().cpu().numpy()) for key in primary])
-    _plot_matrix_rows(output, "mfcc_comparison", [(DISPLAY[key], target_mfcc if key == "target" else predicted[key].squeeze().detach().cpu().numpy()) for key in primary], cmap="coolwarm")
+    display = SINGLE_ONLY_DISPLAY if single_only else DISPLAY
+    primary = ("target", "single", "zero") if single_only else ("target", "single", "joint", "zero")
+    _plot_matrix_rows(output, "mel_comparison", [(display[key], target_mel if key == "target" else renderer_states[key].log_mel.squeeze().detach().cpu().numpy()) for key in primary])
+    _plot_matrix_rows(output, "mfcc_comparison", [(display[key], target_mfcc if key == "target" else predicted[key].squeeze().detach().cpu().numpy()) for key in primary], cmap="coolwarm")
     _plot_energy(output, batch["acoustic_rms"][0].detach().cpu().numpy(),
-                 batch["acoustic_activity"][0].detach().cpu().numpy(), renderer_states)
+                 batch["acoustic_activity"][0].detach().cpu().numpy(), renderer_states, display)
 
 
 @dataclass(frozen=True)
@@ -269,31 +285,40 @@ def one_record(dataset: JointManifestDataset, index: int) -> tuple[dict[str, Any
     return homogeneous_collate([dataset[index]]), row
 
 
-def export_trial(*, output: Path, single: RunContext, joint: RunContext, renderer: AudioMFCCRenderer,
+def export_trial(*, output: Path, single: RunContext, joint: RunContext | None, renderer: AudioMFCCRenderer,
                  renderer_checkpoint: Path, dataset_name: str, role: str, index: int, seed: int,
                  iterations: int, target_device: torch.device) -> dict[str, Any]:
     single_dataset, single_indices = selected_indices(single, dataset_name, role)
-    joint_dataset, joint_indices = selected_indices(joint, dataset_name, role)
+    joint_dataset = None
     try:
-        trial_to_joint = {str(joint_dataset.frame.iloc[item].trial_id): item for item in joint_indices}
         batch, row = one_record(single_dataset, index)
         trial_id = str(row["trial_id"])
-        if trial_id not in trial_to_joint:
-            raise RuntimeError(f"joint checkpoint has no matching selected trial {trial_id}")
-        joint_batch, _ = one_record(joint_dataset, trial_to_joint[trial_id])
-        # ``audio_id`` is intentionally derived by JointManifestDataset rather
-        # than stored as a redundant manifest column.  Compare the loader's
-        # derived, provenance-checked identity instead of indexing the row.
-        if str(joint_batch["audio_id"][0]) != str(batch["audio_id"][0]):
-            raise RuntimeError(f"single/joint audio identity differs for {trial_id}")
-        batch = move(batch, target_device); joint_batch = move(joint_batch, target_device)
+        joint_batch = None
+        if joint is not None:
+            joint_dataset, joint_indices = selected_indices(joint, dataset_name, role)
+            trial_to_joint = {str(joint_dataset.frame.iloc[item].trial_id): item for item in joint_indices}
+            if trial_id not in trial_to_joint:
+                raise RuntimeError(f"joint checkpoint has no matching selected trial {trial_id}")
+            joint_batch, _ = one_record(joint_dataset, trial_to_joint[trial_id])
+            # ``audio_id`` is intentionally derived by JointManifestDataset rather
+            # than stored as a redundant manifest column.  Compare the loader's
+            # derived, provenance-checked identity instead of indexing the row.
+            if str(joint_batch["audio_id"][0]) != str(batch["audio_id"][0]):
+                raise RuntimeError(f"single/joint audio identity differs for {trial_id}")
+        batch = move(batch, target_device)
+        if joint_batch is not None:
+            joint_batch = move(joint_batch, target_device)
         with torch.no_grad():
             single_state = single.model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
-            joint_state = joint.model(joint_batch["eeg"], joint_batch["channel_xyz"], joint_batch["channel_mask"], joint_batch["time_mask"], joint_batch["dataset_id"])
-            predictions = {"single": single_state.mfcc, "joint": joint_state.mfcc}
+            predictions = {"single": single_state.mfcc}
+            control_model, control_batch = single.model, batch
+            if joint is not None and joint_batch is not None:
+                joint_state = joint.model(joint_batch["eeg"], joint_batch["channel_xyz"], joint_batch["channel_mask"], joint_batch["time_mask"], joint_batch["dataset_id"])
+                predictions["joint"] = joint_state.mfcc
+                control_model, control_batch = joint.model, joint_batch
             for control in ("zero", "time_shuffle", "channel_shuffle"):
-                controlled = counterfactual_eeg(joint_batch["eeg"], control, time_mask=joint_batch["time_mask"], channel_mask=joint_batch["channel_mask"])
-                predictions[control] = joint.model(controlled, joint_batch["channel_xyz"], joint_batch["channel_mask"], joint_batch["time_mask"], joint_batch["dataset_id"]).mfcc
+                controlled = counterfactual_eeg(control_batch["eeg"], control, time_mask=control_batch["time_mask"], channel_mask=control_batch["channel_mask"])
+                predictions[control] = control_model(controlled, control_batch["channel_xyz"], control_batch["channel_mask"], control_batch["time_mask"], control_batch["dataset_id"]).mfcc
             renderer_states = {key: _renderer_state(renderer, value) for key, value in predictions.items()}
         source_path = ROOT / str(row["audio_path"])
         if not source_path.exists() or sha256_file(source_path) != str(row["audio_sha256"]):
@@ -307,9 +332,10 @@ def export_trial(*, output: Path, single: RunContext, joint: RunContext, rendere
         waveforms = {"target": inverse_log_mel(target_state.log_mel[0], iterations=iterations, seed=seed)}
         waveforms.update({key: inverse_log_mel(state.log_mel[0], iterations=iterations, seed=seed + offset)
                           for offset, (key, state) in enumerate(renderer_states.items(), start=1)})
+        wav_names = SINGLE_ONLY_WAV_NAMES if joint is None else WAV_NAMES
         for key, waveform in waveforms.items():
-            write_pcm16(output / WAV_NAMES[key], waveform, peak_normalize=True)
-        _plot_bundle(output, joint_batch, predictions, renderer_states)
+            write_pcm16(output / wav_names[key], waveform, peak_normalize=True)
+        _plot_bundle(output, control_batch, predictions, renderer_states, single_only=joint is None)
         files = {path.name: sha256_file(path) for path in sorted(output.iterdir()) if path.is_file()}
         metadata = {
             "schema_version": "eeg2speech-audio-pair-comparison-v1",
@@ -322,12 +348,13 @@ def export_trial(*, output: Path, single: RunContext, joint: RunContext, rendere
             "source_audio": {"path": str(row["audio_path"]), "sha256": str(row["audio_sha256"]),
                              "original_sample_rate_hz": source_rate, "original_channels": source_channels,
                              "duration_seconds_at_16khz": len(source) / SAMPLE_RATE},
-            "checkpoints": {"single": str(single.checkpoint), "joint": str(joint.checkpoint)},
+            "checkpoints": {"single": str(single.checkpoint), **({"joint": str(joint.checkpoint)} if joint is not None else {})},
             "renderer_checkpoint": str(renderer_checkpoint),
             "generation": {"sample_rate_hz": SAMPLE_RATE, "mel_frames": MEL_FRAMES,
                            "griffin_lim_iterations": iterations,
                            "generated_duration_seconds": HOP_LENGTH * (MEL_FRAMES - 1) / SAMPLE_RATE,
                            "normalization": "source WAV gain-preserving; generated Griffin-Lim WAVs independently peak-normalized to 0.95"},
+            "comparison_mode": "single_only" if joint is None else "single_vs_joint",
             "interpretation": "exploratory diagnostic audio only; Griffin-Lim is not a validated neural vocoder and generated WAVs are not waveform metrics.",
             "files_sha256": files,
         }
@@ -335,7 +362,9 @@ def export_trial(*, output: Path, single: RunContext, joint: RunContext, rendere
         return {"seed": seed, "dataset": dataset_name, "role": role, "trial_id": trial_id,
                 "subject": str(row["subject"]), "folder": str(output), "pairing_level": str(row["pairing_level"])}
     finally:
-        single_dataset.close(); joint_dataset.close()
+        single_dataset.close()
+        if joint_dataset is not None:
+            joint_dataset.close()
 
 
 def parse_csv(value: str, choices: set[str], flag: str) -> list[str]:
@@ -355,6 +384,8 @@ def main() -> int:
     parser.add_argument("--roles", default="validation,test")
     parser.add_argument("--max-pairs", type=int, default=3, help="deterministic pairs per dataset/role/seed; 0 exports all")
     parser.add_argument("--griffin-lim-iterations", type=int, default=32)
+    parser.add_argument("--single-only", action="store_true",
+                        help="export one dataset checkpoint and its EEG controls; do not require a joint checkpoint")
     parser.add_argument("--overwrite", action="store_true", help="replace an already complete trial bundle")
     args = parser.parse_args()
     if args.max_pairs < 0:
@@ -377,10 +408,12 @@ def main() -> int:
             if not checkpoint.exists():
                 raise RuntimeError(f"single checkpoint is missing: {checkpoint}")
             single_contexts[dataset_name] = load_context(checkpoint, target_device)
-        joint_checkpoint = experiment_root / "generalization" / "joint" / f"seed-{seed}" / "checkpoint.pt"
-        if not joint_checkpoint.exists():
-            raise RuntimeError(f"joint checkpoint is missing: {joint_checkpoint}")
-        joint_context = load_context(joint_checkpoint, target_device)
+        joint_context = None
+        if not args.single_only:
+            joint_checkpoint = experiment_root / "generalization" / "joint" / f"seed-{seed}" / "checkpoint.pt"
+            if not joint_checkpoint.exists():
+                raise RuntimeError(f"joint checkpoint is missing: {joint_checkpoint}")
+            joint_context = load_context(joint_checkpoint, target_device)
         for dataset_name in datasets:
             for role in roles:
                 dataset, indices = selected_indices(single_contexts[dataset_name], dataset_name, role)

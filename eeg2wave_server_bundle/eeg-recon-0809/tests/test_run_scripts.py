@@ -91,6 +91,13 @@ class TestRunScripts(unittest.TestCase):
         self.assertEqual(config["pilot"]["generalization_contents_by_role"],
                          {"train": 128, "validation": 16, "test": 16})
 
+    def test_ds004940_audio_pair_runner_uses_single_checkpoint_mode(self):
+        runner = (ROOT / "app/run_ds004940_audio_pair_comparisons.sh").read_text()
+        generic = (ROOT / "app/run_joint_audio_pair_comparisons.sh").read_text()
+        self.assertIn("AUDIO_PAIR_SINGLE_ONLY=1", runner)
+        self.assertIn("AUDIO_PAIR_DATASETS=ds004940", runner)
+        self.assertIn("--single-only", generic)
+
     def test_atomic_training_state_and_contract_mismatch_detection(self):
         contract = {"mode": "joint", "seed": 31, "artifact_hashes": {"manifest": "abc"}}
         self.assertEqual(train.contract_mismatches(contract, dict(contract)), [])

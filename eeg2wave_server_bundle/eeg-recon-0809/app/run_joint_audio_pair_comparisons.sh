@@ -14,6 +14,8 @@ AUDIO_PAIR_DATASETS="${AUDIO_PAIR_DATASETS:-ds004940,ds006104}"
 AUDIO_PAIR_ROLES="${AUDIO_PAIR_ROLES:-validation,test}"
 AUDIO_PAIR_MAX_PAIRS="${AUDIO_PAIR_MAX_PAIRS:-3}"
 GRIFFIN_LIM_ITERATIONS="${GRIFFIN_LIM_ITERATIONS:-32}"
+SINGLE_ONLY_ARGS=()
+if [[ "${AUDIO_PAIR_SINGLE_ONLY:-0}" == "1" ]]; then SINGLE_ONLY_ARGS+=(--single-only); fi
 
 start_joint_log audio_pair_export
 require_joint_runtime
@@ -34,6 +36,7 @@ joint_run "$PYTHON_BIN" app/export_audio_pair_comparisons.py \
   --datasets "$AUDIO_PAIR_DATASETS" \
   --roles "$AUDIO_PAIR_ROLES" \
   --max-pairs "$AUDIO_PAIR_MAX_PAIRS" \
-  --griffin-lim-iterations "$GRIFFIN_LIM_ITERATIONS"
+  --griffin-lim-iterations "$GRIFFIN_LIM_ITERATIONS" \
+  "${SINGLE_ONLY_ARGS[@]}"
 
 echo "audio_pairs=$EXPERIMENT_ROOT/generalization/audio_pair_comparisons"

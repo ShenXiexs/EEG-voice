@@ -221,6 +221,20 @@ caffeinate -dimsu env \
 outputs/joint_pilot_v1/ds004940_explore_10h_v1/
 ```
 
+训练完成后，导出 DS004940-only 的原始/目标/EEG/control WAV 及能量、mel、MFCC
+对照图（不要求 joint checkpoint）：
+
+```bash
+AUDIO_PAIR_MAX_PAIRS=3 GRIFFIN_LIM_ITERATIONS=32 \
+  ./app/run_ds004940_audio_pair_comparisons.sh
+```
+
+这会导出三个 seed 的 validation/test 各最多三个 pair，结果位于：
+
+```text
+outputs/joint_pilot_v1/ds004940_explore_10h_v1/generalization/audio_pair_comparisons/
+```
+
 Explore outputs 永远隔离在：
 
 ```text
