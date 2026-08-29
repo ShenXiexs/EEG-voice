@@ -198,6 +198,29 @@ step 和随机状态。中断最多损失最近一个 checkpoint interval 内的
 checkpoint 会自动跳过。若有意重新训练某个已完成 run，直接调用
 `app/train_joint.py` 并加 `--restart`。
 
+### DS004940-only 10-hour exploratory run
+
+如果目标是提高 DS004940-only 的严格 held-out content 覆盖，而不是比较 joint
+迁移，可使用独立的 10 小时 runner。它只构建 DS004940 的新 Stage-2 artifacts，
+并将 train grid 从旧实验的 `4 subjects × 28 contents = 112` 扩展为
+`4 × 128 = 512`；validation/test 各为 `1 × 16 = 16`。模型结构和 loss 保持不变，
+仅为 9,000-step run 启用从 `3e-4` 衰减到 `3e-5` 的 cosine learning rate。
+
+```bash
+caffeinate -dimsu env \
+  CHECKPOINT_EVERY=100 \
+  ./app/run_ds004940_explore_10h.sh
+```
+
+默认运行 3 个 seed（31、47、73）各 9,000 step。按此前约 0.92 秒/step 的速度，
+训练约 6.9 小时，并为 EEG shard、HuBERT target cache、evaluation 和机器波动预留
+约 3.1 小时。中断后重跑**同一条命令**会从每个 seed 最近的原子 checkpoint 继续。
+所有输出隔离于：
+
+```text
+outputs/joint_pilot_v1/ds004940_explore_10h_v1/
+```
+
 Explore outputs 永远隔离在：
 
 ```text

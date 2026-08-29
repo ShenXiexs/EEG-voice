@@ -28,6 +28,12 @@ class TestStage2Split(unittest.TestCase):
         self.assertEqual(names["artifact_set"],"explore_stage2_8h_v1")
         self.assertNotEqual(names["artifact_set"],"explore_stage2")
 
+    def test_stage2_can_select_a_single_dataset_without_changing_default(self):
+        self.assertEqual(stage2.stage2_datasets({}), ("ds004940", "ds006104"))
+        self.assertEqual(stage2.stage2_datasets({"stage2": {"datasets": ["ds004940"]}}), ("ds004940",))
+        with self.assertRaises(ValueError):
+            stage2.stage2_datasets({"stage2": {"datasets": ["ds004940", "ds004940"]}})
+
     def test_declared_bad_channel_qc_is_applied_before_subject_selection(self):
         frame = pd.DataFrame([
             {"dataset": "ds004940", "bad_channels": '["A1", "A2"]'},

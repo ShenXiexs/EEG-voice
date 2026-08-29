@@ -134,6 +134,25 @@ def resume_maximum_steps(requested: int, state: dict) -> tuple[int, bool]:
     return (original, True) if completed > requested else (requested, False)
 
 
+def learning_rate_scheduler(optimizer: torch.optim.Optimizer, training: dict,
+                            maximum_steps: int):
+    """Create an optional resumable schedule; legacy configs stay constant-LR."""
+    kind = str(training.get("lr_schedule", "constant")).lower()
+    if kind == "constant":
+        return None
+    if kind != "cosine":
+        raise ValueError(f"unsupported lr_schedule={kind!r}; choose constant or cosine")
+    floor = float(training.get("min_learning_rate", 0.0))
+    initial = float(training["learning_rate"])
+    if not 0.0 <= floor <= initial:
+        raise ValueError("min_learning_rate must be between zero and learning_rate")
+    if maximum_steps < 1:
+        raise ValueError("cosine learning-rate schedule requires positive maximum_steps")
+    return torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=maximum_steps, eta_min=floor,
+    )
+
+
 def device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -370,6 +389,7 @@ def main() -> int:
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"]["learning_rate"]),
                                   weight_decay=float(cfg["training"]["weight_decay"]))
     maximum = args.max_steps or int(cfg["training"]["max_steps"])
+    scheduler = learning_rate_scheduler(optimizer, cfg["training"], maximum)
     checkpoint_every = (args.checkpoint_every if args.checkpoint_every is not None
                         else int(cfg["training"].get("checkpoint_interval_steps", 25)))
     if checkpoint_every < 1:
@@ -391,6 +411,7 @@ def main() -> int:
             "resume_contract": current_contract, "model": model.state_dict(),
             "optimizer": optimizer.state_dict(), "completed_steps": completed_steps,
             "maximum_steps": maximum, "history": history,
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "seen_batch_sources": sorted(seen_batch_sources), "early_stopped": early_stopped,
             "batch_schedule": schedule, "interrupted": interrupted, "completed": completed,
             "python_random_state": random.getstate(), "numpy_random_state": np.random.get_state(),
@@ -413,6 +434,10 @@ def main() -> int:
         model.load_state_dict(previous["model"])
         optimizer.load_state_dict(previous["optimizer"])
         optimizer_to(optimizer, device())
+        if scheduler is not None:
+            if previous.get("scheduler") is None:
+                raise RuntimeError("partial checkpoint is missing the configured learning-rate scheduler state")
+            scheduler.load_state_dict(previous["scheduler"])
         history = list(previous.get("history", []))
         seen_batch_sources = set(previous.get("seen_batch_sources", []))
         early_stopped = bool(previous.get("early_stopped", False))
@@ -459,10 +484,13 @@ def main() -> int:
             if not torch.isfinite(gradient_norm):
                 raise RuntimeError(f"nonfinite gradient norm at step {step} ({name}); metrics={metrics}")
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             completed_steps = step
             if name not in seen_batch_sources or step % 100 == 0:
                 seen_batch_sources.add(name)
-                history.append({"step": step, "dataset": name, **metrics})
+                history.append({"step": step, "dataset": name,
+                                "learning_rate": float(optimizer.param_groups[0]["lr"]), **metrics})
                 if step % 100 == 0:
                     screen = {dataset_name: full_content_retrieval(model, evaluation_loaders[dataset_name], device())
                               for dataset_name in names}
@@ -516,6 +544,7 @@ def main() -> int:
                                                               "controls": controls, "steps_completed": completed_steps,
                                                               "early_stopped": early_stopped,
                                                               "batch_schedule": schedule,
+                                                              "learning_rate_schedule": cfg["training"].get("lr_schedule", "constant"),
                                                               "runtime_code_sha256": runtime_code_sha256(),
                                                               "artifact_hashes": artifact_hashes}, indent=2) + "\n")
     print(json.dumps({"checkpoint": str(final_checkpoint_path), "run_kind": run_kind,

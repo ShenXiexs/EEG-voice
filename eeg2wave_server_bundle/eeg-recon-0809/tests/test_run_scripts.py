@@ -78,6 +78,19 @@ class TestRunScripts(unittest.TestCase):
         self.assertIn('PILOT_CONFIG="$PROJECT_ROOT/configs/joint_explore_8h_v1.yaml"', explore)
         self.assertIn("explore_8h_v1_corrected", explore)
 
+    def test_ds004940_ten_hour_runner_is_single_dataset_and_resumable(self):
+        runner = (ROOT / "app/run_ds004940_explore_10h.sh").read_text()
+        config = yaml.safe_load((ROOT / "configs/ds004940_explore_10h_v1.yaml").read_text())
+        self.assertIn("--mode ds004940", runner)
+        self.assertIn("--checkpoint-every", runner)
+        self.assertIn("--output-root", runner)
+        self.assertNotIn("--mode joint", runner)
+        self.assertEqual(config["stage2"]["datasets"], ["ds004940"])
+        self.assertEqual(config["pilot"]["generalization_subjects_by_role"],
+                         {"train": 4, "validation": 1, "test": 1})
+        self.assertEqual(config["pilot"]["generalization_contents_by_role"],
+                         {"train": 128, "validation": 16, "test": 16})
+
     def test_atomic_training_state_and_contract_mismatch_detection(self):
         contract = {"mode": "joint", "seed": 31, "artifact_hashes": {"manifest": "abc"}}
         self.assertEqual(train.contract_mismatches(contract, dict(contract)), [])
@@ -109,6 +122,17 @@ class TestRunScripts(unittest.TestCase):
         self.assertEqual(train.resume_maximum_steps(5000, {"completed_steps": 2500, "maximum_steps": 2700}), (5000, False))
         with self.assertRaisesRegex(RuntimeError, "invalid completed_steps"):
             train.resume_maximum_steps(5000, {"completed_steps": 8, "maximum_steps": 7})
+
+    def test_cosine_schedule_is_optional_and_reaches_its_floor(self):
+        parameter = torch.nn.Parameter(torch.ones(()))
+        optimizer = torch.optim.AdamW([parameter], lr=3e-4)
+        self.assertIsNone(train.learning_rate_scheduler(optimizer, {"learning_rate": 3e-4}, 10))
+        scheduler = train.learning_rate_scheduler(
+            optimizer, {"learning_rate": 3e-4, "lr_schedule": "cosine", "min_learning_rate": 3e-5}, 4,
+        )
+        for _ in range(4):
+            optimizer.step(); scheduler.step()
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 3e-5, places=10)
 
 
 if __name__ == "__main__":

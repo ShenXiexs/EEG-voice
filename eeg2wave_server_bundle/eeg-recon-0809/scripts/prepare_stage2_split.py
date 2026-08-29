@@ -52,6 +52,17 @@ def stage2_names(pilot: dict, explore: bool) -> dict[str, str]:
     return values
 
 
+def stage2_datasets(pilot: dict) -> tuple[str, ...]:
+    """Return explicitly requested datasets, defaulting to the joint pilot."""
+    requested = tuple(str(value) for value in pilot.get("stage2", {}).get(
+        "datasets", ("ds004940", "ds006104"),
+    ))
+    allowed = {"ds004940", "ds006104"}
+    if not requested or len(set(requested)) != len(requested) or set(requested) - allowed:
+        raise ValueError(f"stage2.datasets must be a nonempty unique subset of {sorted(allowed)}")
+    return requested
+
+
 def stable(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -113,6 +124,7 @@ def build(data_config: Path, pilot_config: Path) -> Path:
     lock = json.loads((root / "source_lock.json").read_text()); p = pilot["pilot"]
     subject_counts = {key:int(value) for key,value in p["generalization_subjects_by_role"].items()}
     content_counts = {key:int(value) for key,value in p["generalization_contents_by_role"].items()}
+    datasets = stage2_datasets(pilot)
     records=[]; assignment={"algorithm":"exact-stage2-subject-content-v2-one-trial-per-cell","datasets":{},
                             "source_lock_sha256":lock["source_lock_sha256"],"preprocess_config_sha256":config["_config_sha256"]}
     eligible = frame[(frame.build_status == "included") & (frame.qc_pass.astype(str).str.lower() == "true")]
@@ -124,14 +136,14 @@ def build(data_config: Path, pilot_config: Path) -> Path:
         "max_bad_fraction": float(config["harmonized"]["interpolation"]["max_bad_fraction"]),
         "excluded_trials_by_dataset": {
             dataset: int((rejected_declared_qc.dataset == dataset).sum())
-            for dataset in ("ds004940", "ds006104")
+            for dataset in datasets
         },
         "excluded_subjects_by_dataset": {
             dataset: sorted(rejected_declared_qc[rejected_declared_qc.dataset == dataset].subject.astype(str).unique().tolist())
-            for dataset in ("ds004940", "ds006104")
+            for dataset in datasets
         },
     }
-    for dataset in ("ds004940","ds006104"):
+    for dataset in datasets:
         content = selection_eligible[(selection_eligible.dataset==dataset)&selection_eligible.supervision_type.isin(["paired_audio","weak_audio"])].copy()
         if dataset == "ds004940" and p.get("primary_ds004940_task"): content=content[content.task==p["primary_ds004940_task"]]
         if dataset == "ds006104" and not bool(p["primary_ds006104_tms"]):
@@ -188,7 +200,7 @@ def build(data_config: Path, pilot_config: Path) -> Path:
     result.loc[duplicates, "role"] = "excluded"
     result.loc[duplicates, "exclusion_reason"] = "duplicate_stage2_subject_content_cell"
     result = result.drop(columns="_cell_order")
-    for dataset in ("ds004940","ds006104"):
+    for dataset in datasets:
         selected=result[(result.trial_id.str.startswith(dataset))&result.role.isin(["train","validation","test"])]
         for left,right in (("train","validation"),("train","test"),("validation","test")):
             for column in ("subject_group","linguistic_content_group"):
@@ -281,7 +293,7 @@ def materialize(config: dict, pilot: dict, hubert_local_path: Path,
     if split_contract_rebuild and not rebuild:
         print("Stage2 split changed since existing named shards; rebuilding selected shards to preserve provenance.")
     for role in ("train", "validation", "test"):
-        for dataset in ("ds004940", "ds006104"):
+        for dataset in stage2_datasets(pilot):
             build_eeg_shards(
                 config, dataset, "all", "all", None, None, None, "any", role,
                 protocol, 0, not effective_rebuild, False, artifact_set,
