@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pandas as pd
 import torch
 from scipy.io import wavfile
 
@@ -44,6 +45,15 @@ class TestAudioPairExport(unittest.TestCase):
         self.assertEqual(exporter.SINGLE_ONLY_WAV_NAMES["single"], "02_ds004940_eeg_mfcc_griffinlim.wav")
         self.assertNotIn("joint", " ".join(exporter.SINGLE_ONLY_WAV_NAMES.values()))
         self.assertEqual(exporter.SINGLE_ONLY_DISPLAY["single"], "DS004940 EEG")
+
+    def test_train_representative_selection_keeps_one_stable_trial_per_content(self):
+        class FrameOnlyDataset:
+            frame = pd.DataFrame([
+                {"linguistic_content_id": "a"}, {"linguistic_content_id": "a"},
+                {"linguistic_content_id": "b"}, {"linguistic_content_id": "c"},
+                {"linguistic_content_id": "b"},
+            ])
+        self.assertEqual(exporter.one_train_representative_per_content(FrameOnlyDataset(), [1, 2, 4, 0, 3]), [1, 2, 3])
 
 
 if __name__ == "__main__":

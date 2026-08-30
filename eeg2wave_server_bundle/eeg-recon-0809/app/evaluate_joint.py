@@ -357,7 +357,13 @@ def main() -> int:
     else:
         retrieval={"r1":float("nan"),"mrr":float("nan"),"chance_r1":float("nan"),"unique_contents":0}; wrong=delta=float("nan")
     subject_values=defaultdict(list)
-    for subject,value in zip(subjects,control_errors["correct"]): subject_values[subject].append(value)
+    subject_control_values={control: defaultdict(list) for control in control_errors}
+    for control, errors in control_errors.items():
+        if len(errors) != len(subjects):
+            raise RuntimeError(f"subject/control alignment mismatch for {control}: {len(errors)} != {len(subjects)}")
+        for subject, value in zip(subjects, errors):
+            subject_control_values[control][subject].append(value)
+    for subject, value in zip(subjects, control_errors["correct"]): subject_values[subject].append(value)
     if len(prediction):
         train_reference, train_reference_pairs = training_target_reference(
             manifest, split, args.dataset, targets, normalizer, cfg, vocabulary,
@@ -399,6 +405,10 @@ def main() -> int:
             "delta_l1":delta,"wrong_pair_mfcc_l1":wrong,"retrieval":retrieval,
             "controls":control_means,
             "subject_mfcc_l1":{key:float(np.mean(value)) for key,value in subject_values.items()},
+            "subject_control_mfcc_l1": {
+                control: {key: float(np.mean(value)) for key, value in values.items()}
+                for control, values in subject_control_values.items()
+            },
             "stratified_mfcc_l1": strata,
             "hubert_similarity": hubert_metrics,
             "subject_leakage_probe": leakage,

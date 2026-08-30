@@ -235,6 +235,42 @@ AUDIO_PAIR_MAX_PAIRS=3 GRIFFIN_LIM_ITERATIONS=32 \
 outputs/joint_pilot_v1/ds004940_explore_10h_v1/generalization/audio_pair_comparisons/
 ```
 
+### DS004940 large-scale full-content exploratory run
+
+该实验保留同一 N400Active-only EEG→MFCC/HuBERT 模型，并在锁定的15%坏通道
+上限后选择14名完整受试者，将402个 unique speech contents 全部分配到严格双重
+OOD split：`10 × 338 = 3,380` train pairs、
+`2 × 32 = 64` validation pairs 和 `2 × 32 = 64` locked-test pairs。训练是三个
+独立随机 seed 的最多 50 epoch 无放回 shuffle；每 2 epoch 在 validation fold 以
+MFCC retrieval MRR 选择 best checkpoint，最少20 epoch、连续8次未改善则早停。
+
+```bash
+caffeinate -dimsu env \
+  CHECKPOINT_EVERY=100 \
+  ./app/run_ds004940_large_scale_v1.sh
+```
+
+中断后重复完全相同的命令即可从 `training_state.pt` 继续。每个 seed 同时保留
+`best_checkpoint.pt`、`last_checkpoint.pt` 和下游兼容的 `checkpoint.pt`（best）。
+输出完全隔离于：
+
+```text
+outputs/joint_pilot_v1/ds004940_large_scale_v1/
+```
+
+训练完成后，以单独、可续跑的阶段导出所有 held-out validation/test 对照 bundle，
+并为 train 的338个内容各导出一个 seed-31 代表样本；总计722个音频/能量/mel/MFCC
+bundle。生成 WAV 均为 Griffin–Lim diagnostic，不是经验证的 neural-vocoder output。
+
+```bash
+caffeinate -dimsu env \
+  GRIFFIN_LIM_ITERATIONS=32 \
+  ./app/run_ds004940_large_scale_audio_comparisons.sh
+```
+
+人工听音/转录审计仍未完成，因此本节所有模型、图和音频都只能解释为 exploratory
+evidence，而不能替代注册结果。
+
 Explore outputs 永远隔离在：
 
 ```text

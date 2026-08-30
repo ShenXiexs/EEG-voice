@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 import yaml
+from torch.utils.data import Dataset
 
 
 ROOT = Path(__file__).parents[1]
@@ -29,6 +30,8 @@ train_spec.loader.exec_module(train)
 class TestRunScripts(unittest.TestCase):
     def test_all_shell_entry_points_are_executable_and_parse(self):
         scripts = sorted((ROOT / "app").glob("run_joint_*.sh"))
+        scripts += [ROOT / "app/run_ds004940_large_scale_v1.sh",
+                    ROOT / "app/run_ds004940_large_scale_audio_comparisons.sh"]
         self.assertGreaterEqual(len(scripts), 8)
         for script in scripts:
             self.assertTrue(os.access(script, os.X_OK), script)
@@ -91,12 +94,57 @@ class TestRunScripts(unittest.TestCase):
         self.assertEqual(config["pilot"]["generalization_contents_by_role"],
                          {"train": 128, "validation": 16, "test": 16})
 
+    def test_ds004940_large_scale_runner_is_epoch_based_and_isolated(self):
+        runner = (ROOT / "app/run_ds004940_large_scale_v1.sh").read_text()
+        config = yaml.safe_load((ROOT / "configs/ds004940_large_scale_v1.yaml").read_text())
+        self.assertIn("--max-epochs", runner)
+        self.assertIn("--mode ds004940", runner)
+        self.assertIn("plot_ds004940_large_scale.py", runner)
+        self.assertEqual(config["training"]["max_epochs"], 50)
+        self.assertEqual(config["training"]["sampling_strategy"], "shuffled_without_replacement")
+        self.assertEqual(config["training"]["validation_early_stopping"], {
+            "selection_metric": "mfcc_retrieval_mrr", "interval_epochs": 2, "minimum_epochs": 20,
+            "patience_validations": 8, "minimum_delta": 0.0001,
+        })
+
+    def test_epoch_horizon_and_validation_selection_contract(self):
+        maximum, epochs = train.epoch_horizon(
+            max_steps=None, max_epochs=50, training={}, mode="ds004940", loader_count=1, steps_per_epoch=423,
+        )
+        self.assertEqual((maximum, epochs), (21150, 50))
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            train.epoch_horizon(max_steps=1, max_epochs=1, training={}, mode="ds004940", loader_count=1, steps_per_epoch=1)
+        best = {"retrieval": {"mrr": 0.3}}
+        self.assertTrue(train.validation_improved({"retrieval": {"mrr": 0.301}}, best, 0.0001))
+        self.assertFalse(train.validation_improved({"retrieval": {"mrr": 0.30005}}, best, 0.0001))
+
+    def test_shuffled_sampler_covers_each_item_once_and_is_seeded(self):
+        class TinyDataset(Dataset):
+            def __len__(self): return 7
+            def __getitem__(self, index): return index
+            def sampling_weights(self): return torch.ones(7, dtype=torch.double)
+        dataset = TinyDataset()
+        first = list(train.sampler_for(dataset, list(range(7)), 31, "shuffled_without_replacement"))
+        repeat = list(train.sampler_for(dataset, list(range(7)), 31, "shuffled_without_replacement"))
+        other = list(train.sampler_for(dataset, list(range(7)), 47, "shuffled_without_replacement"))
+        self.assertEqual(first, repeat)
+        self.assertEqual(sorted(first), list(range(7)))
+        self.assertNotEqual(first, other)
+
     def test_ds004940_audio_pair_runner_uses_single_checkpoint_mode(self):
         runner = (ROOT / "app/run_ds004940_audio_pair_comparisons.sh").read_text()
         generic = (ROOT / "app/run_joint_audio_pair_comparisons.sh").read_text()
         self.assertIn("AUDIO_PAIR_SINGLE_ONLY=1", runner)
         self.assertIn("AUDIO_PAIR_DATASETS=ds004940", runner)
         self.assertIn("--single-only", generic)
+
+    def test_large_scale_audio_runner_exports_heldout_and_train_representatives(self):
+        runner = (ROOT / "app/run_ds004940_large_scale_audio_comparisons.sh").read_text()
+        generic = (ROOT / "app/run_joint_audio_pair_comparisons.sh").read_text()
+        self.assertIn("AUDIO_PAIR_ROLES=validation,test", runner)
+        self.assertIn("AUDIO_PAIR_ROLES=train", runner)
+        self.assertIn("AUDIO_PAIR_TRAIN_REPRESENTATIVE=1", runner)
+        self.assertIn("--one-train-representative-per-content", generic)
 
     def test_atomic_training_state_and_contract_mismatch_detection(self):
         contract = {"mode": "joint", "seed": 31, "artifact_hashes": {"manifest": "abc"}}

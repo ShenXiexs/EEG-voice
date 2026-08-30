@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from torch.utils.data import DataLoader, RandomSampler, Subset, WeightedRandomSampler
 
 APP = Path(__file__).resolve().parent
 ROOT = APP.parent
@@ -161,13 +161,30 @@ def device() -> torch.device:
     return torch.device("cpu")
 
 
-def loader_for(dataset: JointManifestDataset, indices: list[int], batch_size: int, seed: int) -> DataLoader:
+def sampler_for(dataset: JointManifestDataset, indices: list[int], seed: int,
+                strategy: str = "weighted_with_replacement"):
+    """Create the deterministic sampler declared by an experiment config.
+
+    The legacy pilot balances incomplete grids with weighted replacement.  A
+    large, already complete subject×content grid instead needs every cell
+    exactly once per epoch, so it uses a seeded shuffled sampler.
+    """
+    subset = Subset(dataset, indices)
+    if strategy == "weighted_with_replacement":
+        weights = dataset.sampling_weights()[indices]
+        return WeightedRandomSampler(weights, num_samples=max(len(indices), 1), replacement=True,
+                                     generator=torch.Generator().manual_seed(seed))
+    if strategy == "shuffled_without_replacement":
+        return RandomSampler(subset, replacement=False, generator=torch.Generator().manual_seed(seed))
+    raise ValueError("sampling_strategy must be weighted_with_replacement or shuffled_without_replacement")
+
+
+def loader_for(dataset: JointManifestDataset, indices: list[int], batch_size: int, seed: int,
+               sampling_strategy: str = "weighted_with_replacement") -> DataLoader:
     if not indices:
         raise RuntimeError("pilot selection produced zero trials")
     subset = Subset(dataset, indices)
-    weights = dataset.sampling_weights()[indices]
-    sampler = WeightedRandomSampler(weights, num_samples=max(len(indices), batch_size), replacement=True,
-                                    generator=torch.Generator().manual_seed(seed))
+    sampler = sampler_for(dataset, indices, seed, sampling_strategy)
     return DataLoader(subset, batch_size=batch_size, sampler=sampler, collate_fn=homogeneous_collate, drop_last=False)
 
 
@@ -189,6 +206,21 @@ def retrieval_r1(prediction: torch.Tensor, target: torch.Tensor, eligible: torch
     names = [labels[index] for index in eligible.nonzero(as_tuple=False).flatten().tolist()]
     nearest = (left @ right.T).argmax(1).tolist()
     return float(np.mean([names[index] == names[target_index] for index, target_index in enumerate(nearest)]))
+
+
+def retrieval_metrics(prediction: torch.Tensor, target: torch.Tensor, labels: list[str]) -> dict[str, float | int]:
+    """Multi-positive content retrieval for validation-time model selection."""
+    if len(labels) < 2:
+        return {"r1": float("nan"), "mrr": float("nan"), "chance_r1": float("nan"), "unique_contents": len(set(labels))}
+    left = torch.nn.functional.normalize(prediction.flatten(1), dim=-1)
+    right = torch.nn.functional.normalize(target.flatten(1), dim=-1)
+    order = (left @ right.T).argsort(1, descending=True)
+    positive = torch.tensor([[left_label == right_label for right_label in labels] for left_label in labels],
+                            dtype=torch.bool, device=order.device)
+    ranked_positive = positive.gather(1, order)
+    first = ranked_positive.float().argmax(1) + 1
+    return {"r1": float((first == 1).float().mean()), "mrr": float((1.0 / first.float()).mean()),
+            "chance_r1": float(positive.float().mean()), "unique_contents": len(set(labels))}
 
 
 def evaluate_batch(model, batch: dict, target: torch.device) -> dict[str, float]:
@@ -224,6 +256,66 @@ def full_content_retrieval(model, loader: DataLoader, target: torch.device) -> f
     return retrieval_r1(prediction, teacher, torch.ones(len(prediction), dtype=torch.bool, device=prediction.device), labels)
 
 
+def validation_metrics(model, loader: DataLoader, target: torch.device) -> dict:
+    """Evaluate the model-selection fold without touching the locked test fold."""
+    predictions = []; teachers = []; labels: list[str] = []
+    controls: dict[str, list[float]] = {name: [] for name in ("correct", "zero", "time_shuffle", "channel_shuffle")}
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            batch = move(batch, target)
+            eligible = batch["pairing_weight"] > 0
+            if not eligible.any():
+                continue
+            state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+            prediction = state.mfcc[eligible]
+            teacher = batch["content_mfcc"][eligible]
+            predictions.append(prediction.cpu()); teachers.append(teacher.cpu())
+            selected = eligible.nonzero(as_tuple=False).flatten().tolist()
+            labels.extend(batch["linguistic_content_id"][index] for index in selected)
+            controls["correct"].extend((prediction - teacher).abs().mean((1, 2)).cpu().tolist())
+            for control in ("zero", "time_shuffle", "channel_shuffle"):
+                eeg = counterfactual_eeg(batch["eeg"], control, time_mask=batch["time_mask"], channel_mask=batch["channel_mask"])
+                output = model(eeg, batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+                controls[control].extend((output.mfcc[eligible] - teacher).abs().mean((1, 2)).cpu().tolist())
+    if was_training:
+        model.train()
+    if not predictions:
+        raise RuntimeError("validation fold has no audio-supervised pairs")
+    prediction, teacher = torch.cat(predictions), torch.cat(teachers)
+    return {"pairs": len(labels), "mfcc_l1": float((prediction - teacher).abs().mean()),
+            "retrieval": retrieval_metrics(prediction, teacher, labels),
+            "controls": {name: float(np.mean(values)) for name, values in controls.items()}}
+
+
+def epoch_horizon(*, max_steps: int | None, max_epochs: int | None, training: dict,
+                  mode: str, loader_count: int, steps_per_epoch: int) -> tuple[int, int | None]:
+    """Resolve legacy step runs or a single-dataset epoch-defined experiment."""
+    configured_epochs = training.get("max_epochs")
+    if max_steps is not None and max_epochs is not None:
+        raise ValueError("--max-steps and --max-epochs are mutually exclusive")
+    if max_steps is not None and configured_epochs is not None:
+        raise ValueError("--max-steps cannot override a config that declares max_epochs")
+    epochs = max_epochs if max_epochs is not None else configured_epochs
+    if epochs is None:
+        maximum = max_steps or int(training["max_steps"])
+        return maximum, None
+    if mode == "joint" or loader_count != 1:
+        raise RuntimeError("epoch-defined training currently requires exactly one audio-supervised dataset")
+    if int(epochs) < 1 or steps_per_epoch < 1:
+        raise ValueError("max_epochs and steps_per_epoch must be positive")
+    return int(epochs) * steps_per_epoch, int(epochs)
+
+
+def validation_improved(current: dict, best: dict | None, minimum_delta: float) -> bool:
+    """Select by validation MRR; numerical ties keep the earlier checkpoint."""
+    value = float(current["retrieval"]["mrr"])
+    if not np.isfinite(value):
+        raise RuntimeError("validation retrieval MRR is nonfinite")
+    return best is None or value > float(best["retrieval"]["mrr"]) + float(minimum_delta)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "joint_pilot_v1.yaml")
@@ -231,6 +323,8 @@ def main() -> int:
     parser.add_argument("--stage", choices=["overfit", "generalization"], default="overfit")
     parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--max-epochs", type=int,
+                        help="single-dataset epoch horizon; mutually exclusive with --max-steps")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke-model", action="store_true", help="use a 48-dim/1-layer engineering smoke model")
     parser.add_argument("--explore", action="store_true",
@@ -331,8 +425,9 @@ def main() -> int:
             return 0
 
     names = [args.mode] if args.mode != "joint" else ["ds004940", "ds006104"]
-    datasets = {}; loaders = {}; evaluation_loaders = {}
+    datasets = {}; loaders = {}; evaluation_loaders = {}; validation_loaders = {}
     selections = {}
+    sampling_strategy = str(cfg["training"].get("sampling_strategy", "weighted_with_replacement"))
     vocabulary = phoneme_vocabulary_from_manifest(manifest_path)
     if len(vocabulary) > int(cfg["model"]["phoneme_classes"]):
         raise RuntimeError(f"phoneme vocabulary has {len(vocabulary)} labels but model has {cfg['model']['phoneme_classes']} classes")
@@ -343,7 +438,8 @@ def main() -> int:
                                        phoneme_vocabulary=vocabulary)
         indices = pilot_indices(dataset, cfg, args.stage, "train")
         datasets[name] = dataset
-        loaders[name] = loader_for(dataset, indices, int(cfg["training"]["batch_size"]), args.seed)
+        loaders[name] = loader_for(dataset, indices, int(cfg["training"]["batch_size"]), args.seed,
+                                   sampling_strategy)
         evaluation_loaders[name] = evaluation_loader_for(dataset, indices, int(cfg["training"]["batch_size"]))
         selected = dataset.frame.iloc[indices]
         selections[name] = {"pairs": len(selected), "subjects": int(selected.subject.nunique()),
@@ -357,12 +453,34 @@ def main() -> int:
         aux_indices = auxiliary_indices(auxiliary, cfg, args.stage)
         aux_name = "ds006104_label_only"
         datasets[aux_name] = auxiliary
-        loaders[aux_name] = loader_for(auxiliary, aux_indices, int(cfg["training"]["batch_size"]), args.seed + 1009)
+        loaders[aux_name] = loader_for(auxiliary, aux_indices, int(cfg["training"]["batch_size"]), args.seed + 1009,
+                                       sampling_strategy)
         selected = auxiliary.frame.iloc[aux_indices]
         selections[aux_name] = {"pairs": len(selected), "subjects": int(selected.subject.nunique()),
                                 "contents": int(selected.linguistic_content_id.nunique()),
                                 "labels": int(selected.phoneme_label.nunique()),
                                 "subject_counts": selected.groupby("subject").size().astype(int).to_dict()}
+
+    validation_spec = cfg["training"].get("validation_early_stopping")
+    if validation_spec is not None:
+        if args.stage != "generalization" or args.mode == "joint" or len(names) != 1:
+            raise RuntimeError("validation_early_stopping requires single-dataset generalization training")
+        validation_dataset = JointManifestDataset(
+            manifest_path, split_path, "validation", names[0], target_path, normalizer_path,
+            float(cfg["loss"]["weak_content_weight"]), supervision_types={"paired_audio", "weak_audio"},
+            phoneme_vocabulary=vocabulary,
+        )
+        validation_indices = pilot_indices(validation_dataset, cfg, args.stage, "validation")
+        validation_loaders[names[0]] = evaluation_loader_for(
+            validation_dataset, validation_indices, int(cfg["training"]["batch_size"]),
+        )
+        datasets[f"{names[0]}_validation"] = validation_dataset
+        selected = validation_dataset.frame.iloc[validation_indices]
+        selections[f"{names[0]}_validation"] = {
+            "pairs": len(selected), "subjects": int(selected.subject.nunique()),
+            "contents": int(selected.linguistic_content_id.nunique()),
+            "subject_counts": selected.groupby("subject").size().astype(int).to_dict(),
+        }
 
     model = JointEEGContentModel(**cfg["model"]).to(device())
     dry_batches = {name: move(next(iter(loader)), device()) for name, loader in loaders.items()}
@@ -388,7 +506,22 @@ def main() -> int:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"]["learning_rate"]),
                                   weight_decay=float(cfg["training"]["weight_decay"]))
-    maximum = args.max_steps or int(cfg["training"]["max_steps"])
+    steps_per_epoch = len(loaders[names[0]]) if len(loaders) == 1 else 0
+    maximum, maximum_epochs = epoch_horizon(
+        max_steps=args.max_steps, max_epochs=args.max_epochs, training=cfg["training"], mode=args.mode,
+        loader_count=len(loaders), steps_per_epoch=steps_per_epoch,
+    )
+    validation_interval_steps: int | None = None
+    validation_spec = cfg["training"].get("validation_early_stopping")
+    if validation_spec is not None:
+        if maximum_epochs is None:
+            raise RuntimeError("validation_early_stopping requires max_epochs, not max_steps")
+        validation_interval_epochs = int(validation_spec["interval_epochs"])
+        if validation_interval_epochs < 1:
+            raise ValueError("validation_early_stopping.interval_epochs must be positive")
+        validation_interval_steps = validation_interval_epochs * steps_per_epoch
+        if maximum % steps_per_epoch:
+            raise RuntimeError("epoch-defined maximum must end on an epoch boundary")
     scheduler = learning_rate_scheduler(optimizer, cfg["training"], maximum)
     checkpoint_every = (args.checkpoint_every if args.checkpoint_every is not None
                         else int(cfg["training"].get("checkpoint_interval_steps", 25)))
@@ -405,14 +538,39 @@ def main() -> int:
     seen_batch_sources: set[str] = set()
     early_stopped = False
     completed_steps = 0
+    completed_epochs = 0
+    validation_history: list[dict] = []
+    best_validation: dict | None = None
+    validation_without_improvement = 0
+    best_checkpoint_path = checkpoint_dir / "best_checkpoint.pt"
+    last_checkpoint_path = checkpoint_dir / "last_checkpoint.pt"
+
+    def model_payload(*, checkpoint_kind: str, validation: dict | None = None) -> dict:
+        return {
+            "model": model.state_dict(), "model_config": cfg["model"], "pilot_config": cfg,
+            "mode": args.mode, "stage": args.stage, "seed": args.seed, "run_kind": run_kind,
+            "split_protocol": split_protocol, "artifact_set": artifact_set,
+            "target_name": target_name, "normalizer_name": normalizer_name,
+            "selections": selections, "source_lock_sha256": source_lock["source_lock_sha256"],
+            "preprocess_config_sha256": source_lock["config_sha256"],
+            "runtime_code_sha256": runtime_code_sha256(), "model_code_sha256": model_code_sha256(),
+            "phoneme_vocabulary": vocabulary, "artifact_hashes": artifact_hashes,
+            "resume_contract": current_contract, "steps_completed": completed_steps,
+            "epochs_completed": completed_epochs, "checkpoint_kind": checkpoint_kind,
+            "validation_selection": validation,
+        }
 
     def save_training_state(*, interrupted: bool = False, completed: bool = False) -> None:
         payload = {
             "resume_contract": current_contract, "model": model.state_dict(),
             "optimizer": optimizer.state_dict(), "completed_steps": completed_steps,
-            "maximum_steps": maximum, "history": history,
+            "maximum_steps": maximum, "maximum_epochs": maximum_epochs,
+            "steps_per_epoch": steps_per_epoch, "completed_epochs": completed_epochs, "history": history,
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "seen_batch_sources": sorted(seen_batch_sources), "early_stopped": early_stopped,
+            "validation_history": validation_history, "best_validation": best_validation,
+            "validation_without_improvement": validation_without_improvement,
+            "best_checkpoint_path": str(best_checkpoint_path) if best_checkpoint_path.exists() else "",
             "batch_schedule": schedule, "interrupted": interrupted, "completed": completed,
             "python_random_state": random.getstate(), "numpy_random_state": np.random.get_state(),
             "torch_rng_state": torch.get_rng_state(),
@@ -431,6 +589,11 @@ def main() -> int:
                                f"{changed}; use --restart to deliberately discard its progress")
         maximum, preserved_original_maximum = resume_maximum_steps(maximum, previous)
         completed_steps = int(previous.get("completed_steps", 0))
+        if int(previous.get("steps_per_epoch", steps_per_epoch)) != steps_per_epoch:
+            raise RuntimeError("partial checkpoint has incompatible steps_per_epoch")
+        if previous.get("maximum_epochs", maximum_epochs) != maximum_epochs:
+            raise RuntimeError("partial checkpoint has incompatible maximum_epochs")
+        completed_epochs = int(previous.get("completed_epochs", completed_steps // steps_per_epoch if steps_per_epoch else 0))
         model.load_state_dict(previous["model"])
         optimizer.load_state_dict(previous["optimizer"])
         optimizer_to(optimizer, device())
@@ -441,6 +604,9 @@ def main() -> int:
         history = list(previous.get("history", []))
         seen_batch_sources = set(previous.get("seen_batch_sources", []))
         early_stopped = bool(previous.get("early_stopped", False))
+        validation_history = list(previous.get("validation_history", []))
+        best_validation = previous.get("best_validation")
+        validation_without_improvement = int(previous.get("validation_without_improvement", 0))
         # The sampler has a deterministic private generator. Replaying its
         # consumed batches recreates the next batch without serialising
         # DataLoader, MNE, or HDF5 state.
@@ -487,11 +653,16 @@ def main() -> int:
             if scheduler is not None:
                 scheduler.step()
             completed_steps = step
-            if name not in seen_batch_sources or step % 100 == 0:
+            if steps_per_epoch and completed_steps % steps_per_epoch == 0:
+                completed_epochs = completed_steps // steps_per_epoch
+            screen_interval = int(cfg["training"].get("train_screen_interval_steps", 100))
+            if screen_interval < 1:
+                raise ValueError("train_screen_interval_steps must be positive")
+            if name not in seen_batch_sources or step % screen_interval == 0:
                 seen_batch_sources.add(name)
                 history.append({"step": step, "dataset": name,
                                 "learning_rate": float(optimizer.param_groups[0]["lr"]), **metrics})
-                if step % 100 == 0:
+                if step % screen_interval == 0:
                     screen = {dataset_name: full_content_retrieval(model, evaluation_loaders[dataset_name], device())
                               for dataset_name in names}
                     history[-1]["full_content_retrieval_r1"] = screen
@@ -500,6 +671,28 @@ def main() -> int:
                     ):
                         early_stopped = True
                 print(json.dumps(history[-1]))
+            if validation_interval_steps is not None and completed_steps % validation_interval_steps == 0:
+                validation = validation_metrics(model, validation_loaders[names[0]], device())
+                validation.update({"step": completed_steps, "epoch": completed_epochs,
+                                   "learning_rate": float(optimizer.param_groups[0]["lr"])})
+                improved = validation_improved(
+                    validation, best_validation, float(validation_spec.get("minimum_delta", 0.0)),
+                )
+                validation["improved"] = improved
+                if improved:
+                    best_validation = validation
+                    validation_without_improvement = 0
+                    atomic_torch_save(
+                        model_payload(checkpoint_kind="best_validation", validation=validation), best_checkpoint_path,
+                    )
+                else:
+                    validation_without_improvement += 1
+                validation["validations_without_improvement"] = validation_without_improvement
+                validation_history.append(validation)
+                if (completed_epochs >= int(validation_spec["minimum_epochs"])
+                        and validation_without_improvement >= int(validation_spec["patience_validations"])):
+                    early_stopped = True
+                print(json.dumps({"validation": validation, "early_stopped": early_stopped}))
             if completed_steps % checkpoint_every == 0 or early_stopped or stop_requested[0] is not None:
                 save_training_state(interrupted=stop_requested[0] is not None)
             if early_stopped or stop_requested[0] is not None:
@@ -522,19 +715,18 @@ def main() -> int:
         return 130
 
     controls = {name: evaluate_batch(model, next(iter(loaders[name])), device()) for name in names}
-    final_payload = {
-        "model": model.state_dict(), "model_config": cfg["model"], "pilot_config": cfg,
-        "mode": args.mode, "stage": args.stage, "seed": args.seed, "run_kind": run_kind,
-        "split_protocol": split_protocol,
-        "artifact_set": artifact_set, "target_name": target_name, "normalizer_name": normalizer_name,
-        "selections": selections, "source_lock_sha256": source_lock["source_lock_sha256"],
-        "preprocess_config_sha256": source_lock["config_sha256"],
-        "runtime_code_sha256": runtime_code_sha256(), "model_code_sha256": model_code_sha256(),
-        "phoneme_vocabulary": vocabulary,
-        "artifact_hashes": artifact_hashes, "resume_contract": current_contract,
-        "steps_completed": completed_steps,
-    }
-    atomic_torch_save(final_payload, final_checkpoint_path)
+    atomic_torch_save(model_payload(checkpoint_kind="last", validation=best_validation), last_checkpoint_path)
+    if validation_spec is not None:
+        if best_validation is None or not best_checkpoint_path.exists():
+            raise RuntimeError("epoch-defined training completed without a validation-selected checkpoint")
+        selected_payload = torch.load(best_checkpoint_path, map_location="cpu", weights_only=False)
+        selected_kind = "best_validation"
+    else:
+        selected_payload = model_payload(checkpoint_kind="last", validation=None)
+        selected_kind = "last"
+    selected_payload["selected_checkpoint_kind"] = selected_kind
+    selected_payload["last_steps_completed"] = completed_steps
+    atomic_torch_save(selected_payload, final_checkpoint_path)
     save_training_state(completed=True)
     interpretation = ("engineering_only_no_scientific_gate_claim" if args.smoke_model
                       else ("exploratory_only_gates_bypassed_not_registered" if args.explore
@@ -542,13 +734,22 @@ def main() -> int:
     (checkpoint_dir / "metrics.json").write_text(json.dumps({"run_kind": run_kind, "interpretation": interpretation,
                                                               "selections": selections, "history": history,
                                                               "controls": controls, "steps_completed": completed_steps,
+                                                              "epochs_completed": completed_epochs,
+                                                              "steps_per_epoch": steps_per_epoch,
+                                                              "maximum_epochs": maximum_epochs,
                                                               "early_stopped": early_stopped,
+                                                              "validation_history": validation_history,
+                                                              "best_validation": best_validation,
+                                                              "selected_checkpoint_kind": selected_kind,
+                                                              "best_checkpoint": str(best_checkpoint_path) if best_checkpoint_path.exists() else "",
+                                                              "last_checkpoint": str(last_checkpoint_path),
                                                               "batch_schedule": schedule,
                                                               "learning_rate_schedule": cfg["training"].get("lr_schedule", "constant"),
                                                               "runtime_code_sha256": runtime_code_sha256(),
                                                               "artifact_hashes": artifact_hashes}, indent=2) + "\n")
     print(json.dumps({"checkpoint": str(final_checkpoint_path), "run_kind": run_kind,
-                      "interpretation": interpretation, "controls": controls}, indent=2))
+                      "interpretation": interpretation, "selected_checkpoint_kind": selected_kind,
+                      "best_validation": best_validation, "controls": controls}, indent=2))
     for dataset in datasets.values(): dataset.close()
     return 0
 

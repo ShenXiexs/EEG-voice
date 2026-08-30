@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import yaml
 from scipy.io import wavfile
+from tqdm.auto import tqdm
 
 APP = Path(__file__).resolve().parent
 ROOT = APP.parent
@@ -287,7 +288,7 @@ def one_record(dataset: JointManifestDataset, index: int) -> tuple[dict[str, Any
 
 def export_trial(*, output: Path, single: RunContext, joint: RunContext | None, renderer: AudioMFCCRenderer,
                  renderer_checkpoint: Path, dataset_name: str, role: str, index: int, seed: int,
-                 iterations: int, target_device: torch.device) -> dict[str, Any]:
+                 iterations: int, target_device: torch.device, selection_policy: str = "all_selected_pairs") -> dict[str, Any]:
     single_dataset, single_indices = selected_indices(single, dataset_name, role)
     joint_dataset = None
     try:
@@ -340,6 +341,7 @@ def export_trial(*, output: Path, single: RunContext, joint: RunContext | None, 
         metadata = {
             "schema_version": "eeg2speech-audio-pair-comparison-v1",
             "trial_id": trial_id, "dataset": dataset_name, "role": role,
+            "selection_policy": selection_policy,
             "subject": str(row["subject"]), "task": str(row["task"]), "condition": str(row["condition"]),
             "tms_applied": str(row.get("tms_applied", "")), "linguistic_content_id": str(row["linguistic_content_id"]),
             "pairing_level": str(row["pairing_level"]), "audio_semantics": str(row["audio_semantics"]),
@@ -375,6 +377,18 @@ def parse_csv(value: str, choices: set[str], flag: str) -> list[str]:
     return result
 
 
+def one_train_representative_per_content(dataset: JointManifestDataset, ordered: list[int]) -> list[int]:
+    """Keep the first stable trial for every content after deterministic sorting."""
+    seen: set[str] = set()
+    result: list[int] = []
+    for index in ordered:
+        content = str(dataset.frame.iloc[index].linguistic_content_id)
+        if content not in seen:
+            seen.add(content)
+            result.append(index)
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment-root", type=Path, required=True, help="output root containing generalization/<mode>/seed-N checkpoints")
@@ -384,6 +398,10 @@ def main() -> int:
     parser.add_argument("--roles", default="validation,test")
     parser.add_argument("--max-pairs", type=int, default=3, help="deterministic pairs per dataset/role/seed; 0 exports all")
     parser.add_argument("--griffin-lim-iterations", type=int, default=32)
+    parser.add_argument("--one-train-representative-per-content", action="store_true",
+                        help="for role=train, export one deterministic subject×trial per linguistic content")
+    parser.add_argument("--manifest-name", default="export_manifest",
+                        help="safe basename for this invocation's CSV/JSON manifest")
     parser.add_argument("--single-only", action="store_true",
                         help="export one dataset checkpoint and its EEG controls; do not require a joint checkpoint")
     parser.add_argument("--overwrite", action="store_true", help="replace an already complete trial bundle")
@@ -392,6 +410,8 @@ def main() -> int:
         parser.error("--max-pairs must be nonnegative")
     if args.griffin_lim_iterations < 1:
         parser.error("--griffin-lim-iterations must be positive")
+    if not args.manifest_name.replace("_", "").replace("-", "").isalnum():
+        parser.error("--manifest-name must contain only letters, numbers, _ and -")
     seeds = [int(value.strip()) for value in args.seeds.split(",") if value.strip()]
     datasets = parse_csv(args.datasets, {"ds004940", "ds006104"}, "--datasets")
     roles = parse_csv(args.roles, {"train", "validation", "test"}, "--roles")
@@ -400,7 +420,13 @@ def main() -> int:
     if not renderer_path.exists():
         raise RuntimeError(f"renderer checkpoint is missing: {renderer_path}")
     configure(); target_device = device(); renderer = load_renderer(renderer_path, target_device)
-    exported: list[dict[str, Any]] = []
+    # Resolve the complete deterministic export plan before rendering.  Griffin--
+    # Lim is intentionally relatively slow, so a pair-level progress bar is
+    # more useful than printing only after each comparison bundle finishes.
+    # It includes already-complete folders: a resumed invocation therefore
+    # immediately shows how much work will be skipped versus rendered.
+    export_plan: list[tuple[int, str, str, int, str]] = []
+    contexts_by_seed: dict[int, tuple[dict[str, RunContext], RunContext | None]] = {}
     for seed in seeds:
         single_contexts = {}
         for dataset_name in datasets:
@@ -414,37 +440,58 @@ def main() -> int:
             if not joint_checkpoint.exists():
                 raise RuntimeError(f"joint checkpoint is missing: {joint_checkpoint}")
             joint_context = load_context(joint_checkpoint, target_device)
+        contexts_by_seed[seed] = (single_contexts, joint_context)
         for dataset_name in datasets:
             for role in roles:
                 dataset, indices = selected_indices(single_contexts[dataset_name], dataset_name, role)
                 try:
                     ordered = sorted(indices, key=lambda item: hashlib.sha256(
                         str(dataset.frame.iloc[item].trial_id).encode()).hexdigest())
+                    if args.one_train_representative_per_content and role == "train":
+                        ordered = one_train_representative_per_content(dataset, ordered)
                     trial_ids = {item: str(dataset.frame.iloc[item].trial_id) for item in ordered}
                 finally:
                     dataset.close()
                 if args.max_pairs:
                     ordered = ordered[:args.max_pairs]
                 for index in ordered:
-                    trial_id = trial_ids[index]
-                    folder = experiment_root / "generalization" / "audio_pair_comparisons" / f"seed-{seed}" / dataset_name / role / trial_id
-                    if (folder / "metadata.json").exists() and not args.overwrite:
-                        print(json.dumps({"status": "skip_complete", "folder": str(folder)})); continue
-                    exported.append(export_trial(output=folder, single=single_contexts[dataset_name], joint=joint_context,
-                                                  renderer=renderer, renderer_checkpoint=renderer_path,
-                                                  dataset_name=dataset_name, role=role, index=index, seed=seed,
-                                                  iterations=args.griffin_lim_iterations, target_device=target_device))
+                    export_plan.append((seed, dataset_name, role, index, trial_ids[index]))
+
+    selection_policy = ("one_train_representative_per_content"
+                        if args.one_train_representative_per_content else "all_selected_pairs")
+    print(json.dumps({"status": "export_plan_ready", "pairs_total": len(export_plan),
+                      "griffin_lim_iterations": args.griffin_lim_iterations,
+                      "selection_policy": selection_policy,
+                      "overwrite": args.overwrite}, indent=2))
+    exported: list[dict[str, Any]] = []
+    skipped_complete = 0
+    progress = tqdm(export_plan, desc="Audio comparison bundles", unit="pair", dynamic_ncols=True, mininterval=0.5)
+    for seed, dataset_name, role, index, trial_id in progress:
+        progress.set_postfix_str(f"seed={seed} {dataset_name} {role}", refresh=False)
+        folder = experiment_root / "generalization" / "audio_pair_comparisons" / f"seed-{seed}" / dataset_name / role / trial_id
+        if (folder / "metadata.json").exists() and not args.overwrite:
+            skipped_complete += 1
+            continue
+        single_contexts, joint_context = contexts_by_seed[seed]
+        exported.append(export_trial(output=folder, single=single_contexts[dataset_name], joint=joint_context,
+                                     renderer=renderer, renderer_checkpoint=renderer_path,
+                                     dataset_name=dataset_name, role=role, index=index, seed=seed,
+                                     iterations=args.griffin_lim_iterations, target_device=target_device,
+                                     selection_policy=selection_policy))
     output_root = experiment_root / "generalization" / "audio_pair_comparisons"
     output_root.mkdir(parents=True, exist_ok=True)
-    manifest = output_root / "export_manifest.csv"
+    manifest = output_root / f"{args.manifest_name}.csv"
     with manifest.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["seed", "dataset", "role", "trial_id", "subject", "pairing_level", "folder"])
         writer.writeheader(); writer.writerows(exported)
     summary = {"schema_version": "eeg2speech-audio-pair-export-v1", "experiment_root": str(experiment_root),
                "renderer_checkpoint": str(renderer_path), "renderer_sha256": sha256_file(renderer_path),
-               "exports_written_this_invocation": len(exported), "manifest_csv": str(manifest),
+               "pairs_considered_this_invocation": len(export_plan),
+               "exports_written_this_invocation": len(exported),
+               "skipped_complete_this_invocation": skipped_complete, "manifest_csv": str(manifest),
+               "selection_policy": selection_policy,
                "warning": "All generated WAVs are Griffin-Lim diagnostics from predicted log-mel, not outputs from a validated neural vocoder."}
-    (output_root / "export_manifest.json").write_text(json.dumps(summary, indent=2) + "\n")
+    (output_root / f"{args.manifest_name}.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2)); return 0
 
 

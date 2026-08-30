@@ -34,6 +34,37 @@ class TestStage2Split(unittest.TestCase):
         with self.assertRaises(ValueError):
             stage2.stage2_datasets({"stage2": {"datasets": ["ds004940", "ds004940"]}})
 
+    def test_large_scale_config_uses_all_ds004940_contents_in_a_double_ood_grid(self):
+        config_path = ROOT / "configs/ds004940_large_scale_v1.yaml"
+        if not config_path.exists():
+            self.fail(f"missing large-scale config: {config_path}")
+        import yaml
+        pilot = yaml.safe_load(config_path.read_text())["pilot"]
+        self.assertEqual(pilot["generalization_subjects_by_role"], {"train": 10, "validation": 2, "test": 2})
+        self.assertEqual(pilot["generalization_contents_by_role"], {"train": 338, "validation": 32, "test": 32})
+        self.assertEqual(pilot["max_train_trials_per_dataset"], 3380)
+        self.assertEqual(pilot["max_validation_trials_per_dataset"], 64)
+        self.assertEqual(pilot["max_test_trials_per_dataset"], 64)
+        self.assertEqual(sum(pilot["generalization_contents_by_role"].values()), 402)
+
+    def test_real_ds004940_active_manifest_supports_the_large_complete_grid(self):
+        manifest = ROOT / "artifacts/training_data/v3/manifests/manifest_all.csv"
+        if not manifest.exists(): self.skipTest("DS004940 manifest is unavailable")
+        frame = pd.read_csv(manifest, keep_default_na=False, low_memory=False)
+        from prepare_training_data import load_config
+        data_config, _ = load_config(ROOT / "configs/training_data_v3.yaml")
+        active = frame[(frame.dataset == "ds004940") & (frame.build_status == "included") &
+                       (frame.qc_pass.astype(str).str.lower() == "true") &
+                       (frame.task == "N400Active") & frame.supervision_type.isin(["paired_audio", "weak_audio"])]
+        active = active[stage2.declared_channel_qc_mask(active, data_config)]
+        subjects, contents = stage2.choose_subjects(active, 14, 402, "test-large-ds004940")
+        self.assertEqual(len(subjects), 14)
+        self.assertEqual(len(contents), 402)
+        subject_roles = stage2.assign(subjects, {"train": 10, "validation": 2, "test": 2}, "subject")
+        content_roles = stage2.assign(contents, {"train": 338, "validation": 32, "test": 32}, "content")
+        self.assertEqual(pd.Series(subject_roles).value_counts().to_dict(), {"train": 10, "validation": 2, "test": 2})
+        self.assertEqual(pd.Series(content_roles).value_counts().to_dict(), {"train": 338, "validation": 32, "test": 32})
+
     def test_declared_bad_channel_qc_is_applied_before_subject_selection(self):
         frame = pd.DataFrame([
             {"dataset": "ds004940", "bad_channels": '["A1", "A2"]'},
