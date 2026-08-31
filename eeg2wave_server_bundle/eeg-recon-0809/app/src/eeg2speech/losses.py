@@ -119,27 +119,45 @@ def joint_content_loss(state: JointState, batch: dict, model, weights: dict) -> 
         # Block shuffle preserves local EEG spectrum; a full sample permutation
         # can be detected trivially rather than testing temporal decoding.
         model_mask = batch.get("model_time_mask", batch["time_mask"])
-        shuffled = counterfactual_eeg(batch["eeg"], "time_block_shuffle", time_mask=model_mask, channel_mask=batch["channel_mask"])
-        controls.append(model(shuffled, batch["channel_xyz"], batch["channel_mask"], model_mask, batch["dataset_id"]).mfcc)
-        labels = list(batch["linguistic_content_id"])
-        subjects = list(batch.get("subject", [""] * len(labels)))
-        order = []
-        for index, label in enumerate(labels):
-            candidate = next((other for other, other_label in enumerate(labels)
-                              if other_label != label and subjects[other] == subjects[index]), None)
-            if candidate is None:
-                candidate = next((other for other, other_label in enumerate(labels) if other_label != label), None)
-            if candidate is None:
-                raise RuntimeError("wrong-trial ranking requires at least two contents in a batch")
-            order.append(candidate)
-        swapped = batch["eeg"][torch.tensor(order, device=batch["eeg"].device)]
-        controls.append(model(swapped, batch["channel_xyz"], batch["channel_mask"], model_mask, batch["dataset_id"]).mfcc)
+        # Counterfactual outputs are fixed comparison baselines.  Their role is
+        # to push the *correct* EEG prediction below a detached control error;
+        # backpropagating through two additional full EEG encoders merely lets
+        # the model manipulate the controls and, on MPS, exhausts memory before
+        # the first optimizer step.  This keeps the ranking gradient on the
+        # correct branch while making the control branch scientifically stable
+        # and O(1) in autograd memory.
+        with torch.no_grad():
+            shuffled = counterfactual_eeg(batch["eeg"], "time_block_shuffle", time_mask=model_mask,
+                                           channel_mask=batch["channel_mask"])
+            controls.append(model(shuffled, batch["channel_xyz"], batch["channel_mask"],
+                                  model_mask, batch["dataset_id"]).mfcc.detach())
+            labels = list(batch["linguistic_content_id"])
+            subjects = list(batch.get("subject", [""] * len(labels)))
+            if len(set(labels)) < 2:
+                # Weighted M0 sampling can rarely draw one content repeatedly.
+                # Keep the valid time-block control, but omit the unavailable
+                # wrong-trial comparator rather than aborting training.
+                pass
+            else:
+                order = []
+                for index, label in enumerate(labels):
+                    candidate = next((other for other, other_label in enumerate(labels)
+                                      if other_label != label and subjects[other] == subjects[index]), None)
+                    if candidate is None:
+                        candidate = next((other for other, other_label in enumerate(labels) if other_label != label), None)
+                    if candidate is None:
+                        raise RuntimeError("wrong-trial ranking requires at least two contents in a batch")
+                    order.append(candidate)
+                swapped = batch["eeg"][torch.tensor(order, device=batch["eeg"].device)]
+                controls.append(model(swapped, batch["channel_xyz"], batch["channel_mask"],
+                                      model_mask, batch["dataset_id"]).mfcc.detach())
         margin = float(weights.get("counterfactual_margin", 0.02))
         values = []
         for prediction in controls:
             control_error = (prediction[eligible] - batch["content_mfcc"][eligible]).abs().mean((1, 2))
             values.append(F.relu(margin + correct_error - control_error).mean())
-        rank = torch.stack(values).mean()
+        if values:
+            rank = torch.stack(values).mean()
     total = (float(weights["mfcc"]) * mfcc + float(weights["delta"]) * delta +
              float(weights["local_alignment"]) * local + float(weights["global_clip"]) * global_ +
              float(weights["phoneme_auxiliary"]) * phoneme +

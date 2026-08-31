@@ -85,6 +85,8 @@ def resume_contract(*, args: argparse.Namespace, cfg: dict, artifact_hashes: dic
         "split_protocol": split_protocol, "artifact_set": artifact_set,
         "target_name": target_name, "normalizer_name": normalizer_name,
         "model_config_sha256": stable_sha256(cfg["model"]),
+        "batch_size": int(cfg["training"]["batch_size"]),
+        "content_grouped_batch": cfg["training"].get("content_grouped_batch"),
         "pilot_config_sha256": sha256_file(args.config),
         "model_code_sha256": model_code_sha256(),
         "source_lock_sha256": source_lock["source_lock_sha256"],
@@ -404,6 +406,12 @@ def main() -> int:
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--max-epochs", type=int,
                         help="single-dataset epoch horizon; mutually exclusive with --max-steps")
+    parser.add_argument("--batch-size", type=int,
+                        help="override batch size; recorded in the resumability contract")
+    parser.add_argument("--contents-per-batch", type=int,
+                        help="generalization only: content groups per DS004940 batch")
+    parser.add_argument("--subjects-per-content", type=int,
+                        help="generalization only: same-content subjects per DS004940 batch")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke-model", action="store_true", help="use a 48-dim/1-layer engineering smoke model")
     parser.add_argument("--explore", action="store_true",
@@ -417,6 +425,26 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text())
+    if args.batch_size is not None:
+        if args.batch_size < 1:
+            parser.error("--batch-size must be positive")
+        cfg["training"]["batch_size"] = int(args.batch_size)
+    if args.contents_per_batch is not None or args.subjects_per_content is not None:
+        if args.stage != "generalization":
+            parser.error("content-group batch overrides are only valid for generalization")
+        grouped = dict(cfg["training"].get("content_grouped_batch", {}))
+        if args.contents_per_batch is not None:
+            if args.contents_per_batch < 1:
+                parser.error("--contents-per-batch must be positive")
+            grouped["contents_per_batch"] = int(args.contents_per_batch)
+        if args.subjects_per_content is not None:
+            if args.subjects_per_content < 1:
+                parser.error("--subjects-per-content must be positive")
+            grouped["subjects_per_content"] = int(args.subjects_per_content)
+        expected_batch = int(grouped.get("contents_per_batch", 4)) * int(grouped.get("subjects_per_content", 2))
+        if int(cfg["training"]["batch_size"]) != expected_batch:
+            parser.error("--batch-size must equal --contents-per-batch × --subjects-per-content")
+        cfg["training"]["content_grouped_batch"] = grouped
     if args.smoke_model:
         cfg["model"].update({"dimension": 48, "heads": 4, "layers": 1, "local_layers": 1, "dropout": 0.0})
         cfg["training"]["batch_size"] = 2
@@ -550,9 +578,13 @@ def main() -> int:
                                 "labels": int(selected.phoneme_label.nunique()),
                                 "subject_counts": selected.groupby("subject").size().astype(int).to_dict()}
 
-    validation_spec = cfg["training"].get("validation_early_stopping")
+    # The same pilot config is shared by M0 and M1.  Early stopping is an M1
+    # (generalization) protocol only; M0 is intentionally a fixed-step
+    # overfit diagnostic and must not require --max-epochs.
+    validation_spec = (cfg["training"].get("validation_early_stopping")
+                       if args.stage == "generalization" else None)
     if validation_spec is not None:
-        if args.stage != "generalization" or args.mode == "joint" or len(names) != 1:
+        if args.mode == "joint" or len(names) != 1:
             raise RuntimeError("validation_early_stopping requires single-dataset generalization training")
         validation_dataset = JointManifestDataset(
             manifest_path, split_path, "validation", names[0], target_path, normalizer_path,
@@ -606,7 +638,8 @@ def main() -> int:
         loader_count=len(loaders), steps_per_epoch=steps_per_epoch,
     )
     validation_interval_steps: int | None = None
-    validation_spec = cfg["training"].get("validation_early_stopping")
+    validation_spec = (cfg["training"].get("validation_early_stopping")
+                       if args.stage == "generalization" else None)
     if validation_spec is not None:
         if maximum_epochs is None:
             raise RuntimeError("validation_early_stopping requires max_epochs, not max_steps")

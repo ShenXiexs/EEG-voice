@@ -13,7 +13,13 @@ EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$RUN_ROOT/$EXPERIMENT_NAME}"
 V2_FROM="${V2_FROM:-all}" # all | a0 | m0 | m1 | resume (M0 through final export)
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-50}"
 M0_STEPS="${M0_STEPS:-5000}"
+M0_BATCH_SIZE="${M0_BATCH_SIZE:-2}"
 M1_EPOCHS="${M1_EPOCHS:-50}"
+M1_BATCH_SIZE="${M1_BATCH_SIZE:-4}"
+M1_CONTENTS_PER_BATCH="${M1_CONTENTS_PER_BATCH:-2}"
+M1_SUBJECTS_PER_CONTENT="${M1_SUBJECTS_PER_CONTENT:-2}"
+THERMAL_MODE="${THERMAL_MODE:-1}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-90}"
 NATIVE_RENDERER_STEPS="${NATIVE_RENDERER_STEPS:-2000}"
 DIFFUSION_DENOISE="${DIFFUSION_DENOISE:-0}"
 DIFFUSION_TRAIN_STEPS="${DIFFUSION_TRAIN_STEPS:-2000}"
@@ -21,6 +27,19 @@ V2_BYPASS_M0="${V2_BYPASS_M0:-0}"
 A0_MAX_PAIRS="${A0_MAX_PAIRS:-402}"
 case "$V2_FROM" in all|a0|m0|m1|resume) ;; *) echo "V2_FROM must be all, a0, m0, m1, or resume" >&2; exit 2 ;; esac
 case "$DIFFUSION_DENOISE" in 0|1) ;; *) echo "DIFFUSION_DENOISE must be 0 or 1" >&2; exit 2 ;; esac
+case "$THERMAL_MODE" in 0|1) ;; *) echo "THERMAL_MODE must be 0 or 1" >&2; exit 2 ;; esac
+
+# Conservative defaults for a laptop: cap CPU helper threads, encourage MPS
+# garbage collection, and leave headroom for macOS.  They do not alter EEG,
+# audio targets, optimization semantics, or reported metrics.
+if [[ "$THERMAL_MODE" == "1" ]]; then
+  export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+  export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+  export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-2}"
+  export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-2}"
+  export PYTORCH_MPS_HIGH_WATERMARK_RATIO="${PYTORCH_MPS_HIGH_WATERMARK_RATIO:-0.75}"
+  export PYTORCH_MPS_LOW_WATERMARK_RATIO="${PYTORCH_MPS_LOW_WATERMARK_RATIO:-0.40}"
+fi
 
 start_joint_log "$EXPERIMENT_NAME"
 require_joint_runtime
@@ -30,6 +49,7 @@ cd "$PROJECT_ROOT"
 echo "WARNING: v2 is exploratory until pairing/listening gates are completed."
 echo "experiment_root=$EXPERIMENT_ROOT"
 echo "resume_from=$V2_FROM"
+echo "thermal_mode=$THERMAL_MODE m0_batch=$M0_BATCH_SIZE m1_batch=$M1_BATCH_SIZE (${M1_CONTENTS_PER_BATCH} contents x ${M1_SUBJECTS_PER_CONTENT} subjects)"
 
 if [[ "$V2_FROM" == "all" || "$V2_FROM" == "a0" ]]; then
   joint_run "$PYTHON_BIN" scripts/prepare_training_data.py --config "$DATA_CONFIG" audit
@@ -51,7 +71,8 @@ if [[ "$V2_FROM" == "all" || "$V2_FROM" == "m0" || "$V2_FROM" == "resume" ]]; th
     --manifest artifacts/training_data/v4_ds004940_fixed/manifests/manifest_explore_m0.csv \
     --output "$EXPERIMENT_ROOT/d0_fixed_window_m0.json"
   joint_run "$PYTHON_BIN" app/train_joint.py --config "$PILOT_CONFIG" --mode ds004940 --stage overfit \
-    --seed 31 --explore --max-steps "$M0_STEPS" --checkpoint-every "$CHECKPOINT_EVERY" --output-root "$EXPERIMENT_ROOT"
+    --seed 31 --explore --max-steps "$M0_STEPS" --batch-size "$M0_BATCH_SIZE" \
+    --checkpoint-every "$CHECKPOINT_EVERY" --output-root "$EXPERIMENT_ROOT"
   joint_run "$PYTHON_BIN" app/evaluate_joint.py \
     --checkpoint "$EXPERIMENT_ROOT/overfit/ds004940/seed-31/checkpoint.pt" --dataset ds004940 --role train
 fi
@@ -76,10 +97,16 @@ PY
     --explore --materialize --hubert-local-path "$HUBERT_LOCAL_PATH"
   for seed in $(pilot_seeds); do
     joint_run "$PYTHON_BIN" app/train_joint.py --config "$PILOT_CONFIG" --mode ds004940 --stage generalization \
-      --seed "$seed" --explore --max-epochs "$M1_EPOCHS" --checkpoint-every "$CHECKPOINT_EVERY" --output-root "$EXPERIMENT_ROOT"
+      --seed "$seed" --explore --max-epochs "$M1_EPOCHS" --batch-size "$M1_BATCH_SIZE" \
+      --contents-per-batch "$M1_CONTENTS_PER_BATCH" --subjects-per-content "$M1_SUBJECTS_PER_CONTENT" \
+      --checkpoint-every "$CHECKPOINT_EVERY" --output-root "$EXPERIMENT_ROOT"
     checkpoint="$EXPERIMENT_ROOT/generalization/ds004940/seed-$seed/checkpoint.pt"
     joint_run "$PYTHON_BIN" app/evaluate_joint.py --checkpoint "$checkpoint" --dataset ds004940 --role validation
     joint_run "$PYTHON_BIN" app/evaluate_joint.py --checkpoint "$checkpoint" --dataset ds004940 --role test
+    if [[ "$COOLDOWN_SECONDS" -gt 0 ]]; then
+      echo "cooldown_seconds=$COOLDOWN_SECONDS after seed=$seed"
+      sleep "$COOLDOWN_SECONDS"
+    fi
   done
   ARTIFACT="artifacts/training_data/v4_ds004940_fixed"
   joint_run "$PYTHON_BIN" app/train_native_audio_renderer.py --config "$PILOT_CONFIG" \
