@@ -174,6 +174,20 @@ def stratified_error(errors: list[float], metadata: dict[str, list[str]]) -> dic
     return result
 
 
+def wrong_trial_order(labels: list[str], subjects: list[str], device: torch.device) -> torch.Tensor:
+    """Deterministically select another-content EEG trial for every target."""
+    if len(labels) < 2 or len(set(labels)) < 2:
+        raise RuntimeError("wrong_trial control requires at least two distinct contents per batch")
+    order = []
+    for index, label in enumerate(labels):
+        candidate = next((other for other, other_label in enumerate(labels)
+                          if other_label != label and subjects[other] == subjects[index]), None)
+        if candidate is None:
+            candidate = next(other for other, other_label in enumerate(labels) if other_label != label)
+        order.append(candidate)
+    return torch.tensor(order, dtype=torch.long, device=device)
+
+
 def leave_one_out_subject_probe(embeddings: torch.Tensor, subjects: list[str]) -> dict[str, float | int]:
     """Nearest-centroid diagnostic; high accuracy signals subject leakage."""
     if len(embeddings) < 2 or len(set(subjects)) < 2:
@@ -232,7 +246,7 @@ def evaluate_label_only(model, manifest: Path, split: Path, role: str, targets: 
     with torch.no_grad():
         for batch in loader:
             tensor = {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
-            state = model(tensor["eeg"], tensor["channel_xyz"], tensor["channel_mask"], tensor["time_mask"], tensor["dataset_id"])
+            state = model(tensor["eeg"], tensor["channel_xyz"], tensor["channel_mask"], tensor.get("model_time_mask", tensor["time_mask"]), tensor["dataset_id"])
             valid = tensor["phoneme_index"] >= 0; predicted = state.phoneme_logits.argmax(1)
             match = predicted[valid] == tensor["phoneme_index"][valid]
             correct += int(match.sum()); total += int(valid.sum())
@@ -307,17 +321,28 @@ def main() -> int:
                         collate_fn=homogeneous_collate)
     target_device = _device()
     model = JointEEGContentModel(**payload["model_config"]).to(target_device)
-    model.load_state_dict(payload["model"]); model.eval()
+    model.load_state_dict(payload["model"], strict=False)
+    templates = payload.get("target_templates")
+    if bool(payload["model_config"].get("zero_centered", False)):
+        if not templates:
+            raise RuntimeError("zero-centered checkpoint is missing its train-fold template")
+        model.set_target_templates(templates["mfcc_mean"], templates["mfcc_scale"], templates.get("hubert_mean"))
+    model.eval()
     label_only_metrics = (evaluate_label_only(model, manifest, split, args.role, targets, normalizer, cfg, vocabulary, target_device)
                           if args.dataset == "ds006104" else {"status": "not_applicable", "pairs": 0})
     predictions=[]; target_values=[]; subjects=[]; contents=[]; audio_ids=[]; tasks=[]; conditions=[]; tms_conditions=[]
     target_mels=[]; target_rms=[]; target_activities=[]; exact_flags=[]
     eeg_globals=[]; hubert_eeg_local=[]; hubert_audio_local=[]; hubert_eeg_global=[]; hubert_audio_global=[]; hubert_labels=[]
-    control_errors=defaultdict(list)
+    configured_controls = tuple(control for control in cfg.get("controls", ("zero", "time_shuffle", "channel_shuffle"))
+                                if control in {"zero", "time_shuffle", "time_block_shuffle", "channel_shuffle", "wrong_trial"})
+    if not configured_controls:
+        configured_controls = ("zero", "time_shuffle", "channel_shuffle")
+    control_errors=defaultdict(list); residual_values=[]; target_residual_values=[]; zero_template_errors=[]
     with torch.no_grad():
         for batch in loader:
             tensor = {key: value.to(target_device) if torch.is_tensor(value) else value for key, value in batch.items()}
-            state = model(tensor["eeg"], tensor["channel_xyz"], tensor["channel_mask"], tensor["time_mask"], tensor["dataset_id"])
+            model_time_mask = tensor.get("model_time_mask", tensor["time_mask"])
+            state = model(tensor["eeg"], tensor["channel_xyz"], tensor["channel_mask"], model_time_mask, tensor["dataset_id"])
             eligible = tensor["pairing_weight"] > 0
             if eligible.any():
                 predictions.append(state.mfcc[eligible].cpu()); target_values.append(tensor["content_mfcc"][eligible].cpu())
@@ -331,7 +356,7 @@ def main() -> int:
                 eeg_globals.append(state.global_embedding[eligible].cpu())
                 hubert_eligible = eligible & tensor["hubert_mask"].any(1)
                 if hubert_eligible.any():
-                    audio_local = model.project_audio(tensor["hubert_local"][hubert_eligible])
+                    audio_local = model.centered_audio(tensor["hubert_local"][hubert_eligible])
                     hubert_eeg_local.append(state.local[hubert_eligible].cpu()); hubert_audio_local.append(audio_local.cpu())
                     hubert_eeg_global.append(state.global_embedding[hubert_eligible].cpu())
                     hubert_audio_global.append(torch.nn.functional.normalize(audio_local.mean(1), dim=-1).cpu())
@@ -339,11 +364,20 @@ def main() -> int:
                     hubert_labels.extend(batch["linguistic_content_id"][i] for i in hubert_indices)
                 correct = (state.mfcc[eligible] - tensor["content_mfcc"][eligible]).abs().mean((1,2))
                 control_errors["correct"].extend(correct.cpu().tolist())
-                for control in ("zero", "time_shuffle", "channel_shuffle"):
-                    eeg = counterfactual_eeg(tensor["eeg"], control, time_mask=tensor["time_mask"], channel_mask=tensor["channel_mask"])
-                    output = model(eeg, tensor["channel_xyz"], tensor["channel_mask"], tensor["time_mask"], tensor["dataset_id"])
+                if state.residual_mfcc is not None and state.baseline_mfcc is not None:
+                    residual_values.append(state.residual_mfcc[eligible].cpu())
+                    target_residual_values.append((tensor["content_mfcc"][eligible] - state.baseline_mfcc[eligible]).cpu())
+                for control in configured_controls:
+                    if control == "wrong_trial":
+                        order = wrong_trial_order(batch["linguistic_content_id"], batch["subject"], target_device)
+                        eeg = tensor["eeg"][order]
+                    else:
+                        eeg = counterfactual_eeg(tensor["eeg"], control, time_mask=model_time_mask, channel_mask=tensor["channel_mask"])
+                    output = model(eeg, tensor["channel_xyz"], tensor["channel_mask"], model_time_mask, tensor["dataset_id"])
                     error = (output.mfcc[eligible] - tensor["content_mfcc"][eligible]).abs().mean((1,2))
                     control_errors[control].extend(error.cpu().tolist())
+                    if control == "zero" and output.baseline_mfcc is not None:
+                        zero_template_errors.extend((output.mfcc[eligible] - output.baseline_mfcc[eligible]).abs().mean((1,2)).cpu().tolist())
     prediction = torch.cat(predictions) if predictions else torch.empty(0,39,161)
     target = torch.cat(target_values) if target_values else torch.empty(0,39,161)
     if len(prediction):
@@ -374,6 +408,18 @@ def main() -> int:
     else:
         templates = {}
     control_means = {key:float(np.mean(value)) for key,value in control_errors.items()}
+    subject_control_gains = {}
+    for control in configured_controls:
+        common_subjects = sorted(set(subject_control_values["correct"]) & set(subject_control_values[control]))
+        gains = [float(np.mean(subject_control_values[control][subject])) -
+                 float(np.mean(subject_control_values["correct"][subject])) for subject in common_subjects]
+        subject_control_gains[control] = bootstrap_mean(gains)
+    residual_variance_ratio = float("nan")
+    if residual_values and target_residual_values:
+        predicted_residual = torch.cat(residual_values).flatten(1)
+        target_residual = torch.cat(target_residual_values).flatten(1)
+        residual_variance_ratio = float(predicted_residual.var(0, unbiased=False).mean() /
+                                        target_residual.var(0, unbiased=False).mean().clamp_min(1e-8))
     hubert_metrics = {"pairs": 0, "local_cosine": float("nan"), "global_retrieval": {
         "r1": float("nan"), "mrr": float("nan"), "chance_r1": float("nan"), "unique_contents": 0,
     }}
@@ -401,9 +447,21 @@ def main() -> int:
         checks[baseline_name] = baseline_passed
         for control in gate["correct_must_beat"]:
             checks[f"correct_beats_{control}"] = control_means["correct"] < control_means[control]
+    elif payload.get("stage") == "generalization" and len(prediction) and bool(payload["model_config"].get("zero_centered", False)):
+        threshold = float(cfg["gates"]["generalization"].get("paired_control_ci_low_min", 0.0))
+        for control in configured_controls:
+            checks[f"correct_beats_{control}"] = control_means["correct"] < control_means[control]
+            checks[f"subject_bootstrap_{control}_ci_low"] = subject_control_gains[control]["ci_low"] > threshold
+        checks["mfcc_residual_variance_retained"] = residual_variance_ratio >= float(cfg["loss"].get("variance_floor_fraction", 0.25))
+        checks["zero_equals_train_template"] = bool(zero_template_errors) and max(zero_template_errors) <= 1e-7
+        global_retrieval = hubert_metrics["global_retrieval"]
+        checks["hubert_global_above_chance"] = bool(np.isfinite(global_retrieval["r1"])) and global_retrieval["r1"] > global_retrieval["chance_r1"]
     result={"dataset":args.dataset,"role":args.role,"pairs":len(prediction),"mfcc_l1":float((prediction-target).abs().mean()) if len(prediction) else float("nan"),
             "delta_l1":delta,"wrong_pair_mfcc_l1":wrong,"retrieval":retrieval,
             "controls":control_means,
+            "subject_control_error_gain": subject_control_gains,
+            "residual_variance_ratio": residual_variance_ratio,
+            "zero_template_max_abs_error": max(zero_template_errors) if zero_template_errors else float("nan"),
             "subject_mfcc_l1":{key:float(np.mean(value)) for key,value in subject_values.items()},
             "subject_control_mfcc_l1": {
                 control: {key: float(np.mean(value)) for key, value in values.items()}

@@ -23,6 +23,35 @@ def _tms_off(frame: pd.DataFrame) -> pd.Series:
     return ~frame.tms_applied.astype(str).str.lower().isin({"true", "1", "yes"})
 
 
+def _buildable_rows(frame: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Exclude rows whose recording-level bad-channel fraction cannot build.
+
+    The audit manifest records declared bad channels, while the shard builder
+    applies ``max_bad_fraction`` once per recording.  M0 selection must use the
+    same contract or it can deterministically select a grid that later writes
+    fewer cells than requested (for example a subject with 20/128 bad channels
+    under a 0.15 limit).
+    """
+    if frame.empty:
+        return frame
+    threshold = float(config["harmonized"]["interpolation"]["max_bad_fraction"])
+    canonical_count = {
+        name: len(spec["channel_order"])
+        for name, spec in config["sources"].items()
+    }
+
+    def keep(row: pd.Series) -> bool:
+        raw = str(row.get("bad_channels", ""))
+        try:
+            bad = json.loads(raw) if raw.startswith("[") else []
+        except json.JSONDecodeError:
+            bad = []
+        denominator = max(int(canonical_count.get(str(row.get("dataset", "")), 1)), 1)
+        return len(set(bad)) / denominator <= threshold
+
+    return frame.loc[frame.apply(keep, axis=1)].copy()
+
+
 def _grid(frame: pd.DataFrame, subjects: int, contents: int, namespace: str) -> pd.DataFrame:
     selected = _complete_grid(frame, subjects, contents, namespace)
     if selected.groupby(["subject", "linguistic_content_id"]).size().ne(1).any():
@@ -53,35 +82,43 @@ def select_registered_grids(config: dict, pilot: dict) -> dict[str, pd.DataFrame
         & (eligible.task == str(spec["primary_ds004940_task"]))
         & (eligible.supervision_type == "paired_audio")
     ]
+    ds004 = _buildable_rows(ds004, config)
+    requested = tuple(pilot.get("stage2", {}).get("datasets", ("ds004940", "ds006104")))
+    if not requested or set(requested) - {"ds004940", "ds006104"}:
+        raise RuntimeError("stage2.datasets must be a nonempty subset of ds004940/ds006104")
     ds006 = eligible[
         (eligible.dataset == "ds006104")
         & eligible.supervision_type.isin(["paired_audio", "weak_audio"])
     ]
+    ds006 = _buildable_rows(ds006, config)
     label = eligible[
         (eligible.dataset == "ds006104")
         & (eligible.supervision_type == "label_only")
     ]
+    label = _buildable_rows(label, config)
     if not bool(spec["primary_ds006104_tms"]):
         ds006 = ds006[_tms_off(ds006)]
         label = label[_tms_off(label)]
 
-    grids = {
-        "ds004940": _grid(ds004, subject_count, content_count, "M0|ds004940"),
-        "ds006104": _grid(ds006, subject_count, content_count, "M0|ds006104"),
-    }
+    grids = {}
+    if "ds004940" in requested:
+        grids["ds004940"] = _grid(ds004, subject_count, content_count, "M0|ds004940")
+    if "ds006104" in requested:
+        grids["ds006104"] = _grid(ds006, subject_count, content_count, "M0|ds006104")
     # single-phoneme has six registered content labels, so its auxiliary grid
     # is deliberately 5 x min(6, configured maximum) rather than padded to 50.
-    label_content_count = min(
-        int(label.linguistic_content_id.nunique()),
-        int(spec["label_only_max_overfit_pairs"]) // subject_count,
-    )
-    if label_content_count <= 0:
-        raise RuntimeError("M0 label-only selection has no complete content grid")
-    grids["ds006104_label_only"] = _grid(
-        label, subject_count, label_content_count, "M0|ds006104|label-only"
-    )
+    if "ds006104" in requested and int(spec.get("label_only_max_overfit_pairs", 0)):
+        label_content_count = min(
+            int(label.linguistic_content_id.nunique()),
+            int(spec["label_only_max_overfit_pairs"]) // subject_count,
+        )
+        if label_content_count <= 0:
+            raise RuntimeError("M0 label-only selection has no complete content grid")
+        grids["ds006104_label_only"] = _grid(label, subject_count, label_content_count, "M0|ds006104|label-only")
     expected = int(spec["overfit_pairs_per_dataset"])
     for name in ("ds004940", "ds006104"):
+        if name not in grids:
+            continue
         if len(grids[name]) != expected:
             raise RuntimeError(f"{name}: selected {len(grids[name])} M0 pairs, expected {expected}")
     return grids
@@ -124,11 +161,13 @@ def _curate_m0_manifest(config: dict, grids: dict[str, pd.DataFrame], artifact_s
 
     included = frame[(frame.build_status == "included") & desired]
     expected = {name: len(grid) for name, grid in grids.items()}
-    partitions = {
-        "ds004940": included[(included.dataset == "ds004940") & (included.supervision_type == "paired_audio")],
-        "ds006104": included[(included.dataset == "ds006104") & included.supervision_type.isin(["paired_audio", "weak_audio"])],
-        "ds006104_label_only": included[(included.dataset == "ds006104") & (included.supervision_type == "label_only")],
-    }
+    partitions = {}
+    if "ds004940" in grids:
+        partitions["ds004940"] = included[(included.dataset == "ds004940") & (included.supervision_type == "paired_audio")]
+    if "ds006104" in grids:
+        partitions["ds006104"] = included[(included.dataset == "ds006104") & included.supervision_type.isin(["paired_audio", "weak_audio"])]
+    if "ds006104_label_only" in grids:
+        partitions["ds006104_label_only"] = included[(included.dataset == "ds006104") & (included.supervision_type == "label_only")]
     for name, selected in partitions.items():
         cells = selected.groupby(["subject", "linguistic_content_id"]).size()
         if len(selected) != expected[name] or len(cells) != expected[name] or not cells.eq(1).all():
@@ -152,12 +191,13 @@ def materialize(config: dict, pilot: dict, grids: dict[str, pd.DataFrame],
     if artifact_set != "built":
         normalizer_name = f"explore_m0_{split_path_name}"
 
-    calls = (
-        ("ds004940", grids["ds004940"], ",".join(sorted(grids["ds004940"].task.unique())), "any"),
-        ("ds006104", grids["ds006104"], ",".join(sorted(grids["ds006104"].task.unique())), "off"),
-        ("ds006104", grids["ds006104_label_only"],
-         ",".join(sorted(grids["ds006104_label_only"].task.unique())), "off"),
-    )
+    calls = []
+    if "ds004940" in grids:
+        calls.append(("ds004940", grids["ds004940"], ",".join(sorted(grids["ds004940"].task.unique())), "any"))
+    if "ds006104" in grids:
+        calls.append(("ds006104", grids["ds006104"], ",".join(sorted(grids["ds006104"].task.unique())), "off"))
+    if "ds006104_label_only" in grids:
+        calls.append(("ds006104", grids["ds006104_label_only"], ",".join(sorted(grids["ds006104_label_only"].task.unique())), "off"))
     for dataset, frame, tasks, tms_condition in calls:
         build_eeg_shards(
             config,

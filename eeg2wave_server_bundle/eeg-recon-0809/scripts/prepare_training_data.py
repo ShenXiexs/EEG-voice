@@ -440,6 +440,8 @@ def _ds004_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str
     _, pd = runtime()
     spec = config["sources"]["ds004940"]
     data_root = ROOT / spec["data_root"]
+    epoch = config["harmonized"]["epoch"]["ds004940"]
+    fixed_window = bool(epoch.get("fixed_window", False))
     audio_index = {path.name: path for path in (data_root / "stimuli").glob("*.wav")}
     audio_hashes: dict[Path, str] = {}
     rows: list[dict[str, Any]] = []
@@ -487,8 +489,15 @@ def _ds004_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str
                 continue
             audio = audio_index.get(Path(str(event[stim_col])).name) if stim_col and str(event[stim_col]) not in ("nan", "") else None
             global_zero = round_half_up(onset * 512)
-            global_start = global_zero - int(config["harmonized"]["epoch"]["ds004940"]["pre_samples_source"])
-            global_end = global_zero + round_half_up((stimulus_duration + float(config["harmonized"]["epoch"]["ds004940"]["post_sentence_s"])) * 512)
+            global_start = global_zero - int(epoch["pre_samples_source"])
+            # v3 ended the EEG epoch at presented-audio duration + post roll.
+            # That made the model mask a near-perfect sentence-duration ID.
+            # v4 always takes a real, fixed continuous window.  Any recording
+            # that cannot supply it is rejected rather than zero padded.
+            if fixed_window:
+                global_end = global_start + int(epoch["total_samples_source"])
+            else:
+                global_end = global_zero + round_half_up((stimulus_duration + float(epoch["post_sentence_s"])) * 512)
             selected_run = next((item for item in runs if item["start_sample"] <= global_zero < item["end_sample"]), None)
             boundary = bool(selected_run and (global_start < selected_run["start_sample"] or global_end > selected_run["end_sample"]))
             bdf = selected_run["path"] if selected_run else None
@@ -530,13 +539,14 @@ def _ds004_trial_rows(config: dict[str, Any], lock: dict[str, Any], qc: dict[str
                 "neural_task": "perception", "response_onset_relative_s": None,
                 "response_onset_output_index": None, "response_onset_provenance": "",
                 "production_contaminated": False, "clean_perception_start_index": 0,
-                "clean_perception_end_index": int(spec.get("epoch_target_length", config["harmonized"]["epoch"]["ds004940"]["total_samples_target"])),
+                "clean_perception_end_index": int(spec.get("epoch_target_length", epoch["total_samples_target"])),
                 "source_sfreq_hz": 512, "target_sfreq_hz": 256,
                 "eeg_zero_index": 64, "audio_start_relative_to_eeg_samples": 64,
                 "source_zero_sample": global_zero - run_offset,
                 "source_start_sample": global_start - run_offset,
                 "source_end_sample": global_end - run_offset,
-                "eeg_valid_samples_target": round_half_up((global_end - global_start) * 256 / 512),
+                "eeg_valid_samples_target": (int(epoch["total_samples_target"]) if fixed_window else round_half_up((global_end - global_start) * 256 / 512)),
+                "model_time_mask_policy": "fixed_full_epoch" if fixed_window else "variable_valid_epoch",
                 "source_run_offsets": json.dumps([{"path": as_relative(item["path"]), "run": item["run"], "start_sample": item["start_sample"], "end_sample": item["end_sample"]} for item in runs]),
                 "boundary_overlap": boundary,
                 "qc_pass": not bool(reason), "build_status": "included" if not reason else "excluded",
@@ -1287,7 +1297,8 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
             continue
         arrays={"eeg": np.stack(eegs), "channel_xyz": shard_xyz, "eeg_valid_mask": np.stack(valids), "clean_perception_mask": np.stack(cleans), "audio_loss_mask": np.stack(audio_losses), "tms_output_mask": np.stack(tmsm), "bad_channel_mask":np.stack(bads), "interpolated_channel_mask":np.stack(interps), "zero_filled_channel_mask":np.stack(zeros), "channel_valid_mask":~np.stack(zeros)}
         commit, diff = git_provenance()
-        attrs={"schema_version": config["schema_version"], "preprocessing_profile": config.get("preprocessing_profile", "harmonized_v3"), "artifact_set": artifact_set, "eeg_unit": "V", "eeg_dtype": "float32", "channel_order": canonical, "channel_order_hash": channel_order_hash(canonical), "preprocess_config_sha256":config["_config_sha256"], "source_lock_sha256":lock["source_lock_sha256"], "split_index_sha256":split_contract_hash, "split_hash_required": True, "code_commit":commit, "code_diff_hash":sha256_bytes(diff.encode()), "audit_override_allow_warnings": bool(allow_audit_warnings), "tms_interpolation_algorithm": config["harmonized"]["tms"]["interpolation_algorithm"], "official_tms_code_sha256": config["harmonized"]["tms"]["source_code_sha256"]}
+        fixed_policy = bool(config["harmonized"]["epoch"].get(ds, {}).get("fixed_window", False))
+        attrs={"schema_version": config["schema_version"], "preprocessing_profile": config.get("preprocessing_profile", "harmonized_v3"), "artifact_set": artifact_set, "eeg_unit": "V", "eeg_dtype": "float32", "channel_order": canonical, "channel_order_hash": channel_order_hash(canonical), "preprocess_config_sha256":config["_config_sha256"], "source_lock_sha256":lock["source_lock_sha256"], "split_index_sha256":split_contract_hash, "split_hash_required": True, "code_commit":commit, "code_diff_hash":sha256_bytes(diff.encode()), "audit_override_allow_warnings": bool(allow_audit_warnings), "tms_interpolation_algorithm": config["harmonized"]["tms"]["interpolation_algorithm"], "official_tms_code_sha256": config["harmonized"]["tms"]["source_code_sha256"], "model_time_mask_policy": "fixed_full_epoch" if fixed_policy else "variable_valid_epoch"}
         provenance_keys = ("dataset", "subject", "task", "condition", "pairing_level", "supervision_type", "linguistic_content_id", "waveform_id", "phoneme_label", "audio_id")
         strings = {"trial_id": ids}
         for key in provenance_keys:

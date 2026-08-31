@@ -21,8 +21,9 @@ trials are identical.
 | MFCC head | linear projection to `39 × 161` | Predicts the main speech-content target: 39 MFCC coefficients over 161 relative-time frames. | Yes |
 | Phoneme auxiliary head | linear classifier from pooled EEG | Lets DS006104 single-phoneme label-only trials provide a low-weight auxiliary signal. | Yes |
 | Audio teacher | cached frozen HuBERT local/global representations | Provides speech-content alignment targets; HuBERT is not updated by EEG training. | Shared target space |
-| Acoustic renderer | `AudioMFCCRenderer`: 1D CNN | Maps predicted MFCC to 80-bin log-mel, RMS energy, and activity for diagnostic reconstruction. | Yes |
-| Qualitative audio exporter | deterministic Griffin--Lim inversion | Makes listening WAVs and energy/mel/MFCC plots from log-mel outputs after training. | Post-training only |
+| Native acoustic renderer | `DurationConditionedNativeRenderer`: 1D CNN | Expands relative-time MFCC plus predicted duration into native-duration SpeechT5 mel. | Audio-only, train-fold fitted |
+| Optional diffusion refiner | `ConditionalMelDiffusion`: conditional 1D DDPM with deterministic DDIM sampling | Refines renderer mel before vocoding. It never receives EEG/subject/content IDs and is applied identically to all controls. | Audio-only, switchable |
+| Neural vocoder | frozen local SpeechT5 HiFi-GAN | Converts native SpeechT5 mel to a waveform without Griffin--Lim phase reconstruction. | Post-training only |
 
 ## Training losses
 
@@ -44,8 +45,8 @@ objective**, not an imported OpenAI CLIP image-text model.
 | Autoregressive decoder | No | The system predicts all 161 MFCC frames in parallel. It does not generate one token/sample after another. |
 | EEG-to-waveform regression | No | Waveform samples are never the primary supervised target. |
 | EnCodec / RVQ code prediction | No | Codec-token inversion from the reference research route is intentionally excluded from this pilot. |
-| Neural vocoder (HiFi-GAN, SpeechT5, WaveGlow, etc.) | No | Current WAVs are Griffin--Lim diagnostic reconstructions, not validated neural-vocoder outputs. |
-| Diffusion / flow-matching audio generation | No | No diffusion acoustic generator is trained. |
+| Autoregressive waveform decoder | No | The SpeechT5 HiFi-GAN and optional diffusion refiner are non-autoregressive post-processing modules. |
+| Waveform-domain diffusion | No | The optional diffusion module refines native mel; it does not directly denoise or generate waveform samples. |
 | Fixed channel intersection | No | DS004940 and DS006104 retain their native EEG channel spaces and use xyz plus masks. |
 
 ## Joint training in one sentence
@@ -65,8 +66,10 @@ EEG + channel xyz + channel/time masks
 → shared Conformer
 → local/global EEG content representations
 → MFCC prediction (39 × 161)
-→ optional CNN acoustic renderer (log-mel / RMS / activity)
-→ diagnostic Griffin--Lim WAV export
+→ duration-conditioned native SpeechT5-mel renderer
+→ optional conditional diffusion mel refinement
+→ frozen SpeechT5 HiFi-GAN
+→ diagnostic native-duration WAV export
 ```
 
 For source details, see [`model.py`](model.py), [`losses.py`](losses.py), and

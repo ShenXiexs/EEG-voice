@@ -84,6 +84,21 @@ class JointState:
     mfcc: torch.Tensor
     phoneme_logits: torch.Tensor
     token_mask: torch.Tensor
+    baseline_mfcc: torch.Tensor | None = None
+    residual_mfcc: torch.Tensor | None = None
+    predicted_duration: torch.Tensor | None = None
+    activity_logits: torch.Tensor | None = None
+
+
+@dataclass
+class _RawState:
+    local: torch.Tensor
+    global_feature: torch.Tensor
+    mfcc: torch.Tensor
+    phoneme_logits: torch.Tensor
+    token_mask: torch.Tensor
+    duration: torch.Tensor
+    activity_logits: torch.Tensor
 
 
 class JointEEGContentModel(nn.Module):
@@ -91,10 +106,11 @@ class JointEEGContentModel(nn.Module):
                  local_layers: int = 2, dropout: float = 0.1, token_steps: int = 96,
                  target_frames: int = 161, mfcc_dimension: int = 39,
                  hubert_dimension: int = 768, phoneme_classes: int = 64,
-                 datasets: int = 2):
+                 datasets: int = 2, zero_centered: bool = False):
         super().__init__()
         self.token_steps = int(token_steps)
         self.target_frames = int(target_frames)
+        self.zero_centered = bool(zero_centered)
         branch = dimension // 3
         widths = (branch, branch, dimension - 2 * branch)
         self.input_adapter = DatasetInputAdapter(datasets)
@@ -114,8 +130,29 @@ class JointEEGContentModel(nn.Module):
         self.global_head = nn.Sequential(nn.LayerNorm(dimension), nn.Linear(dimension, dimension), nn.GELU(), nn.Linear(dimension, dimension))
         self.mfcc_head = nn.Sequential(nn.LayerNorm(dimension), nn.Linear(dimension, mfcc_dimension))
         self.phoneme_head = nn.Sequential(nn.LayerNorm(dimension), nn.Linear(dimension, phoneme_classes))
+        self.duration_head = nn.Sequential(nn.LayerNorm(dimension), nn.Linear(dimension, 1))
+        self.activity_head = nn.Sequential(nn.LayerNorm(dimension), nn.Linear(dimension, 1))
         self.audio_projection = nn.Sequential(nn.LayerNorm(hubert_dimension), nn.Linear(hubert_dimension, dimension))
         self.clip_logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
+        # Templates are derived from the training fold and are deliberately
+        # carried by checkpoint provenance rather than baked into code/config.
+        self.register_buffer("target_mfcc_template", torch.zeros(mfcc_dimension, target_frames), persistent=False)
+        self.register_buffer("target_mfcc_scale", torch.ones(mfcc_dimension, target_frames), persistent=False)
+        self.register_buffer("hubert_template", torch.zeros(hubert_dimension), persistent=False)
+
+    def set_target_templates(self, mfcc_mean: torch.Tensor, mfcc_scale: torch.Tensor | None = None,
+                             hubert_mean: torch.Tensor | None = None) -> None:
+        if mfcc_mean.shape != self.target_mfcc_template.shape:
+            raise ValueError(f"MFCC template shape {tuple(mfcc_mean.shape)} is invalid")
+        self.target_mfcc_template.copy_(mfcc_mean.detach().to(self.target_mfcc_template))
+        if mfcc_scale is not None:
+            if mfcc_scale.shape != self.target_mfcc_scale.shape:
+                raise ValueError("MFCC scale shape mismatch")
+            self.target_mfcc_scale.copy_(mfcc_scale.detach().to(self.target_mfcc_scale).clamp_min(1e-4))
+        if hubert_mean is not None:
+            if hubert_mean.shape != self.hubert_template.shape:
+                raise ValueError("HuBERT template shape mismatch")
+            self.hubert_template.copy_(hubert_mean.detach().to(self.hubert_template))
 
     def _dataset_norm(self, value: torch.Tensor, dataset_id: torch.Tensor) -> torch.Tensor:
         output = torch.empty_like(value)
@@ -128,19 +165,17 @@ class JointEEGContentModel(nn.Module):
     def project_audio(self, hubert_local: torch.Tensor) -> torch.Tensor:
         return self.audio_projection(hubert_local)
 
-    def forward(self, eeg: torch.Tensor, channel_xyz: torch.Tensor, channel_mask: torch.Tensor,
-                time_mask: torch.Tensor, dataset_id: torch.Tensor) -> JointState:
-        if eeg.ndim != 3 or channel_xyz.shape != (*eeg.shape[:2], 3):
-            raise ValueError("eeg must be [B,C,T] and channel_xyz [B,C,3]")
-        if channel_mask.shape != eeg.shape[:2] or time_mask.shape != (eeg.shape[0], eeg.shape[2]):
-            raise ValueError("channel/time mask shape mismatch")
-        if not channel_mask.any(1).all() or not time_mask.any(1).all():
-            raise ValueError("each example needs at least one valid channel and time sample")
+    def centered_audio(self, hubert_local: torch.Tensor) -> torch.Tensor:
+        audio = self.project_audio(hubert_local)
+        if not self.zero_centered:
+            return audio
+        return audio - self.project_audio(self.hubert_template.view(1, 1, -1)).squeeze(0)
+
+    def _forward_raw(self, eeg: torch.Tensor, channel_xyz: torch.Tensor, channel_mask: torch.Tensor,
+                     time_mask: torch.Tensor, dataset_id: torch.Tensor) -> _RawState:
+        """Backbone execution before optional zero-baseline subtraction."""
         batch, channels, samples = eeg.shape
         adapted = self.input_adapter(eeg, dataset_id)
-        # Robust normalization maps padded zeros away from zero, and the
-        # dataset adapter has a learnable bias.  Re-apply both masks before any
-        # temporal convolution so neither source can leak padding/bad channels.
         adapted = adapted * time_mask[:, None, :].to(adapted.dtype)
         adapted = adapted * channel_mask[:, :, None].to(adapted.dtype)
         flat = adapted.reshape(batch * channels, 1, samples)
@@ -160,10 +195,47 @@ class JointEEGContentModel(nn.Module):
         stem = self.stem(value + self.position, token_mask)
         local = self.local_head(stem, token_mask)
         pooled = masked_mean(stem, token_mask)
-        global_embedding = F.normalize(self.global_head(pooled), dim=-1)
         acoustic_tokens = F.interpolate(local.transpose(1, 2), size=self.target_frames, mode="linear", align_corners=False).transpose(1, 2)
-        mfcc = self.mfcc_head(acoustic_tokens).transpose(1, 2)
-        return JointState(local, global_embedding, mfcc, self.phoneme_head(pooled), token_mask)
+        return _RawState(local, self.global_head(pooled), self.mfcc_head(acoustic_tokens).transpose(1, 2),
+                         self.phoneme_head(pooled), token_mask,
+                         F.softplus(self.duration_head(pooled).squeeze(-1)) + 1.0,
+                         self.activity_head(acoustic_tokens).squeeze(-1))
+
+    def forward(self, eeg: torch.Tensor, channel_xyz: torch.Tensor, channel_mask: torch.Tensor,
+                time_mask: torch.Tensor, dataset_id: torch.Tensor) -> JointState:
+        if eeg.ndim != 3 or channel_xyz.shape != (*eeg.shape[:2], 3):
+            raise ValueError("eeg must be [B,C,T] and channel_xyz [B,C,3]")
+        if channel_mask.shape != eeg.shape[:2] or time_mask.shape != (eeg.shape[0], eeg.shape[2]):
+            raise ValueError("channel/time mask shape mismatch")
+        if not channel_mask.any(1).all() or not time_mask.any(1).all():
+            raise ValueError("each example needs at least one valid channel and time sample")
+        # ``zero EEG`` is a scientific control, not a stochastic forward pass.
+        # In training mode two dropout draws would otherwise make h(0)-h(0)
+        # nonzero and quietly violate the zero-centered residual contract.
+        if self.zero_centered and not bool(eeg.detach().abs().any()):
+            token_mask = F.interpolate(time_mask.float().unsqueeze(1), size=self.token_steps, mode="nearest").squeeze(1).bool()
+            baseline_mfcc = self.target_mfcc_template.unsqueeze(0).expand(eeg.shape[0], -1, -1)
+            return JointState(
+                torch.zeros(eeg.shape[0], self.token_steps, self.position.shape[-1], device=eeg.device, dtype=eeg.dtype),
+                torch.zeros(eeg.shape[0], self.position.shape[-1], device=eeg.device, dtype=eeg.dtype),
+                baseline_mfcc, torch.zeros(eeg.shape[0], self.phoneme_head[-1].out_features, device=eeg.device, dtype=eeg.dtype),
+                token_mask, baseline_mfcc, torch.zeros_like(baseline_mfcc),
+                torch.ones(eeg.shape[0], device=eeg.device, dtype=eeg.dtype),
+                torch.zeros(eeg.shape[0], self.target_frames, device=eeg.device, dtype=eeg.dtype),
+            )
+        raw = self._forward_raw(eeg, channel_xyz, channel_mask, time_mask, dataset_id)
+        if not self.zero_centered:
+            return JointState(raw.local, F.normalize(raw.global_feature, dim=-1), raw.mfcc,
+                              raw.phoneme_logits, raw.token_mask,
+                              torch.zeros_like(raw.mfcc), raw.mfcc, raw.duration, raw.activity_logits)
+        baseline = self._forward_raw(torch.zeros_like(eeg), channel_xyz, channel_mask, time_mask, dataset_id)
+        residual_mfcc = (raw.mfcc - baseline.mfcc) * self.target_mfcc_scale.unsqueeze(0)
+        mfcc = self.target_mfcc_template.unsqueeze(0) + residual_mfcc
+        local = raw.local - baseline.local
+        global_embedding = F.normalize(raw.global_feature - baseline.global_feature, dim=-1, eps=1e-6)
+        return JointState(local, global_embedding, mfcc, raw.phoneme_logits, raw.token_mask,
+                          self.target_mfcc_template.unsqueeze(0).expand_as(mfcc), residual_mfcc,
+                          raw.duration, raw.activity_logits)
 
 
 @dataclass
@@ -195,3 +267,38 @@ class AudioMFCCRenderer(nn.Module):
         state = self.backbone(mfcc)
         return RendererState(self.log_mel_head(state), self.rms_head(state).squeeze(1),
                              self.activity_head(state).squeeze(1))
+
+
+class DurationConditionedNativeRenderer(nn.Module):
+    """Relative MFCC plus duration to native SpeechT5 mel.
+
+    Content remains on the 161-frame relative grid; only this audio-only
+    renderer expands it to a native-duration mel sequence.  It is deliberately
+    separate from the EEG model so waveform quality cannot hide weak EEG use.
+    """
+
+    def __init__(self, hidden_dimension: int = 160, layers: int = 4, dropout: float = 0.1):
+        super().__init__()
+        blocks: list[nn.Module] = [nn.Conv1d(40, hidden_dimension, 5, padding=2), nn.GELU()]
+        for _ in range(max(1, int(layers))):
+            blocks.extend([nn.Conv1d(hidden_dimension, hidden_dimension, 5, padding=2, groups=hidden_dimension),
+                           nn.Conv1d(hidden_dimension, hidden_dimension, 1), nn.GELU(), nn.Dropout(dropout)])
+        self.backbone = nn.Sequential(*blocks)
+        self.mel_head = nn.Conv1d(hidden_dimension, 80, 1)
+
+    def forward(self, mfcc: torch.Tensor, duration_frames: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if mfcc.ndim != 3 or mfcc.shape[1] != 39:
+            raise ValueError("native renderer MFCC must be [B,39,T]")
+        if duration_frames.ndim != 1 or duration_frames.shape[0] != mfcc.shape[0]:
+            raise ValueError("duration_frames must be [B]")
+        maximum = int(duration_frames.max().item()) if len(duration_frames) else 1
+        duration = duration_frames.to(mfcc.dtype).clamp_min(1).log().view(-1, 1, 1).expand(-1, 1, mfcc.shape[-1])
+        relative = self.mel_head(self.backbone(torch.cat((mfcc, duration), dim=1)))
+        rows = []
+        mask = torch.zeros(mfcc.shape[0], maximum, dtype=torch.bool, device=mfcc.device)
+        for index, frames in enumerate(duration_frames.tolist()):
+            frames = max(1, int(frames))
+            value = F.interpolate(relative[index:index + 1], size=frames, mode="linear", align_corners=False)
+            rows.append(F.pad(value, (0, maximum - frames)))
+            mask[index, :frames] = True
+        return torch.cat(rows, dim=0), mask

@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import sys
 from pathlib import Path
 
 import h5py
@@ -17,6 +18,11 @@ from scipy.io import wavfile
 from scipy.signal import resample_poly
 
 from prepare_training_data import ROOT, git_provenance, load_config, output_root, sha256_bytes, sha256_file
+
+APP_SRC = ROOT / "app" / "src"
+if str(APP_SRC) not in sys.path:
+    sys.path.insert(0, str(APP_SRC))
+from eeg2speech.speecht5 import CONTRACT as SPEECHT5_NATIVE_CONTRACT, HOP_SAMPLES, native_speecht5_mel
 
 
 def _pcm_float(value: np.ndarray) -> np.ndarray:
@@ -189,6 +195,8 @@ def cache(config: dict, dataset: str, limit: int | None, include_hubert: bool,
         output.attrs["code_commit"] = commit
         output.attrs["code_diff_hash"] = sha256_bytes(diff.encode())
         output.attrs["target_code_sha256"] = sha256_file(Path(__file__))
+        output.attrs["native_mel_contract"] = SPEECHT5_NATIVE_CONTRACT
+        output.attrs["native_mel_hop_samples"] = HOP_SAMPLES
         output.attrs["hubert_included"] = include_hubert
         if hubert_runtime is not None:
             output.attrs["hubert_source"] = hubert_runtime[2]
@@ -200,6 +208,7 @@ def cache(config: dict, dataset: str, limit: int | None, include_hubert: bool,
             wave, source_rate, source_channels = load_wave(source)
             mfcc, content_mask = content_features(wave, int(config["audio"]["content"]["relative_frames"]))
             acoustic = log_mel(wave).numpy().astype(np.float32)
+            native_mel = native_speecht5_mel(torch.from_numpy(wave).unsqueeze(0)).squeeze(0).cpu().numpy().astype(np.float32)
             rms, acoustic_activity = frame_rms_activity(
                 wave, float(config["audio"]["content"]["vad_threshold_db_below_peak"])
             )
@@ -210,6 +219,12 @@ def cache(config: dict, dataset: str, limit: int | None, include_hubert: bool,
             group.create_dataset("log_mel", data=acoustic, compression="gzip")
             group.create_dataset("rms", data=rms, compression="gzip")
             group.create_dataset("activity", data=acoustic_activity)
+            # Native SpeechT5 mel is deliberately ragged.  The loader pads it
+            # per batch with an explicit mask; it must never be compressed to
+            # the 161-frame relative-content grid before waveform synthesis.
+            group.create_dataset("native_speecht5_mel", data=native_mel, compression="gzip")
+            group.create_dataset("native_audio_mask", data=np.ones(native_mel.shape[1], dtype=bool))
+            group.attrs["native_duration_frames"] = int(native_mel.shape[1])
             if include_hubert:
                 centered = wave - wave.mean()
                 content_wave, _ = active_crop(
@@ -226,7 +241,8 @@ def cache(config: dict, dataset: str, limit: int | None, include_hubert: bool,
             group.attrs["target_rate_hz"] = 16000
             inventory.append({"audio_id": audio_id, "dataset": row.dataset, "pairing_level": row.pairing_level,
                               "audio_sha256": row.audio_sha256, "mfcc_frames": mfcc.shape[1],
-                              "acoustic_frames": acoustic.shape[1], "hubert_included": include_hubert})
+                              "acoustic_frames": acoustic.shape[1], "native_speecht5_frames": native_mel.shape[1],
+                              "hubert_included": include_hubert})
     os.replace(partial, target)
     pd.DataFrame(inventory).to_csv(target.parent / f"{target_name}_inventory.csv", index=False)
     (target.parent / f"{target_name}.sha256").write_text(sha256_file(target) + "\n")

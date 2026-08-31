@@ -12,7 +12,9 @@ import pandas as pd
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "app/src"))
 
-from eeg2speech.data import AlternatingBatchIterator, JointManifestDataset, homogeneous_collate, pilot_indices
+from eeg2speech.data import (AlternatingBatchIterator, ContentGroupedBatchSampler,
+                             JointManifestDataset, homogeneous_collate, pilot_indices)
+from eeg2speech.diffusion import ConditionalMelDiffusion, denormalize_mel, normalize_mel
 from eeg2speech.losses import counterfactual_eeg, joint_content_loss, masked_mfcc_loss, soft_dtw_token_loss
 from eeg2speech.model import AudioMFCCRenderer, JointEEGContentModel
 
@@ -36,6 +38,42 @@ class TestJointPipeline(unittest.TestCase):
         self.assertEqual(second.local.shape, (2, 96, 24))
         (first.mfcc.mean() + second.mfcc.mean()).backward()
         self.assertTrue(all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in self.model.parameters()))
+
+    def test_zero_centered_contract_returns_exact_train_template(self):
+        model = JointEEGContentModel(dimension=24, heads=4, layers=1, local_layers=1,
+                                     dropout=0.2, phoneme_classes=8, zero_centered=True)
+        template = torch.randn(39, 161)
+        scale = torch.full((39, 161), 0.75)
+        model.set_target_templates(template, scale, torch.zeros(768))
+        eeg, xyz, channels, mask, dataset_id = self._inputs(8, 1178, 0)
+        # Training-mode dropout must not make h(0)-h(0) noisy.
+        output = model(torch.zeros_like(eeg), xyz, channels, mask, dataset_id)
+        self.assertTrue(torch.equal(output.mfcc, template.unsqueeze(0).expand_as(output.mfcc)))
+        self.assertTrue(torch.equal(output.residual_mfcc, torch.zeros_like(output.residual_mfcc)))
+
+    def test_content_grouped_sampler_uses_subset_positions_and_full_epoch(self):
+        frame = pd.DataFrame([
+            {"subject": f"s{subject}", "linguistic_content_id": f"c{content}"}
+            for content in range(4) for subject in range(4)
+        ])
+        # Sparse original indices reproduce a strict split inside a larger
+        # manifest. Emitted indices must still be 0..len(subset)-1.
+        frame = pd.concat([pd.DataFrame([{"subject": "unused", "linguistic_content_id": "unused"}]), frame],
+                          ignore_index=True)
+        indices = list(range(1, 17))
+        sampler = ContentGroupedBatchSampler(frame, indices, batch_size=8,
+                                              contents_per_batch=4, subjects_per_content=2, seed=31)
+        batches = list(iter(sampler))
+        flattened = [item for batch in batches for item in batch]
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(sorted(flattened), list(range(16)))
+        self.assertTrue(all(0 <= item < len(indices) for item in flattened))
+        selected = frame.iloc[indices].reset_index(drop=True)
+        for batch in batches:
+            rows = selected.iloc[batch]
+            self.assertEqual(rows.linguistic_content_id.nunique(), 4)
+            self.assertTrue(rows.groupby("linguistic_content_id").size().eq(2).all())
+            self.assertEqual(rows.subject.nunique(), 2)
 
     def test_supervision_weight_masks_label_only_content(self):
         state = self.model(*self._inputs(61, 192, 1, batch=3))
@@ -139,6 +177,30 @@ class TestJointPipeline(unittest.TestCase):
         self.assertEqual(state.log_mel.shape,(2,80,161))
         self.assertEqual(state.rms.shape,(2,161))
         self.assertEqual(state.activity_logits.shape,(2,161))
+
+    def test_conditional_diffusion_is_finite_masked_and_differentiable(self):
+        model = ConditionalMelDiffusion(hidden_dimension=24, layers=2, dropout=0.0,
+                                        timesteps=12)
+        clean = torch.randn(2, 80, 17)
+        condition = torch.randn_like(clean)
+        mask = torch.tensor([[1] * 17, [1] * 11 + [0] * 6], dtype=torch.bool)
+        loss = model.denoising_loss(clean, condition, mask)
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(all(parameter.grad is None or torch.isfinite(parameter.grad).all()
+                            for parameter in model.parameters()))
+        noise = torch.zeros_like(clean)
+        refined = model.refine(condition, mask, steps=4, noise=noise)
+        self.assertEqual(refined.shape, clean.shape)
+        self.assertTrue(torch.isfinite(refined).all())
+        self.assertTrue(torch.equal(refined[1, :, 11:], torch.zeros_like(refined[1, :, 11:])))
+
+    def test_diffusion_mel_normalization_roundtrip(self):
+        value = torch.randn(2, 80, 13)
+        mean = torch.linspace(-2, 2, 80)
+        scale = torch.linspace(0.5, 1.5, 80)
+        restored = denormalize_mel(normalize_mel(value, mean, scale), mean, scale)
+        self.assertTrue(torch.allclose(value, restored, atol=1e-6, rtol=1e-6))
 
     def test_content_dataset_fails_closed_without_speech_targets(self):
         with tempfile.TemporaryDirectory() as directory:

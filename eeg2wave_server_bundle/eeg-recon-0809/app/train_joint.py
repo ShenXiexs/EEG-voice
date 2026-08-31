@@ -20,7 +20,7 @@ APP = Path(__file__).resolve().parent
 ROOT = APP.parent
 sys.path.insert(0, str(APP / "src"))
 
-from eeg2speech.data import (AlternatingBatchIterator, JointManifestDataset, auxiliary_indices,
+from eeg2speech.data import (AlternatingBatchIterator, ContentGroupedBatchSampler, JointManifestDataset, auxiliary_indices,
                              homogeneous_collate, phoneme_vocabulary_from_manifest, pilot_indices)
 from eeg2speech.gates import require_registered_m0_gates
 from eeg2speech.losses import counterfactual_eeg, joint_content_loss
@@ -180,10 +180,18 @@ def sampler_for(dataset: JointManifestDataset, indices: list[int], seed: int,
 
 
 def loader_for(dataset: JointManifestDataset, indices: list[int], batch_size: int, seed: int,
-               sampling_strategy: str = "weighted_with_replacement") -> DataLoader:
+               sampling_strategy: str = "weighted_with_replacement",
+               content_grouped: dict | None = None) -> DataLoader:
     if not indices:
         raise RuntimeError("pilot selection produced zero trials")
     subset = Subset(dataset, indices)
+    if content_grouped:
+        sampler = ContentGroupedBatchSampler(
+            dataset.frame, indices, batch_size=batch_size,
+            contents_per_batch=int(content_grouped.get("contents_per_batch", 4)),
+            subjects_per_content=int(content_grouped.get("subjects_per_content", 2)), seed=seed,
+        )
+        return DataLoader(subset, batch_sampler=sampler, collate_fn=homogeneous_collate)
     sampler = sampler_for(dataset, indices, seed, sampling_strategy)
     return DataLoader(subset, batch_size=batch_size, sampler=sampler, collate_fn=homogeneous_collate, drop_last=False)
 
@@ -195,6 +203,50 @@ def evaluation_loader_for(dataset: JointManifestDataset, indices: list[int], bat
 
 def move(batch: dict, target: torch.device) -> dict:
     return {key: value.to(target) if torch.is_tensor(value) else value for key, value in batch.items()}
+
+
+def model_mask(batch: dict) -> torch.Tensor:
+    """Return the EEG encoder mask, never the legacy duration-derived mask."""
+    return batch.get("model_time_mask", batch["time_mask"])
+
+
+def train_fold_templates(loader: DataLoader, target: torch.device) -> dict[str, torch.Tensor]:
+    """Fit target templates from *training* pairs only.
+
+    This is intentionally a loader-level operation rather than an HDF5 global
+    statistic: the active split, artifact and any M0/M1 subset are therefore
+    exactly the data allowed to define the zero-EEG baseline.
+    """
+    mfcc_sum = mfcc_sq_sum = mfcc_count = None
+    hubert_sum = hubert_count = None
+    for batch in loader:
+        batch = move(batch, target)
+        eligible = batch["pairing_weight"] > 0
+        if not eligible.any():
+            continue
+        value = batch["content_mfcc"][eligible]
+        mask = batch["content_mask"][eligible].unsqueeze(1).to(value.dtype)
+        current_sum = (value * mask).sum(0)
+        current_sq = (value.square() * mask).sum(0)
+        current_count = mask.sum(0).expand_as(current_sum)
+        mfcc_sum = current_sum if mfcc_sum is None else mfcc_sum + current_sum
+        mfcc_sq_sum = current_sq if mfcc_sq_sum is None else mfcc_sq_sum + current_sq
+        mfcc_count = current_count if mfcc_count is None else mfcc_count + current_count
+        if "hubert_local" in batch and batch["hubert_mask"][eligible].any():
+            local = batch["hubert_local"][eligible]
+            local_mask = batch["hubert_mask"][eligible].unsqueeze(-1).to(local.dtype)
+            current_hubert_sum = (local * local_mask).sum((0, 1))
+            current_hubert_count = local_mask.sum((0, 1))
+            hubert_sum = current_hubert_sum if hubert_sum is None else hubert_sum + current_hubert_sum
+            hubert_count = current_hubert_count if hubert_count is None else hubert_count + current_hubert_count
+    if mfcc_sum is None:
+        raise RuntimeError("cannot fit zero-centered template: training selection has no audio pairs")
+    mean = mfcc_sum / mfcc_count.clamp_min(1)
+    variance = (mfcc_sq_sum / mfcc_count.clamp_min(1) - mean.square()).clamp_min(1e-6)
+    template = {"mfcc_mean": mean.detach(), "mfcc_scale": variance.sqrt().detach()}
+    if hubert_sum is not None:
+        template["hubert_mean"] = (hubert_sum / hubert_count.clamp_min(1)).detach()
+    return template
 
 
 def retrieval_r1(prediction: torch.Tensor, target: torch.Tensor, eligible: torch.Tensor,
@@ -226,13 +278,13 @@ def retrieval_metrics(prediction: torch.Tensor, target: torch.Tensor, labels: li
 def evaluate_batch(model, batch: dict, target: torch.device) -> dict[str, float]:
     batch = move(batch, target)
     with torch.no_grad():
-        state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+        state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], model_mask(batch), batch["dataset_id"])
         eligible = batch["pairing_weight"] > 0
         correct = torch.nn.functional.l1_loss(state.mfcc[eligible], batch["content_mfcc"][eligible]) if eligible.any() else state.mfcc.new_tensor(float("nan"))
         metrics = {"content_retrieval_r1": retrieval_r1(state.mfcc, batch["content_mfcc"], eligible, batch["linguistic_content_id"]), "correct_mfcc_l1": float(correct)}
         for control in ("zero", "time_shuffle", "channel_shuffle"):
-            controlled = counterfactual_eeg(batch["eeg"], control, time_mask=batch["time_mask"], channel_mask=batch["channel_mask"])
-            output = model(controlled, batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+            controlled = counterfactual_eeg(batch["eeg"], control, time_mask=model_mask(batch), channel_mask=batch["channel_mask"])
+            output = model(controlled, batch["channel_xyz"], batch["channel_mask"], model_mask(batch), batch["dataset_id"])
             value = torch.nn.functional.l1_loss(output.mfcc[eligible], batch["content_mfcc"][eligible]) if eligible.any() else output.mfcc.new_tensor(float("nan"))
             metrics[f"{control}_mfcc_l1"] = float(value)
     return metrics
@@ -245,7 +297,7 @@ def full_content_retrieval(model, loader: DataLoader, target: torch.device) -> f
     with torch.no_grad():
         for batch in loader:
             batch = move(batch, target)
-            state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+            state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], model_mask(batch), batch["dataset_id"])
             eligible = batch["pairing_weight"] > 0
             predictions.append(state.mfcc[eligible]); teachers.append(batch["content_mfcc"][eligible])
             labels.extend(batch["linguistic_content_id"][index] for index in eligible.nonzero(as_tuple=False).flatten().tolist())
@@ -256,10 +308,11 @@ def full_content_retrieval(model, loader: DataLoader, target: torch.device) -> f
     return retrieval_r1(prediction, teacher, torch.ones(len(prediction), dtype=torch.bool, device=prediction.device), labels)
 
 
-def validation_metrics(model, loader: DataLoader, target: torch.device) -> dict:
+def validation_metrics(model, loader: DataLoader, target: torch.device,
+                       control_names: tuple[str, ...] = ("zero", "time_shuffle", "channel_shuffle")) -> dict:
     """Evaluate the model-selection fold without touching the locked test fold."""
     predictions = []; teachers = []; labels: list[str] = []
-    controls: dict[str, list[float]] = {name: [] for name in ("correct", "zero", "time_shuffle", "channel_shuffle")}
+    controls: dict[str, list[float]] = {name: [] for name in ("correct", *control_names)}
     was_training = model.training
     model.eval()
     with torch.no_grad():
@@ -268,16 +321,22 @@ def validation_metrics(model, loader: DataLoader, target: torch.device) -> dict:
             eligible = batch["pairing_weight"] > 0
             if not eligible.any():
                 continue
-            state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+            state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], model_mask(batch), batch["dataset_id"])
             prediction = state.mfcc[eligible]
             teacher = batch["content_mfcc"][eligible]
             predictions.append(prediction.cpu()); teachers.append(teacher.cpu())
             selected = eligible.nonzero(as_tuple=False).flatten().tolist()
             labels.extend(batch["linguistic_content_id"][index] for index in selected)
             controls["correct"].extend((prediction - teacher).abs().mean((1, 2)).cpu().tolist())
-            for control in ("zero", "time_shuffle", "channel_shuffle"):
-                eeg = counterfactual_eeg(batch["eeg"], control, time_mask=batch["time_mask"], channel_mask=batch["channel_mask"])
-                output = model(eeg, batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+            for control in control_names:
+                if control == "wrong_trial":
+                    if len(batch["eeg"]) < 2:
+                        continue
+                    order = torch.arange(len(batch["eeg"]), device=target).roll(1)
+                    eeg = batch["eeg"][order]
+                else:
+                    eeg = counterfactual_eeg(batch["eeg"], control, time_mask=model_mask(batch), channel_mask=batch["channel_mask"])
+                output = model(eeg, batch["channel_xyz"], batch["channel_mask"], model_mask(batch), batch["dataset_id"])
                 controls[control].extend((output.mfcc[eligible] - teacher).abs().mean((1, 2)).cpu().tolist())
     if was_training:
         model.train()
@@ -286,7 +345,7 @@ def validation_metrics(model, loader: DataLoader, target: torch.device) -> dict:
     prediction, teacher = torch.cat(predictions), torch.cat(teachers)
     return {"pairs": len(labels), "mfcc_l1": float((prediction - teacher).abs().mean()),
             "retrieval": retrieval_metrics(prediction, teacher, labels),
-            "controls": {name: float(np.mean(values)) for name, values in controls.items()}}
+            "controls": {name: float(np.mean(values)) if values else float("nan") for name, values in controls.items()}}
 
 
 def epoch_horizon(*, max_steps: int | None, max_epochs: int | None, training: dict,
@@ -309,11 +368,31 @@ def epoch_horizon(*, max_steps: int | None, max_epochs: int | None, training: di
 
 
 def validation_improved(current: dict, best: dict | None, minimum_delta: float) -> bool:
-    """Select by validation MRR; numerical ties keep the earlier checkpoint."""
+    """Controls are a prerequisite; MRR selects only among control-valid models."""
     value = float(current["retrieval"]["mrr"])
     if not np.isfinite(value):
         raise RuntimeError("validation retrieval MRR is nonfinite")
-    return best is None or value > float(best["retrieval"]["mrr"]) + float(minimum_delta)
+    # Preserve the public helper contract used by legacy configurations and
+    # focused tests.  v2 always supplies control errors below.
+    if "controls" not in current:
+        return best is None or value > float(best["retrieval"]["mrr"]) + float(minimum_delta)
+    errors = current["controls"]
+    correct = float(errors["correct"])
+    margin = min(float(value) - correct for name, value in errors.items()
+                 if name != "correct" and np.isfinite(value))
+    current_valid = margin > 0
+    if best is None:
+        return True
+    best_errors = best["controls"]
+    best_correct = float(best_errors["correct"])
+    best_margin = min(float(value) - best_correct for name, value in best_errors.items()
+                      if name != "correct" and np.isfinite(value))
+    best_valid = best_margin > 0
+    if current_valid != best_valid:
+        return current_valid
+    if current_valid:
+        return value > float(best["retrieval"]["mrr"]) + float(minimum_delta)
+    return margin > best_margin + float(minimum_delta)
 
 
 def main() -> int:
@@ -347,8 +426,16 @@ def main() -> int:
     # v3 extends v2; output_root is explicitly overridden in the child.
     artifact_root = ROOT / data_cfg["output_root"]
     audit = json.loads((artifact_root / "qc" / "audit.json").read_text())
-    if audit.get("included_counts", {}).get("ds004940") != 17489 or audit.get("included_counts", {}).get("ds006104") != 10888:
-        raise RuntimeError("Stage 0 audit gate failed: expected 17,489 and 10,888 included trials")
+    expected_counts = cfg.get("audit_expected_included_counts")
+    if expected_counts is None and str(data_cfg.get("schema_version", "")).startswith("training-data-v3"):
+        expected_counts = {"ds004940": 17489, "ds006104": 10888}
+    for dataset_name, expected in (expected_counts or {}).items():
+        actual = int(audit.get("included_counts", {}).get(dataset_name, -1))
+        if actual != int(expected):
+            raise RuntimeError(f"Stage 0 audit gate failed: {dataset_name} expected {expected}, found {actual}")
+    for dataset_name in cfg.get("audit_required_nonzero_datasets", []):
+        if int(audit.get("included_counts", {}).get(dataset_name, 0)) <= 0:
+            raise RuntimeError(f"Stage 0 audit gate failed: {dataset_name} has no included trials")
     if args.stage == "generalization" and not args.explore and bool(cfg["training"].get("stage2_requires_all_m0_gates", True)):
         require_registered_m0_gates(ROOT, cfg)
     stage2 = cfg.get("stage2", {})
@@ -438,8 +525,10 @@ def main() -> int:
                                        phoneme_vocabulary=vocabulary)
         indices = pilot_indices(dataset, cfg, args.stage, "train")
         datasets[name] = dataset
+        grouped = (cfg["training"].get("content_grouped_batch")
+                   if name == "ds004940" and args.stage == "generalization" else None)
         loaders[name] = loader_for(dataset, indices, int(cfg["training"]["batch_size"]), args.seed,
-                                   sampling_strategy)
+                                   sampling_strategy, grouped)
         evaluation_loaders[name] = evaluation_loader_for(dataset, indices, int(cfg["training"]["batch_size"]))
         selected = dataset.frame.iloc[indices]
         selections[name] = {"pairs": len(selected), "subjects": int(selected.subject.nunique()),
@@ -483,16 +572,21 @@ def main() -> int:
         }
 
     model = JointEEGContentModel(**cfg["model"]).to(device())
+    target_templates: dict[str, torch.Tensor] | None = None
+    if bool(cfg["model"].get("zero_centered", False)):
+        target_templates = train_fold_templates(evaluation_loaders[names[0]], device())
+        model.set_target_templates(target_templates["mfcc_mean"], target_templates["mfcc_scale"],
+                                   target_templates.get("hubert_mean"))
     dry_batches = {name: move(next(iter(loader)), device()) for name, loader in loaders.items()}
     first_batch = dry_batches[names[0]]
-    state = model(first_batch["eeg"], first_batch["channel_xyz"], first_batch["channel_mask"], first_batch["time_mask"], first_batch["dataset_id"])
+    state = model(first_batch["eeg"], first_batch["channel_xyz"], first_batch["channel_mask"], model_mask(first_batch), first_batch["dataset_id"])
     if state.mfcc.shape[1:] != (39, 161) or not torch.isfinite(state.mfcc).all(): raise RuntimeError("model forward contract failed")
     if args.dry_run:
         by_dataset = {}
         model.zero_grad(set_to_none=True)
         for name in loaders:
             batch = dry_batches[name]
-            output = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+            output = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], model_mask(batch), batch["dataset_id"])
             loss, metrics = joint_content_loss(output, batch, model, cfg["loss"])
             (loss / len(loaders)).backward()
             by_dataset[name] = {"batch_shape": list(batch["eeg"].shape), "metrics": metrics}
@@ -555,6 +649,8 @@ def main() -> int:
             "preprocess_config_sha256": source_lock["config_sha256"],
             "runtime_code_sha256": runtime_code_sha256(), "model_code_sha256": model_code_sha256(),
             "phoneme_vocabulary": vocabulary, "artifact_hashes": artifact_hashes,
+            "target_templates": ({key: value.detach().cpu() for key, value in target_templates.items()}
+                                 if target_templates is not None else None),
             "resume_contract": current_contract, "steps_completed": completed_steps,
             "epochs_completed": completed_epochs, "checkpoint_kind": checkpoint_kind,
             "validation_selection": validation,
@@ -571,9 +667,12 @@ def main() -> int:
             "validation_history": validation_history, "best_validation": best_validation,
             "validation_without_improvement": validation_without_improvement,
             "best_checkpoint_path": str(best_checkpoint_path) if best_checkpoint_path.exists() else "",
-            "batch_schedule": schedule, "interrupted": interrupted, "completed": completed,
+            "batch_schedule": schedule, "target_templates": ({key: value.detach().cpu() for key, value in target_templates.items()}
+                                                                 if target_templates is not None else None),
+            "interrupted": interrupted, "completed": completed,
             "python_random_state": random.getstate(), "numpy_random_state": np.random.get_state(),
             "torch_rng_state": torch.get_rng_state(),
+            "mps_rng_state": torch.mps.get_rng_state() if torch.backends.mps.is_available() else None,
             "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
         atomic_torch_save(payload, state_path)
@@ -595,6 +694,12 @@ def main() -> int:
             raise RuntimeError("partial checkpoint has incompatible maximum_epochs")
         completed_epochs = int(previous.get("completed_epochs", completed_steps // steps_per_epoch if steps_per_epoch else 0))
         model.load_state_dict(previous["model"])
+        saved_templates = previous.get("target_templates")
+        if bool(cfg["model"].get("zero_centered", False)):
+            if not saved_templates:
+                raise RuntimeError("zero-centered resume checkpoint is missing train-fold templates")
+            model.set_target_templates(saved_templates["mfcc_mean"], saved_templates["mfcc_scale"],
+                                       saved_templates.get("hubert_mean"))
         optimizer.load_state_dict(previous["optimizer"])
         optimizer_to(optimizer, device())
         if scheduler is not None:
@@ -615,6 +720,8 @@ def main() -> int:
         random.setstate(previous["python_random_state"])
         np.random.set_state(previous["numpy_random_state"])
         torch.set_rng_state(previous["torch_rng_state"])
+        if torch.backends.mps.is_available() and previous.get("mps_rng_state") is not None:
+            torch.mps.set_rng_state(previous["mps_rng_state"])
         if torch.cuda.is_available() and previous.get("cuda_rng_state_all") is not None:
             torch.cuda.set_rng_state_all(previous["cuda_rng_state_all"])
         print(json.dumps({"status": "resumed", "state": str(state_path),
@@ -637,7 +744,7 @@ def main() -> int:
             name, batch = next(iterator)
             batch = move(batch, device())
             optimizer.zero_grad(set_to_none=True)
-            state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+            state = model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], model_mask(batch), batch["dataset_id"])
             loss, metrics = joint_content_loss(state, batch, model, cfg["loss"])
             if not torch.isfinite(loss):
                 raise RuntimeError(f"nonfinite loss at step {step} ({name}); metrics={metrics}")
@@ -672,7 +779,10 @@ def main() -> int:
                         early_stopped = True
                 print(json.dumps(history[-1]))
             if validation_interval_steps is not None and completed_steps % validation_interval_steps == 0:
-                validation = validation_metrics(model, validation_loaders[names[0]], device())
+                validation = validation_metrics(
+                    model, validation_loaders[names[0]], device(),
+                    tuple(validation_spec.get("required_controls", ("zero", "time_shuffle", "channel_shuffle"))),
+                )
                 validation.update({"step": completed_steps, "epoch": completed_epochs,
                                    "learning_rate": float(optimizer.param_groups[0]["lr"])})
                 improved = validation_improved(

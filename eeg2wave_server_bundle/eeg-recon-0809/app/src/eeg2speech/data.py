@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, WeightedRandomSampler
+from torch.utils.data import Dataset, Sampler, WeightedRandomSampler
 
 
 DATASET_IDS = {"ds004940": 0, "ds006104": 1}
@@ -131,6 +131,53 @@ def phoneme_vocabulary_from_manifest(manifest_path: Path) -> dict[str, int]:
     return {label: index for index, label in enumerate(labels)}
 
 
+class ContentGroupedBatchSampler(Sampler[list[int]]):
+    """Emit ``contents_per_batch × subjects_per_content`` homogeneous batches.
+
+    The sampler is for a complete subject×content grid.  It visits every
+    selected record exactly once per epoch and makes cross-subject observations
+    of the same linguistic content available as positives in each batch.
+    """
+
+    def __init__(self, frame: pd.DataFrame, indices: list[int], *, batch_size: int,
+                 contents_per_batch: int = 4, subjects_per_content: int = 2, seed: int = 31):
+        if batch_size != contents_per_batch * subjects_per_content:
+            raise ValueError("content_grouped batch_size must equal contents_per_batch × subjects_per_content")
+        self.contents_per_batch = int(contents_per_batch)
+        self.subjects_per_content = int(subjects_per_content)
+        selected = frame.iloc[indices].copy()
+        # DataLoader wraps the original dataset in ``Subset(dataset, indices)``.
+        # A batch sampler must therefore emit positions inside that Subset,
+        # not the original manifest indices (which may be sparse/nonzero).
+        selected["_subset_index"] = list(range(len(indices)))
+        by_content: dict[str, list[list[int]]] = {}
+        for _, group in selected.groupby("linguistic_content_id", sort=False):
+            ordered = group.sort_values(["subject", "_subset_index"])._subset_index.astype(int).tolist()
+            if len(ordered) % self.subjects_per_content:
+                raise RuntimeError("content_grouped sampler requires a complete subjects-per-content grid")
+            by_content[str(group.iloc[0].linguistic_content_id)] = [ordered[offset:offset + self.subjects_per_content]
+                                                                      for offset in range(0, len(ordered), self.subjects_per_content)]
+        rounds = {len(value) for value in by_content.values()}
+        if len(rounds) != 1:
+            raise RuntimeError("content_grouped sampler requires equal subject coverage for every content")
+        self.rounds = [[chunks[round_index] for chunks in by_content.values()]
+                       for round_index in range(next(iter(rounds), 0))]
+        if not self.rounds or len(self.rounds[0]) % self.contents_per_batch:
+            raise RuntimeError("content_grouped sampler cannot form complete batches")
+        self.seed = int(seed); self.epoch = 0
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        for groups in self.rounds:
+            order = torch.randperm(len(groups), generator=generator).tolist()
+            for offset in range(0, len(order), self.contents_per_batch):
+                yield [index for item in order[offset:offset + self.contents_per_batch] for index in groups[item]]
+
+    def __len__(self) -> int:
+        return sum(len(groups) // self.contents_per_batch for groups in self.rounds)
+
+
 class JointManifestDataset(Dataset):
     def __init__(self, manifest_path: Path, split_path: Path, role: str, dataset: str,
                  speech_targets: Path | None = None, normalizer_path: Path | None = None,
@@ -176,6 +223,13 @@ class JointManifestDataset(Dataset):
                 if bool(self.targets.attrs.get("hubert_included", False)):
                     if "hubert_local" not in group or group["hubert_local"].shape != (96, 768):
                         raise RuntimeError(f"speech target {audio_id} has an invalid HuBERT contract")
+                if "native_mel_contract" in self.targets.attrs:
+                    if "native_speecht5_mel" not in group or "native_audio_mask" not in group:
+                        raise RuntimeError(f"speech target {audio_id} is missing native SpeechT5 mel")
+                    native = group["native_speecht5_mel"][:]
+                    native_mask = group["native_audio_mask"][:].astype(bool)
+                    if native.ndim != 2 or native.shape[0] != 80 or native.shape[1] != native_mask.shape[0] or not native_mask.any():
+                        raise RuntimeError(f"speech target {audio_id} has an invalid native SpeechT5 mel contract")
         if normalizer_path is None or not normalizer_path.exists():
             raise RuntimeError("an existing train-fold normalizer is required")
         normalizer_payload = json.loads(normalizer_path.read_text())
@@ -226,6 +280,9 @@ class JointManifestDataset(Dataset):
         eeg = shard["eeg"][shard_row].astype("float32")
         channel_mask = shard["channel_valid_mask"][shard_row].astype(bool)
         time_mask = shard["eeg_valid_mask"][shard_row].astype(bool)
+        model_time_mask = (np.ones_like(time_mask, dtype=bool)
+                           if str(shard.attrs.get("model_time_mask_policy", "")) == "fixed_full_epoch"
+                           else time_mask.copy())
         normalizer = self.normalizers.get(row.dataset)
         if normalizer:
             center = np.asarray(normalizer["center_median_v"], dtype=np.float32)[:, None]
@@ -241,6 +298,9 @@ class JointManifestDataset(Dataset):
         acoustic = np.zeros((80, 161), dtype=np.float32)
         rms = np.zeros(161, dtype=np.float32)
         activity = np.zeros(161, dtype=bool)
+        native_mel = np.zeros((80, 1), dtype=np.float32)
+        native_mask = np.zeros(1, dtype=bool)
+        duration_frames = 0
         if self.targets is not None and audio_id in self.targets:
             target = self.targets[audio_id]
             content = target["content_mfcc"][:].astype("float32")
@@ -254,6 +314,10 @@ class JointManifestDataset(Dataset):
                                 mode="linear", align_corners=False).squeeze().numpy()
             activity = F.interpolate(torch.from_numpy(target["activity"][:].astype("float32"))[None, None], size=161,
                                      mode="nearest").squeeze().bool().numpy()
+            if "native_speecht5_mel" in target:
+                native_mel = target["native_speecht5_mel"][:].astype("float32")
+                native_mask = target["native_audio_mask"][:].astype(bool)
+                duration_frames = int(target.attrs.get("native_duration_frames", int(native_mask.sum())))
         pairing = str(row.pairing_level)
         pairing_weight = 1.0 if pairing == "verified_exact" else (self.weak_content_weight if pairing == "candidate_filename_timing" else 0.0)
         if pairing_weight > 0 and (self.targets is None or audio_id not in self.targets):
@@ -268,11 +332,15 @@ class JointManifestDataset(Dataset):
             "eeg": torch.from_numpy(eeg), "channel_xyz": torch.from_numpy(shard["channel_xyz"][:].astype("float32")),
             "channel_mask": torch.from_numpy(channel_mask),
             "time_mask": torch.from_numpy(time_mask),
+            "model_time_mask": torch.from_numpy(model_time_mask),
             "tms_output_mask": torch.from_numpy(shard["tms_output_mask"][shard_row].astype(bool)),
             "content_mfcc": torch.from_numpy(content), "content_mask": torch.from_numpy(content_mask),
             "hubert_local": torch.from_numpy(hubert), "hubert_mask": torch.from_numpy(hubert_mask),
             "acoustic_log_mel": torch.from_numpy(acoustic), "acoustic_rms": torch.from_numpy(rms),
             "acoustic_activity": torch.from_numpy(activity),
+            "native_speecht5_mel": torch.from_numpy(native_mel),
+            "native_audio_mask": torch.from_numpy(native_mask),
+            "audio_duration_frames": torch.tensor(duration_frames, dtype=torch.long),
             "acoustic_supervision": torch.tensor(pairing == "verified_exact", dtype=torch.bool),
             "pairing_weight": torch.tensor(pairing_weight, dtype=torch.float32),
             "phoneme_index": torch.tensor(self.phoneme_vocabulary.get(phoneme, -1), dtype=torch.long),
@@ -306,10 +374,23 @@ def homogeneous_collate(records: list[dict[str, Any]]) -> dict[str, Any]:
     datasets = {record["dataset"] for record in records}
     if len(datasets) != 1:
         raise ValueError("a batch must contain exactly one dataset")
-    tensor_keys = ("dataset_id", "eeg", "channel_xyz", "channel_mask", "time_mask", "tms_output_mask",
+    tensor_keys = ("dataset_id", "eeg", "channel_xyz", "channel_mask", "time_mask", "model_time_mask", "tms_output_mask",
                    "content_mfcc", "content_mask", "hubert_local", "hubert_mask", "pairing_weight", "phoneme_index",
-                   "acoustic_log_mel", "acoustic_rms", "acoustic_activity", "acoustic_supervision", "tms_applied")
+                   "acoustic_log_mel", "acoustic_rms", "acoustic_activity", "acoustic_supervision", "tms_applied",
+                   "audio_duration_frames")
     batch = {key: torch.stack([torch.as_tensor(record[key]) for record in records]) for key in tensor_keys}
+    # SpeechT5 target mel remains native-duration/ragged.  Padding is purely a
+    # batch transport detail and is always accompanied by native_audio_mask.
+    maximum = max(int(record["native_speecht5_mel"].shape[-1]) for record in records)
+    native = []
+    native_mask = []
+    for record in records:
+        value = torch.as_tensor(record["native_speecht5_mel"])
+        mask = torch.as_tensor(record["native_audio_mask"], dtype=torch.bool)
+        native.append(F.pad(value, (0, maximum - value.shape[-1])))
+        native_mask.append(F.pad(mask, (0, maximum - mask.shape[-1]), value=False))
+    batch["native_speecht5_mel"] = torch.stack(native)
+    batch["native_audio_mask"] = torch.stack(native_mask)
     for key in ("trial_id", "dataset", "subject", "task", "condition", "linguistic_content_id", "pairing_level",
                 "supervision_type", "audio_id"):
         batch[key] = [record[key] for record in records]

@@ -255,7 +255,15 @@ def load_context(checkpoint: Path, target_device: torch.device) -> RunContext:
         changed = sorted(key for key in current if current.get(key) != expected.get(key))
         raise RuntimeError(f"checkpoint artifact provenance mismatch: {changed}")
     model = JointEEGContentModel(**payload["model_config"]).to(target_device)
-    model.load_state_dict(payload["model"])
+    # Old v3 checkpoints predate duration/activity heads.  They remain
+    # exportable as legacy diagnostics, while v2 zero-centered checkpoints
+    # restore their explicitly saved train-fold template.
+    model.load_state_dict(payload["model"], strict=False)
+    templates = payload.get("target_templates")
+    if bool(payload["model_config"].get("zero_centered", False)):
+        if not templates:
+            raise RuntimeError("zero-centered checkpoint is missing its train-fold template")
+        model.set_target_templates(templates["mfcc_mean"], templates["mfcc_scale"], templates.get("hubert_mean"))
     model.eval()
     return RunContext(checkpoint, payload, cfg, manifest, split, targets, normalizer,
                       payload.get("phoneme_vocabulary") or phoneme_vocabulary_from_manifest(manifest), model)
@@ -310,16 +318,19 @@ def export_trial(*, output: Path, single: RunContext, joint: RunContext | None, 
         if joint_batch is not None:
             joint_batch = move(joint_batch, target_device)
         with torch.no_grad():
-            single_state = single.model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], batch["time_mask"], batch["dataset_id"])
+            mask = batch.get("model_time_mask", batch["time_mask"])
+            single_state = single.model(batch["eeg"], batch["channel_xyz"], batch["channel_mask"], mask, batch["dataset_id"])
             predictions = {"single": single_state.mfcc}
             control_model, control_batch = single.model, batch
             if joint is not None and joint_batch is not None:
-                joint_state = joint.model(joint_batch["eeg"], joint_batch["channel_xyz"], joint_batch["channel_mask"], joint_batch["time_mask"], joint_batch["dataset_id"])
+                joint_mask = joint_batch.get("model_time_mask", joint_batch["time_mask"])
+                joint_state = joint.model(joint_batch["eeg"], joint_batch["channel_xyz"], joint_batch["channel_mask"], joint_mask, joint_batch["dataset_id"])
                 predictions["joint"] = joint_state.mfcc
                 control_model, control_batch = joint.model, joint_batch
             for control in ("zero", "time_shuffle", "channel_shuffle"):
-                controlled = counterfactual_eeg(control_batch["eeg"], control, time_mask=control_batch["time_mask"], channel_mask=control_batch["channel_mask"])
-                predictions[control] = control_model(controlled, control_batch["channel_xyz"], control_batch["channel_mask"], control_batch["time_mask"], control_batch["dataset_id"]).mfcc
+                control_mask = control_batch.get("model_time_mask", control_batch["time_mask"])
+                controlled = counterfactual_eeg(control_batch["eeg"], control, time_mask=control_mask, channel_mask=control_batch["channel_mask"])
+                predictions[control] = control_model(controlled, control_batch["channel_xyz"], control_batch["channel_mask"], control_mask, control_batch["dataset_id"]).mfcc
             renderer_states = {key: _renderer_state(renderer, value) for key, value in predictions.items()}
         source_path = ROOT / str(row["audio_path"])
         if not source_path.exists() or sha256_file(source_path) != str(row["audio_sha256"]):
