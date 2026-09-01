@@ -15,6 +15,7 @@ stage2 = importlib.util.module_from_spec(spec); spec.loader.exec_module(stage2)
 
 from eeg2speech.data import _complete_grid
 from eeg2speech.gates import registered_m0_gate_status
+from prepare_training_data import semantic_preprocessing_contract
 
 
 class TestStage2Split(unittest.TestCase):
@@ -87,6 +88,16 @@ class TestStage2Split(unittest.TestCase):
         counts=pd.Series(list(assigned.values())).value_counts().to_dict()
         self.assertEqual(counts,{"train":28,"validation":6,"test":6})
         self.assertEqual(assigned,stage2.assign(values,{"train":28,"validation":6,"test":6},"test"))
+
+    def test_semantic_preprocessing_contract_excludes_repository_commit(self):
+        contract = semantic_preprocessing_contract(
+            config_sha="config", source_lock_sha="sources", split_hash="split", code_diff_hash="transform",
+        )
+        self.assertEqual(contract, {
+            "preprocess_config_sha256": "config", "source_lock_sha256": "sources",
+            "split_index_sha256": "split", "code_diff_hash": "transform",
+        })
+        self.assertNotIn("code_commit", contract)
 
     def test_real_stage2_split_has_exact_double_ood_grids(self):
         artifact=ROOT/"artifacts/training_data/v3"

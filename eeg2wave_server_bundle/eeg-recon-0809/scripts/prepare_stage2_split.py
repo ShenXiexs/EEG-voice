@@ -13,8 +13,8 @@ import pandas as pd
 import yaml
 
 from prepare_training_data import (ROOT, build as build_eeg_shards, fit_normalizer,
-                                   load_config, output_root, require_build_runtime, sha256_bytes,
-                                   stable_json)
+                                   git_provenance, load_config, output_root, require_build_runtime,
+                                   semantic_preprocessing_contract, sha256_bytes, stable_json)
 
 sys.path.insert(0, str(ROOT / "app" / "src"))
 from eeg2speech.gates import registered_m0_gate_status, require_registered_m0_gates
@@ -257,7 +257,12 @@ def artifact_status(config: dict, pilot: dict, artifact_set: str = "stage2",
 
 
 def named_artifact_split_is_stale(config: dict, artifact_set: str, split_path: Path) -> bool:
-    """Whether a named artifact's existing HDF5 shards pin an older split CSV."""
+    """Whether named shards differ from the current semantic EEG contract.
+
+    This is deliberately stronger than a split-only check: it recovers a
+    partially materialized artifact after a preprocessing edit, while allowing
+    an unrelated repository commit to leave valid EEG shards reusable.
+    """
     manifest_path = output_root(config) / "manifests" / f"manifest_{artifact_set}.csv"
     if not manifest_path.exists():
         return False
@@ -265,14 +270,21 @@ def named_artifact_split_is_stale(config: dict, artifact_set: str, split_path: P
     paths = sorted({str(path) for path in manifest.loc[manifest.build_status == "included", "shard_path"] if str(path)})
     if not paths:
         return False
-    expected = sha256_bytes(split_path.read_bytes())
+    lock = json.loads((output_root(config) / "source_lock.json").read_text())
+    _, diff = git_provenance()
+    expected = semantic_preprocessing_contract(
+        config_sha=config["_config_sha256"],
+        source_lock_sha=lock["source_lock_sha256"],
+        split_hash=sha256_bytes(split_path.read_bytes()),
+        code_diff_hash=sha256_bytes(diff.encode()),
+    )
     h5py, _, _ = require_build_runtime()
     for relative in paths:
         path = ROOT / relative
         if not path.exists():
             return True
         with h5py.File(path, "r") as shard:
-            if str(shard.attrs.get("split_index_sha256", "")) != expected:
+            if any(str(shard.attrs.get(key, "")) != value for key, value in expected.items()):
                 return True
     return False
 

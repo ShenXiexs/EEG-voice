@@ -396,6 +396,24 @@ def resume_compatible(attrs: dict[str, Any], *, config_sha: str, source_lock_sha
     return split_hash is None or attrs.get("split_index_sha256", "") == split_hash
 
 
+def semantic_preprocessing_contract(*, config_sha: str, source_lock_sha: str,
+                                    split_hash: str, code_diff_hash: str) -> dict[str, str]:
+    """Return the provenance fields that can change the EEG values.
+
+    ``code_commit`` is retained as useful lineage metadata, but a repository
+    commit can contain a model, documentation, or runner-only edit.  It is
+    therefore not a preprocessing compatibility key.  ``code_diff_hash`` is
+    derived from the concrete transform functions and loader source and is the
+    fail-closed key for an EEG-value-changing implementation edit.
+    """
+    return {
+        "preprocess_config_sha256": str(config_sha),
+        "source_lock_sha256": str(source_lock_sha),
+        "split_index_sha256": str(split_hash),
+        "code_diff_hash": str(code_diff_hash),
+    }
+
+
 def _event_column(frame, candidates: list[str]) -> str | None:
     lower = {str(c).lower(): c for c in frame.columns}
     return next((lower[c.lower()] for c in candidates if c.lower() in lower), None)
@@ -1321,15 +1339,15 @@ def build(config: dict[str, Any], dataset: str, subjects: str, tasks: str,
         # Preserve old rows for auditability, but never leave an incompatible
         # shard eligible for a new loader/normalizer after code/config/split
         # changes.  The HDF5 file remains on disk and can still be inspected.
-        merge_commit, merge_diff = git_provenance()
-        current_contract = {"preprocess_config_sha256": config["_config_sha256"],
-                            "source_lock_sha256": lock["source_lock_sha256"],
-                            # Named artifact sets pin their role-specific CSV
-                            # rather than the global split-index JSON. Comparing
-                            # against the latter marked every prior named shard
-                            # stale when a second dataset/task was merged.
-                            "split_index_sha256": split_contract_hash,
-                            "code_commit": merge_commit, "code_diff_hash": sha256_bytes(merge_diff.encode())}
+        _, merge_diff = git_provenance()
+        current_contract = semantic_preprocessing_contract(
+            config_sha=config["_config_sha256"],
+            source_lock_sha=lock["source_lock_sha256"],
+            # Named artifact sets pin their role-specific CSV rather than the
+            # global split-index JSON.
+            split_hash=split_contract_hash,
+            code_diff_hash=sha256_bytes(merge_diff.encode()),
+        )
         for shard_path, indices in previous[previous.build_status == "included"].groupby("shard_path").groups.items():
             compatible = False
             path = ROOT / shard_path
@@ -1369,7 +1387,10 @@ def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int,
         raise RuntimeError("no built train-fold trials are available for normalizer fitting")
     lock = json.loads((output_root(config) / "source_lock.json").read_text())
     split_index = json.loads((output_root(config) / "splits" / "assignment.json").read_text())
-    contract_fields = ("preprocess_config_sha256", "source_lock_sha256", "split_index_sha256", "code_commit", "code_diff_hash")
+    # ``code_commit`` is reporting lineage, not a transform contract.  Requiring
+    # it here invalidates a normalizer after an unrelated model/docs commit even
+    # when every EEG sample was produced by exactly the same preprocessing code.
+    contract_fields = ("preprocess_config_sha256", "source_lock_sha256", "split_index_sha256", "code_diff_hash")
     contracts: dict[str, set[str]] = {key: set() for key in contract_fields}
     for shard in sorted(set(chosen.shard_path)):
         with h5py.File(ROOT / shard, "r") as h5:
@@ -1386,9 +1407,9 @@ def fit_normalizer(config: dict[str, Any], split_csv: Path, fold: int,
         if contracts[key] != {value}:
             raise RuntimeError(f"normalizer refuses incompatible {key}: {sorted(contracts[key])} != {value}")
     if bool(config.get("normalization", {}).get("require_single_preprocessing_contract", True)):
-        for key in ("code_commit", "code_diff_hash"):
-            if len(contracts[key]) != 1 or "" in contracts[key]:
-                raise RuntimeError(f"normalizer refuses mixed preprocessing {key}: {sorted(contracts[key])}")
+        if len(contracts["code_diff_hash"]) != 1 or "" in contracts["code_diff_hash"]:
+            raise RuntimeError("normalizer refuses mixed preprocessing code_diff_hash: "
+                               f"{sorted(contracts['code_diff_hash'])}")
     maximum = int(config.get("normalization", {}).get("max_samples_per_channel", 200000))
     dataset_results = {}
     for dataset, dataset_rows in chosen.groupby("dataset"):

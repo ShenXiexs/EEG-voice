@@ -10,7 +10,7 @@ source "$SCRIPT_DIR/lib/joint_pilot_common.sh"
 
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-ds004940_conditioned_v2}"
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-$RUN_ROOT/$EXPERIMENT_NAME}"
-V2_FROM="${V2_FROM:-all}" # all | a0 | m0 | m1 | resume (M0 through final export)
+V2_FROM="${V2_FROM:-all}" # all | a0 | m0 | m1 | renderer | resume
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-50}"
 M0_STEPS="${M0_STEPS:-5000}"
 M0_BATCH_SIZE="${M0_BATCH_SIZE:-2}"
@@ -25,7 +25,7 @@ DIFFUSION_DENOISE="${DIFFUSION_DENOISE:-0}"
 DIFFUSION_TRAIN_STEPS="${DIFFUSION_TRAIN_STEPS:-2000}"
 V2_BYPASS_M0="${V2_BYPASS_M0:-0}"
 A0_MAX_PAIRS="${A0_MAX_PAIRS:-402}"
-case "$V2_FROM" in all|a0|m0|m1|resume) ;; *) echo "V2_FROM must be all, a0, m0, m1, or resume" >&2; exit 2 ;; esac
+case "$V2_FROM" in all|a0|m0|m1|renderer|resume) ;; *) echo "V2_FROM must be all, a0, m0, m1, renderer, or resume" >&2; exit 2 ;; esac
 case "$DIFFUSION_DENOISE" in 0|1) ;; *) echo "DIFFUSION_DENOISE must be 0 or 1" >&2; exit 2 ;; esac
 case "$THERMAL_MODE" in 0|1) ;; *) echo "THERMAL_MODE must be 0 or 1" >&2; exit 2 ;; esac
 
@@ -77,7 +77,11 @@ if [[ "$V2_FROM" == "all" || "$V2_FROM" == "m0" || "$V2_FROM" == "resume" ]]; th
     --checkpoint "$EXPERIMENT_ROOT/overfit/ds004940/seed-31/checkpoint.pt" --dataset ds004940 --role train
 fi
 
-if [[ "$V2_FROM" == "all" || "$V2_FROM" == "m1" || "$V2_FROM" == "resume" ]]; then
+if [[ "$V2_FROM" == "all" || "$V2_FROM" == "m1" || "$V2_FROM" == "resume" || "$V2_FROM" == "renderer" ]]; then
+  # ``renderer`` is an intentional continuation point after EEG checkpoints
+  # have completed.  It does not rematerialize data or reopen an EEG training
+  # checkpoint: both would correctly reject changed provenance contracts.
+  if [[ "$V2_FROM" != "renderer" ]]; then
   M0_EVALUATION="$EXPERIMENT_ROOT/overfit/ds004940/seed-31/evaluation_ds004940_train.json"
   if [[ "$V2_BYPASS_M0" != "1" ]]; then
     joint_run "$PYTHON_BIN" - "$M0_EVALUATION" <<'PY'
@@ -108,9 +112,23 @@ PY
       sleep "$COOLDOWN_SECONDS"
     fi
   done
+  else
+    for seed in $(pilot_seeds); do
+      checkpoint="$EXPERIMENT_ROOT/generalization/ds004940/seed-$seed/checkpoint.pt"
+      [[ -f "$checkpoint" ]] || { echo "renderer continuation requires completed EEG checkpoint: $checkpoint" >&2; exit 2; }
+    done
+    for required in \
+      "artifacts/training_data/v4_ds004940_fixed/manifests/manifest_explore_stage2_ds004940_conditioned_v2.csv" \
+      "artifacts/training_data/v4_ds004940_fixed/splits/stage2_ds004940_conditioned_v2_fold-0.csv" \
+      "artifacts/training_data/v4_ds004940_fixed/speech_targets/speech_targets_explore_stage2_ds004940_conditioned_v2.h5" \
+      "artifacts/training_data/v4_ds004940_fixed/normalizers/explore_stage2_ds004940_conditioned_v2_fold-0.json"; do
+      [[ -f "$required" ]] || { echo "renderer continuation requires artifact: $required" >&2; exit 2; }
+    done
+    echo "Resuming at audio renderer/export only; completed EEG checkpoints are left read-only."
+  fi
   ARTIFACT="artifacts/training_data/v4_ds004940_fixed"
   joint_run "$PYTHON_BIN" app/train_native_audio_renderer.py --config "$PILOT_CONFIG" \
-    --manifest "$ARTIFACT/manifests/explore_stage2_ds004940_conditioned_v2.csv" \
+    --manifest "$ARTIFACT/manifests/manifest_explore_stage2_ds004940_conditioned_v2.csv" \
     --split "$ARTIFACT/splits/stage2_ds004940_conditioned_v2_fold-0.csv" \
     --targets "$ARTIFACT/speech_targets/speech_targets_explore_stage2_ds004940_conditioned_v2.h5" \
     --normalizer "$ARTIFACT/normalizers/explore_stage2_ds004940_conditioned_v2_fold-0.json" \
@@ -118,7 +136,7 @@ PY
     --checkpoint-every "$CHECKPOINT_EVERY"
   if [[ "$DIFFUSION_DENOISE" == "1" ]]; then
     joint_run "$PYTHON_BIN" app/train_native_mel_diffusion.py --config "$PILOT_CONFIG" \
-      --manifest "$ARTIFACT/manifests/explore_stage2_ds004940_conditioned_v2.csv" \
+      --manifest "$ARTIFACT/manifests/manifest_explore_stage2_ds004940_conditioned_v2.csv" \
       --split "$ARTIFACT/splits/stage2_ds004940_conditioned_v2_fold-0.csv" \
       --targets "$ARTIFACT/speech_targets/speech_targets_explore_stage2_ds004940_conditioned_v2.h5" \
       --normalizer "$ARTIFACT/normalizers/explore_stage2_ds004940_conditioned_v2_fold-0.json" \
